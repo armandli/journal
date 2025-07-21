@@ -12,12 +12,8 @@ def _():
 
 @app.cell
 def _():
-    #import os
-    #import glob
     import random
-    #mport cv2
     from tqdm import tqdm
-    #import numpy as np
 
     import torch
     from torch import nn
@@ -34,8 +30,6 @@ def _(torch):
     use_mps = torch.backends.mps.is_built()
     if use_cuda:
         device = torch.device("cuda")
-    elif use_mps:
-        device = torch.device("mps")
     else:
         device = torch.device("cpu")
     device
