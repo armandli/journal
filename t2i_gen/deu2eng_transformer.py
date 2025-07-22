@@ -24,6 +24,7 @@ def _():
 
     url = ("https://raw.githubusercontent.com/neychev/" "small_DL_repo/master/datasets/Multi30k/training.tar.gz")
     dest_dir = "/Users/armandli/data/deu2eng/"
+    model_dir = 'model/'
     dest_file = dest_dir + "training.tar.gz"
     os.makedirs(dest_dir, exist_ok=True)
     if not os.path.exists(dest_file):
@@ -34,7 +35,18 @@ def _():
     train = tarfile.open(dest_file)
     train.extractall(dest_dir)
     train.close()
-    return dest_dir, dest_file, f, fb1, os, requests, tarfile, train, url
+    return (
+        dest_dir,
+        dest_file,
+        f,
+        fb1,
+        model_dir,
+        os,
+        requests,
+        tarfile,
+        train,
+        url,
+    )
 
 
 @app.cell
@@ -717,8 +729,8 @@ def _(LabelSmoothing, NoamOpt, SimpleLossCompute, model, tgt_vocab, torch):
 
 
 @app.cell
-def _(dest_dir):
-    model_file = dest_dir + "de2en.pth"
+def _(model_dir):
+    model_file = model_dir + "de2en.pth"
     return (model_file,)
 
 
