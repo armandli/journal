@@ -667,8 +667,8 @@ def _(caption, idx2word, plt, torchvision):
 
 
 @app.cell
-def _(caption_model, compare, test_images, test_tokens):
-    compare(test_images, test_tokens, 10, caption_model, temp=0.95)
+def _(caption_model2, compare, test_images, test_tokens):
+    compare(test_images, test_tokens, 12, caption_model2, temp=0.95)
     return
 
 
