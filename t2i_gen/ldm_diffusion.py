@@ -428,7 +428,9 @@ def _():
     #         scaler.scale(loss).backward()
     #         scaler.step(optim)
     #         scaler.update()
-    #         if loss_ema is None:
+    #         if math.isnan(loss.item()):
+    #             break
+    #         elif loss_ema is None:
     #             loss_ema = loss.item()
     #         else:
     #             loss_ema = 0.95 * loss_ema + 0.05 * loss.item()
