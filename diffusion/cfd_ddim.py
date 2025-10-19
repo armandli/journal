@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.14.13"
+__generated_with = "0.17.0"
 app = marimo.App(width="medium")
 
 
@@ -21,6 +21,7 @@ def _():
 
     import torch
     from torch import nn
+    import torch.nn.functional as F
     from torch import optim
     import torchvision
     from torch.utils.data import DataLoader
@@ -28,20 +29,12 @@ def _():
     from torchvision import transforms
     from torchvision.transforms import ToTensor
 
-    from datasets import load_dataset
-    from torchvision.transforms import (CenterCrop, Compose,InterpolationMode,RandomHorizontalFlip, Resize)
-
     import matplotlib.pyplot as plt
     return (
-        CenterCrop,
-        Compose,
         DataLoader,
-        InterpolationMode,
-        RandomHorizontalFlip,
-        Resize,
+        F,
         ToTensor,
         datasets,
-        load_dataset,
         math,
         nn,
         np,
@@ -82,6 +75,41 @@ def _(torch):
     def check_nan(mtx):
         return torch.sum(torch.isnan(mtx)) > 0
     return
+
+
+@app.function
+def calculate_group_divisors(ncs):
+    return [ncs[i+1] // ncs[i] for i in range(1, len(ncs)-1)]
+
+
+@app.function
+def is_group_divisors_valid(ncs, gdivisors):
+    if len(ncs) - 2 != len(gdivisors):
+        return False
+    for i in range(1, len(ncs)-1):
+        if ncs[i] * gdivisors[i-1] != ncs[i+1]:
+            return False
+    return True
+
+
+@app.function
+def is_image_size_layer_compat(img_sz, ncs):
+    if len(img_sz) != 3:
+        return False
+    if (len(ncs) <= 2):
+        return False
+    if img_sz[0] != ncs[0]:
+        return False
+    def factor2(val):
+        f = 0
+        while val % 2 == 0:
+            f += 1
+            val = val // 2
+        return f
+    max_layer = min(factor2(img_sz[1]), factor2(img_sz[2]))
+    if len(ncs) > max_layer + 2:
+        return False
+    return True
 
 
 @app.cell
@@ -125,40 +153,25 @@ def _(PositionEmbeddingV1, nn, torch):
 
 @app.cell
 def _(nn):
-    class ConvBlockV1(nn.Module):
-        def __init__(self, inc, outc, nt, gdivisor=2):
-            super(ConvBlockV1, self).__init__()
-            self.conv1 = nn.Sequential(
-                nn.GroupNorm(inc // gdivisor, inc),
+    class EmbeddingBlockV1(nn.Module):
+        def __init__(self, idim, edim):
+            super().__init__()
+            self.layers = nn.Sequential(
+                nn.Linear(idim, edim),
                 nn.SiLU(),
-                nn.Conv2d(inc, outc, 3, stride=1, padding=1),
+                nn.Linear(edim, edim),
             )
-            self.tproj = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(nt, outc),
-            )
-            self.conv2 = nn.Sequential(
-                nn.GroupNorm(outc // gdivisor, outc),
-                nn.SiLU(),
-                nn.Conv2d(outc, outc, 3, stride=1, padding=1),
-            )
-            self.res = nn.Conv2d(inc, outc, 1) if inc != outc else nn.Identity()
 
-        def forward(self, x, t):
-            out = x
-            out = self.conv1(out)
-            out += self.tproj(t).unsqueeze(-1).unsqueeze(-1)
-            out = self.conv2(out)
-            out += self.res(x)
-            return out
-    return (ConvBlockV1,)
+        def forward(self, x):
+            return self.layers(x)
+    return (EmbeddingBlockV1,)
 
 
 @app.cell
-def _(nn):
-    class ConvBlockV2(nn.Module):
-        def __init__(self, inc, outc, nt, gdivisor=2):
-            super(ConvBlockV2, self).__init__()
+def _(EmbeddingBlockV1, nn):
+    class ConvBlockV3(nn.Module):
+        def __init__(self, inc, outc, nt, nc, gdivisor=2):
+            super().__init__()
             self.is_same_channel = inc == outc
             self.conv1 = nn.Sequential(
                 nn.GroupNorm(inc // gdivisor, inc),
@@ -169,270 +182,132 @@ def _(nn):
                 nn.SiLU(),
                 nn.Linear(nt, outc),
             )
+            self.cproj = EmbeddingBlockV1(nc, outc)
             self.conv2 = nn.Sequential(
                 nn.GroupNorm(outc // gdivisor, outc),
                 nn.SiLU(),
                 nn.Conv2d(outc, outc, 3, stride=1, padding=1),
             )
 
-        def forward(self, x, t):
+        def forward(self, x, t, c):
             x1 = self.conv1(x)
-            out = x1 + self.tproj(t).unsqueeze(-1).unsqueeze(-1)
+            c = self.cproj(c).unsqueeze(-1).unsqueeze(-1)
+            out = c * x1 + self.tproj(t).unsqueeze(-1).unsqueeze(-1)
             out = self.conv2(out)
             if self.is_same_channel:
                 out = x + out
             else:
                 out = x1 + out
             return out / 1.414
-    return (ConvBlockV2,)
+    return (ConvBlockV3,)
 
 
 @app.cell
-def _(nn):
-    class AttnBlockV1(nn.Module):
-        def __init__(self, nc, nhead, gdivisor=2):
-            super(AttnBlockV1, self).__init__()
-            self.anorm = nn.GroupNorm(nc // gdivisor, nc)
-            self.attn = nn.MultiheadAttention(nc, nhead, batch_first=True)
-
-        def forward(self, x):
-            b, c, h, w = x.shape
-            out = x.reshape(b, c, h * w)
-            out = self.anorm(out)
-            out = out.transpose(1, 2)
-            out, _ = self.attn(out, out, out)
-            out = out.transpose(1, 2).reshape(b, c, h, w)
-            out += x
-            return out
-    return (AttnBlockV1,)
-
-
-@app.cell
-def _(AttnBlockV1, ConvBlockV1, nn):
-    class DownBlockV1(nn.Module):
-        def __init__(self, inc, outc, nt, nhead, gdivisor=2, downsample=True):
-            super(DownBlockV1, self).__init__()
-            self.res = ConvBlockV1(inc, outc, nt, gdivisor=gdivisor)
-            self.attn = AttnBlockV1(outc, nhead, gdivisor=gdivisor)
+def _(ConvBlockV3, nn):
+    class DownBlockV3(nn.Module):
+        def __init__(self, inc, outc, nt, nc, gdivisor=2, downsample=True):
+            super().__init__()
+            self.res = ConvBlockV3(inc, outc, nt, nc, gdivisor=gdivisor)
             self.downsample = nn.Conv2d(outc, outc, 4, stride=2, padding=1) if downsample else nn.Identity()
 
-        def forward(self, x, t):
-            x = self.res(x, t)
-            x = self.attn(x)
+        def forward(self, x, t, c):
+            x = self.res(x, t, c)
             x = self.downsample(x)
             return x
-    return (DownBlockV1,)
+    return (DownBlockV3,)
 
 
 @app.cell
-def _(ConvBlockV2, nn):
-    class DownBlockV2(nn.Module):
-        def __init__(self, inc, outc, nt, gdivisor=2, downsample=True):
-            super(DownBlockV2, self).__init__()
-            self.res = ConvBlockV2(inc, outc, nt, gdivisor=gdivisor)
-            self.downsample = nn.Conv2d(outc, outc, 4, stride=2, padding=1) if downsample else nn.Identity()
-
-        def forward(self, x, t):
-            x = self.res(x, t)
-            x = self.downsample(x)
-            return x
-    return (DownBlockV2,)
-
-
-@app.cell
-def _(AttnBlockV1, ConvBlockV1, nn, torch):
-    class UpBlockV1(nn.Module):
-        def __init__(self, inc, outc, nt, nhead, gdivisor=2, upsample=True):
-            super(UpBlockV1, self).__init__()
+def _(ConvBlockV3, nn, torch):
+    class UpBlockV3(nn.Module):
+        def __init__(self, inc, outc, nt, nc, gdivisor=2, upsample=True):
+            super().__init__()
             self.upsample = nn.ConvTranspose2d(inc, (inc - outc), 4, stride=2, padding=1) if upsample else nn.Identity()
-            self.res = ConvBlockV1(inc, outc, nt, gdivisor=gdivisor)
-            self.attn = AttnBlockV1(outc, nhead, gdivisor=gdivisor)
+            self.res = ConvBlockV3(inc, outc, nt, nc, gdivisor=gdivisor)
 
-        def forward(self, x, d, t):
+        def forward(self, x, d, t, c):
             x = self.upsample(x)
             x = torch.cat([x, d], dim=1)
-            x = self.res(x, t)
-            x = self.attn(x)
+            x = self.res(x, t, c)
             return x
-    return (UpBlockV1,)
+    return (UpBlockV3,)
 
 
 @app.cell
-def _(ConvBlockV2, nn, torch):
-    class UpBlockV2(nn.Module):
-        def __init__(self, inc, outc, nt, gdivisor=2, upsample=True):
-            super(UpBlockV2, self).__init__()
-            self.upsample = nn.ConvTranspose2d(inc, (inc - outc), 4, stride=2, padding=1) if upsample else nn.Identity()
-            self.res = ConvBlockV2(inc, outc, nt, gdivisor=gdivisor)
+def _(ConvBlockV3, nn):
+    class MidBlockV3(nn.Module):
+        def __init__(self, nc, nt, n_class, gdivisor=2):
+            super().__init__()
+            self.res1 = ConvBlockV3(nc, nc, nt, n_class, gdivisor=gdivisor)
+            self.res2 = ConvBlockV3(nc, nc, nt, n_class, gdivisor=gdivisor)
 
-        def forward(self, x, d, t):
-            x = self.upsample(x)
-            x = torch.cat([x, d], dim=1)
-            x = self.res(x, t)
+        def forward(self, x, t, c):
+            x = self.res1(x, t, c)
+            x = self.res2(x, t, c)
             return x
-    return (UpBlockV2,)
+    return (MidBlockV3,)
 
 
 @app.cell
-def _(AttnBlockV1, ConvBlockV1, nn):
-    class MidBlockV1(nn.Module):
-        def __init__(self, nc, nt, nhead, gdivisor=2):
-            super(MidBlockV1, self).__init__()
-            self.res1 = ConvBlockV1(nc, nc, nt, gdivisor=gdivisor)
-            self.res2 = ConvBlockV1(nc, nc, nt, gdivisor=gdivisor)
-            self.attn = AttnBlockV1(nc, nhead, gdivisor=gdivisor)
-
-        def forward(self, x, t):
-            x = self.res1(x, t)
-            x = self.attn(x)
-            x = self.res2(x, t)
-            return x
-    return (MidBlockV1,)
-
-
-@app.cell
-def _(ConvBlockV2, nn):
-    class MidBlockV2(nn.Module):
-        def __init__(self, nc, nt, gdivisor=2):
-            super(MidBlockV2, self).__init__()
-            self.res1 = ConvBlockV2(nc, nc, nt, gdivisor=gdivisor)
-            self.res2 = ConvBlockV2(nc, nc, nt, gdivisor=gdivisor)
-
-        def forward(self, x, t):
-            x = self.res1(x, t)
-            x = self.res2(x, t)
-            return x
-    return (MidBlockV2,)
-
-
-@app.function
-def calculate_group_divisors(ncs):
-    return [ncs[i+1] // ncs[i] for i in range(1, len(ncs)-1)]
-
-
-@app.function
-def is_group_divisors_valid(ncs, gdivisors):
-    if len(ncs) - 2 != len(gdivisors):
-        return False
-    for i in range(1, len(ncs)-1):
-        if ncs[i] * gdivisors[i-1] != ncs[i+1]:
-            return False
-    return True
-
-
-@app.function
-def is_image_size_layer_compat(img_sz, ncs):
-    if len(img_sz) != 3:
-        return False
-    if (len(ncs) <= 2):
-        return False
-    if img_sz[0] != ncs[0]:
-        return False
-    def factor2(val):
-        f = 0
-        while val % 2 == 0:
-            f += 1
-            val = val // 2
-        return f
-    max_layer = min(factor2(img_sz[1]), factor2(img_sz[2]))
-    if len(ncs) > max_layer + 2:
-        return False
-    return True
-
-
-@app.cell
-def _(DownBlockV1, MidBlockV1, PositionEmbeddingBlockV1, UpBlockV1, nn, torch):
-    class UNetV1(nn.Module):
-        def __init__(self, ncs, nt, nhead, img_sz, device=torch.device("cpu")):
-            super(UNetV1, self).__init__()
-
+def _(
+    DownBlockV3,
+    F,
+    MidBlockV3,
+    PositionEmbeddingBlockV1,
+    UpBlockV3,
+    nn,
+    torch,
+):
+    class UNetV3(nn.Module):
+        def __init__(self, ncs, nt, nc, img_sz, device=torch.device("cpu")):
+            super().__init__()
             assert len(ncs) > 2, "UNetV1 require at least one image channel size + two intermediate layer channel size"
-
             gdivisors = calculate_group_divisors(ncs)
             assert is_group_divisors_valid(ncs, gdivisors) == True, "Invalid channel layer size layout"
-
             assert is_image_size_layer_compat(img_sz, ncs) == True, "Invalid image size and layer setting"
 
+            self.n_class = nc
+            self.device = device
             self.temb = PositionEmbeddingBlockV1(nt, device)
             self.downs = [nn.Conv2d(ncs[0], ncs[1], 3, stride=1, padding=1)]
             for i in range(1, len(ncs)-1):
-                self.downs.append(DownBlockV1(ncs[i], ncs[i+1], nt, nhead, gdivisor=gdivisors[i-1]))
+                self.downs.append(DownBlockV3(ncs[i], ncs[i+1], nt, nc, gdivisor=gdivisors[i-1]))
             self.downs = nn.ModuleList(self.downs)
             self.ups = []
             for i in range(len(ncs)-1, 1, -1):
-                self.ups.append(UpBlockV1(ncs[i], ncs[i-1], nt, nhead, gdivisor=gdivisors[i-2]))
+                self.ups.append(UpBlockV3(ncs[i], ncs[i-1], nt, nc, gdivisor=gdivisors[i-2]))
             self.ups.append(nn.Sequential(
                 nn.GroupNorm(ncs[1] // 2, ncs[1]),
                 nn.SiLU(),
                 nn.Conv2d(ncs[1], ncs[0], 3, stride=1, padding=1)
             ))
             self.ups = nn.ModuleList(self.ups)
-            self.mid = MidBlockV1(ncs[-1], nt, nhead)
+            self.mid = MidBlockV3(ncs[-1], nt, nc)
 
-        def forward(self, x, t):
+        def forward(self, x, t, c, mask):
             t = self.temb(t)
+            c = F.one_hot(c, num_classes=self.n_class).to(self.device)
+            mask = mask[:, None]
+            mask = mask.repeat(1, self.n_class).to(self.device)
+            mask = (1. * (1. - mask))
+            c = c * mask
             dx = []
             x = self.downs[0](x)
             for i in range(1, len(self.downs)):
                 dx.append(x)
-                x = self.downs[i](x, t)
-            x = self.mid(x, t)
+                x = self.downs[i](x, t, c)
+            x = self.mid(x, t, c)
             for i in range(len(self.ups)-1):
                 d = dx.pop()
-                x = self.ups[i](x, d, t)
+                x = self.ups[i](x, d, t, c)
             x = self.ups[-1](x)
             return x
-    return
-
-
-@app.cell
-def _(DownBlockV2, MidBlockV2, PositionEmbeddingBlockV1, UpBlockV2, nn, torch):
-    class UNetV2(nn.Module):
-        def __init__(self, ncs, nt, img_sz, device=torch.device("cpu")):
-            super(UNetV2, self).__init__()
-
-            assert len(ncs) > 2, "UNetV1 require at least one image channel size + two intermediate layer channel size"
-
-            gdivisors = calculate_group_divisors(ncs)
-            assert is_group_divisors_valid(ncs, gdivisors) == True, "Invalid channel layer size layout"
-
-            assert is_image_size_layer_compat(img_sz, ncs) == True, "Invalid image size and layer setting"
-
-            self.temb = PositionEmbeddingBlockV1(nt, device)
-            self.downs = [nn.Conv2d(ncs[0], ncs[1], 3, stride=1, padding=1)]
-            for i in range(1, len(ncs)-1):
-                self.downs.append(DownBlockV2(ncs[i], ncs[i+1], nt, gdivisor=gdivisors[i-1]))
-            self.downs = nn.ModuleList(self.downs)
-            self.ups = []
-            for i in range(len(ncs)-1, 1, -1):
-                self.ups.append(UpBlockV2(ncs[i], ncs[i-1], nt, gdivisor=gdivisors[i-2]))
-            self.ups.append(nn.Sequential(
-                nn.GroupNorm(ncs[1] // 2, ncs[1]),
-                nn.SiLU(),
-                nn.Conv2d(ncs[1], ncs[0], 3, stride=1, padding=1)
-            ))
-            self.ups = nn.ModuleList(self.ups)
-            self.mid = MidBlockV2(ncs[-1], nt)
-
-        def forward(self, x, t):
-            t = self.temb(t)
-            dx = []
-            x = self.downs[0](x)
-            for i in range(1, len(self.downs)):
-                dx.append(x)
-                x = self.downs[i](x, t)
-            x = self.mid(x, t)
-            for i in range(len(self.ups)-1):
-                d = dx.pop()
-                x = self.ups[i](x, d, t)
-            x = self.ups[-1](x)
-            return x
-    return (UNetV2,)
+    return (UNetV3,)
 
 
 @app.cell
 def _():
-    ### noise schedule
+    ### noise scheduler
     return
 
 
@@ -500,7 +375,7 @@ def _(cosine_beta_schedule, torch):
         def timesteps(self, value):
             value = min(self.nts, value)
             self.n_timesteps = value
-    return
+    return (LinearNoiseScheduler,)
 
 
 @app.cell
@@ -559,7 +434,7 @@ def _(cosine_beta_schedule, math, torch):
 
         def training_timesteps(self):
             return self.n_timesteps
-    
+
         # sampling timesteps
         def set_timesteps(self, t):
             for idx, ti in enumerate(self.sampling_timesteps):
@@ -579,7 +454,7 @@ def _(cosine_beta_schedule, math, torch):
                     self.sampling_timesteps_end = idx + 1
                     return
             self.sampling_timesteps_end = len(self.sampling_timesteps)
-    return (DDIMScheduler,)
+    return
 
 
 @app.cell
@@ -590,20 +465,21 @@ def _():
 
 @app.cell
 def _(device, math, torch, tqdm):
-    def train(model, scheduler, dataloader, optim, loss, scaler, lrate, n_epoch, T, device=device):
+    def train(model, scheduler, dataloader, optim, loss, scaler, lrate, n_epoch, T, drop_prob=0.1, device=device):
         model.train()
         for ep in range(n_epoch):
             print(f'epoch {ep}')
             optim.param_groups[0]["lr"] = lrate * (1.-ep/n_epoch)
             pbar = tqdm(dataloader)
             loss_ema = None
-            for x, _ in pbar:
-                x = x.to(device)
+            for x, cls in pbar:
+                x, cls = x.to(device), cls.to(device)
+                mask = torch.bernoulli(torch.zeros_like(cls)+drop_prob).to(device)
                 ts = torch.randint(0, T+1, (x.shape[0],)).to(device)
                 noise = torch.randn_like(x).to(device)
                 xt = scheduler.add_noise(x, noise, ts).to(device)
                 with torch.amp.autocast("cuda"):
-                    out = model(xt, ts)
+                    out = model(xt, ts, cls, mask)
                     l = loss(noise, out)
                     if math.isnan(l.item()):
                         print(f"NaN loss, out ({torch.min(out)}, {torch.max(out)}) {torch.sum(torch.isnan(out))}")
@@ -633,41 +509,72 @@ def _():
 @app.cell
 def _(np, torch):
     @torch.no_grad()
-    def ddpm_sample(n_sample, model, scheduler, image_sz, T, device=torch.device("cpu"), seed=None):
+    def ddpm_sample(n_sample, model, scheduler, image_sz, n_class, T, cvec=None, guide_w=0, device=torch.device("cpu"), seed=None):
         if seed is not None:
             torch.manual_seed(seed)
+        if cvec is None:
+            cvec = torch.randint(0, n_class, n_sample).to(device)
+        else:
+            cvec = cvec.to(device)
+        mask = torch.zeros_like(cvec).to(device)
+        mask = mask.repeat(2)
+        mask[n_sample:] = 1.
+        cvec = cvec.repeat(2)
         scheduler.set_timesteps(T)
         xt = torch.randn(n_sample, *image_sz).to(device)
         xt_store = []
         for t in scheduler.timesteps:
-            ts = t.repeat(n_sample).to(device)
-            eps_pred = model(xt, ts)
-            xt = scheduler.step(eps_pred, t.item(), xt)
+            ts = t.repeat(n_sample * 2).to(device)
+            xt = xt.repeat(2, 1, 1, 1)  
+            eps = model(xt, ts, cvec, mask)
+            # conditional
+            eps1 = eps[:n_sample]
+            # unconditional
+            eps2 = eps[n_sample:]
+            eps = (1+guide_w) * eps1 - guide_w * eps2
+            xt = xt[:n_sample]
+            xt = scheduler.step(eps, t.item(), xt)
             if t % 20 == 0 or t == T or t < 8:
                 xt_store.append(xt.detach().cpu().numpy())
         xt_store = np.array(xt_store)
         return xt, xt_store
-    return
+    return (ddpm_sample,)
 
 
 @app.cell
 def _(np, torch):
     @torch.no_grad()
-    def ddim_sample(n_sample, model, scheduler, image_sz, T, device=torch.device("cpu"), seed=None):
+    def ddim_sample(n_sample, model, scheduler, image_sz, n_class, T, cvec=None, guide_w=0, device=torch.device("cpu"), seed=None):
         if seed is not None:
             torch.manual_seed(seed)
+        if cvec is None:
+            cvec = torch.randint(0, n_class, n_sample).to(device)
+        else:
+            cvec = cvec.to(device)
+        mask = torch.zeros_like(cvec).to(device)
+        mask = mask.repeat(2)
+        mask[n_sample:] = 1.
+        cvec = cvec.repeat(2)
         scheduler.set_timesteps(T)
         xt = torch.randn(n_sample, *image_sz).to(device)
         xt_store = []
         for tau in scheduler.timesteps:
             ts = scheduler.sampling_timesteps[tau.repeat(n_sample)].to(device)
-            eps_pred = model(xt, ts)
-            xt = scheduler.step(eps_pred, tau.item(), xt)
+            ts = ts.repeat(2)
+            xt = xt.repeat(2, 1, 1, 1)
+            eps = model(xt, ts, cvec, mask)
+            # conditional
+            eps1 = eps[:n_sample]
+            # unconditional
+            eps2 = eps[n_sample:]
+            eps = (1+guide_w) * eps1 - guide_w * eps2
+            xt = xt[:n_sample]
+            xt = scheduler.step(eps, tau.item(), xt)
             if tau % 10 == 0 or tau < 8:
                 xt_store.append(xt.detach().cpu().numpy())
         xt_store = np.array(xt_store)
         return xt, xt_store
-    return (ddim_sample,)
+    return
 
 
 @app.cell
@@ -687,7 +594,8 @@ def _(DataLoader, ToTensor, data_dir, datasets, transforms):
     mnist_transform = transforms.Compose([ToTensor()])
     mnist = datasets.MNIST(root=data_dir, train=True, download=True, transform=mnist_transform)
     mnist_loader = DataLoader(mnist, batch_size=32, shuffle=True)
-    return
+    mnist_nclass = 10
+    return (mnist_nclass,)
 
 
 @app.cell
@@ -695,7 +603,8 @@ def _(DataLoader, ToTensor, data_dir, datasets, transforms):
     fmnist_transform = transforms.Compose([ToTensor()])
     fmnist = datasets.FashionMNIST(root=data_dir, train=True, download=True, transform=ToTensor())
     fmnist_loader = DataLoader(fmnist, batch_size=32, shuffle=True)
-    return
+    fmnist_nclass = 10
+    return (fmnist_nclass,)
 
 
 @app.cell
@@ -723,14 +632,13 @@ def _():
 
 @app.cell
 def _(model_dir):
-    mnist_modelfile = model_dir + 'mnist_ddpm_v1.pth'
+    mnist_modelfile = model_dir + 'mnist_ddpm_cfd_v1.pth'
     return (mnist_modelfile,)
 
 
 @app.cell
-def _(UNetV2, device):
-    #mnist_model = UNetV1(ncs=[1, 16, 64, 256], nt=16, nhead=16, img_sz=(1, 28, 28), device=device).to(device)
-    mnist_model = UNetV2(ncs=[1, 16, 64, 256], nt=16, img_sz=(1, 28, 28), device=device).to(device)
+def _(UNetV3, device, mnist_nclass):
+    mnist_model = UNetV3(ncs=[1, 16, 64, 256], nt=16, nc=mnist_nclass, img_sz=(1, 28, 28), device=device).to(device)
     return (mnist_model,)
 
 
@@ -742,15 +650,16 @@ def _(cpu, mnist_model, mnist_modelfile, torch):
 
 
 @app.cell
-def _(DDIMScheduler, T, device, learning_rate, mnist_model, torch):
-    mnist_scheduler = DDIMScheduler(T, (1,28,28), 600, sampling_method='quad', device=device)
+def _(LinearNoiseScheduler, T, device, learning_rate, mnist_model, torch):
+    mnist_scheduler = LinearNoiseScheduler(T, (1,28,28), beta_schedule='cosine', device=device)
+    #mnist_scheduler = DDIMScheduler(T, (1,28,28), 600, beta_schedule='cosine', sampling_method='quad', device=device)
     mnist_optimizer = torch.optim.AdamW(mnist_model.parameters(), lr=learning_rate)
     return (mnist_scheduler,)
 
 
 @app.cell
 def _():
-    #train(model, scheduler, mnist_loader, optimizer, loss, scaler, learning_rate, nsteps, T, device=device)
+    #train(mnist_model, mnist_scheduler, mnist_loader, mnist_optimizer, loss, scaler, learning_rate, n_steps, T, device=device)
     return
 
 
@@ -762,8 +671,10 @@ def _():
 
 
 @app.cell
-def _(T, cpu, ddim_sample, device, mnist_model, mnist_scheduler):
-    mnist_samples, mnist_sample_timesteps = ddim_sample(4, mnist_model, mnist_scheduler, (1, 28, 28), T, device=device)
+def _(T, cpu, ddpm_sample, device, mnist_model, mnist_scheduler, torch):
+    mnist_samples, mnist_sample_timesteps = ddpm_sample(
+        4, mnist_model, mnist_scheduler, (1, 28, 28), 10, T, cvec=torch.tensor([0,1,2,3]), guide_w=2, device=device
+    )
     mnist_samples = mnist_samples.to(cpu)
     return (mnist_samples,)
 
@@ -781,40 +692,40 @@ def _(mnist_samples, plt, torchvision):
 
 @app.cell
 def _():
-    ### DDIM on Fashion MNIST
+    ### DDIM on FMNIST
     return
 
 
 @app.cell
 def _(model_dir):
-    fmnist_modelfile = model_dir + 'fmnist_ddpm_v1.pth'
+    fmnist_modelfile = model_dir + 'fmnist_ddpm_cfd_v1.pth'
     return (fmnist_modelfile,)
 
 
 @app.cell
-def _(UNetV2, device):
-    # fmnist_model = UNetV1(ncs=[1, 8, 16, 32], nt=8, nhead=8, img_sz=(1, 32, 32), device=device).to(device)
-    fmnist_model = UNetV2(ncs=[1, 16, 64, 256], nt=16, img_sz=(1, 28, 28), device=device).to(device)
+def _(UNetV3, device, fmnist_nclass):
+    fmnist_model = UNetV3(ncs=[1, 16, 64, 256], nt=16, nc=fmnist_nclass, img_sz=(1, 28, 28), device=device).to(device)
     return (fmnist_model,)
 
 
 @app.cell
 def _(cpu, fmnist_model, fmnist_modelfile, torch):
-    # load model
+    # load model if there is one
     fmnist_model.load_state_dict(torch.load(fmnist_modelfile, map_location=cpu, weights_only=True))
     return
 
 
 @app.cell
-def _(DDIMScheduler, T, device, learning_rate, mnist_model, torch):
-    fmnist_scheduler = DDIMScheduler(T, (1,28,28), 900, sampling_method='quad', device=device)
-    fmnist_optimizer = torch.optim.AdamW(mnist_model.parameters(), lr=learning_rate)
+def _(LinearNoiseScheduler, T, device, fmnist_model, learning_rate, torch):
+    fmnist_scheduler = LinearNoiseScheduler(T, (1,28,28), beta_schedule='cosine', device=device)
+    #fmnist_scheduler = DDIMScheduler(T, (1,28,28), 600, beta_schedule='cosine', sampling_method='quad', device=device)
+    fmnist_optimizer = torch.optim.AdamW(fmnist_model.parameters(), lr=learning_rate)
     return (fmnist_scheduler,)
 
 
 @app.cell
 def _():
-    #train(fmnist_model, scheduler, fmnist_loader, optimizer, loss, scaler, learning_rate, nsteps, T, device=device)
+    #train(fmnist_model, fmnist_scheduler, fmnist_loader, fmnist_optimizer, loss, scaler, learning_rate, n_steps, T, device=device)
     return
 
 
@@ -826,86 +737,20 @@ def _():
 
 
 @app.cell
-def _(T, cpu, ddim_sample, device, fmnist_model, fmnist_scheduler):
-    fmnist_samples, fmnist_sample_timesteps = ddim_sample(4, fmnist_model, fmnist_scheduler, (1, 28, 28), T, device=device)
+def _(T, cpu, ddpm_sample, device, fmnist_model, fmnist_scheduler, torch):
+    fmnist_samples, fmnist_sample_timesteps = ddpm_sample(
+        4, fmnist_model, fmnist_scheduler, (1, 28, 28), 10, T, cvec=torch.tensor([0,1,2,3]), guide_w=2, device=device
+    )
     fmnist_samples = fmnist_samples.to(cpu)
-    return fmnist_sample_timesteps, fmnist_samples
+    return (fmnist_samples,)
 
 
 @app.cell
 def _(fmnist_samples, plt, torchvision):
     fmnist_grid = torchvision.utils.make_grid(fmnist_samples/2+0.5, nrow=1)
     plt.figure(dpi=100)
-    plt.imshow(fmnist_grid.permute(1,2,0))
+    plt.imshow(fmnist_grid.permute(1,2,0), cmap='binary')
     plt.axis('off')
-    plt.tight_layout()
-    plt.show()
-    return
-
-
-@app.cell
-def _(fmnist_sample_timesteps, plt, torch):
-    plt.figure(figsize=(10,5), dpi=100)
-
-    for k in range(fmnist_sample_timesteps.shape[0]):
-        plt.subplot(8, 10, k+1)
-        im = torch.tensor(fmnist_sample_timesteps[k][0]).permute(1,2,0) / 2 + 0.5
-        plt.imshow(im, cmap='binary')
-        plt.axis('off')
-        plt.title(f"{k}")
-    plt.tight_layout()
-    plt.show()
-    return
-
-
-@app.cell
-def _():
-    ### DDIM on hugging face flower dataset (HF)
-    return
-
-
-@app.cell
-def _(
-    CenterCrop,
-    Compose,
-    InterpolationMode,
-    RandomHorizontalFlip,
-    Resize,
-    ToTensor,
-    load_dataset,
-):
-    hf_augmentations = Compose([
-        Resize(64, interpolation=InterpolationMode.BILINEAR),
-        CenterCrop(64),
-        RandomHorizontalFlip(),
-        ToTensor(),
-    ])
-
-    def hf_transforms(examples):
-        images = [hf_augmentations(image.convert("RGB")) for image in examples["image"]]
-        return {"input": images}
-
-    hf_dataset = load_dataset("huggan/flowers-102-categories", split="train",)
-    hf_dataset.set_transform(hf_transforms)
-    return (hf_dataset,)
-
-
-@app.cell
-def _(hf_dataset, torch):
-    hf_dataloader=torch.utils.data.DataLoader(hf_dataset, batch_size=4, shuffle=True)
-    return (hf_dataloader,)
-
-
-@app.cell
-def _(hf_dataloader, plt, torch):
-    plt.figure(figsize=(5.9,4),dpi=150)
-    for col in range(6):
-        imgs=next(iter(hf_dataloader))["input"]
-        for row in range(4):
-            plt.subplot(4,6,col+1+row*6)
-            img=imgs[row].permute(1,2,0) #B
-            plt.imshow(torch.clip(img,0,1)) #C
-            plt.axis('off')
     plt.tight_layout()
     plt.show()
     return
