@@ -12,12 +12,14 @@ def _():
 
 @app.cell
 def _():
+    from tqdm import tqdm
+
     import numpy as np
     import torch
     from torch import nn
 
     from matplotlib import pyplot as plt
-    return nn, np, plt, torch
+    return nn, np, torch, tqdm
 
 
 @app.cell
@@ -259,6 +261,54 @@ def _(EmbedLayer, ResidualConvBlock, UnetDown, UnetUp, nn, torch):
 
 
 @app.cell
+def _(device, n_sample, size, torch):
+    class NoiseScheduler:
+        def __init__(self, nts, bs=0.0001, be=0.02, device=torch.device("cpu")):
+            self.nts = nts
+            self.bs = bs
+            self.be = be
+            self.device = device
+            self.n_timesteps = nts
+            self._compute_params()
+
+        def _compute_params(self):
+            #TODO: correct with n_timesteps + 1 ?
+            self.beta_t = (self.be - self.bs) * torch.arange(0, self.n_timesteps + 1, dtype=torch.float32) / self.n_timesteps + self.bs
+            self.sqrt_beta_t = torch.sqrt(self.beta_t)
+            self.alpha_t = 1. - self.beta_t
+            self.log_alpha_t = torch.log(self.alpha_t)
+            self.alpha_bar_t = torch.cumsum(self.log_alpha_t, dim=0).exp()
+            self.sqrtab = torch.sqrt(self.alpha_bar_t)
+            self.oneover_sqrta = 1. / torch.sqrt(self.alpha_t)
+            self.sqrtmab = torch.sqrt(1. - self.alpha_bar_t)
+            self.mab_over_sqrtmab_inv = (1. - self.alpha_t) / self.sqrtmab
+
+        def add_noise(self, x0, eps, ts):
+            sqrt_abar = torch.index_select(self.sqrtab, 0, ts)[:, None, None, None]
+            sqrt1abar = torch.index_select(self.sqrtmab, 0, ts)[:, None, None, None]
+            return sqrt_abar * x0 + sqrt1abar * eps
+
+        def step(self, eps_pred, t, xt):
+            #TODO: z condition correct ? t > 1 or t >= 1
+            z = torch.randn(n_sample, *size).to(device) if t > 1 else 0.
+            x_n = self.oneover_sqrta[t] * (xt - eps_pred * self.mab_over_sqrtmab[t]) + self.sqrt_beta_t[t] * z
+            return x_n
+
+        def training_timesteps(self):
+            return self.n_timesteps
+
+        @property
+        def timesteps(self):
+            return [torch.tensor([i]) for i in reversed(range(self.n_timesteps))]
+
+        @timesteps.setter
+        def timesteps(self, value):
+            value = min(self.nts, value)
+            self.n_timesteps = value
+    return
+
+
+@app.cell
 def _(torch):
     def noise_scheduler(T):
         beta1, beta2 = 0.0001, 0.02 
@@ -285,6 +335,12 @@ def _(torch):
 
 
 @app.cell
+def _(torch):
+    torch.randint(0, 10, (20,))
+    return
+
+
+@app.cell
 def _(device, nn, noise_scheduler, torch):
     class DDPM(nn.Module):
         def __init__(self, model, n_T, device=device, drop_prob=0.1):
@@ -305,6 +361,27 @@ def _(device, nn, noise_scheduler, torch):
             context_mask = torch.bernoulli(torch.zeros_like(c)+self.drop_prob).to(self.device)
             return self.loss_mse(noise, self.model(x_t, c, _ts / self.n_T, context_mask))
     return (DDPM,)
+
+
+@app.cell
+def _(device, nn, noise_scheduler, torch):
+    class DDPM_noclass(nn.Module):
+        def __init__(self, model, n_T, device=device):
+            super().__init__()
+            self.model = model.to(device)
+            for k, v in noise_scheduler(n_T).items():
+                self.register_buffer(k, v)
+            self.n_T = n_T
+            self.device = device
+            self.loss_mse = nn.MSELoss()
+
+        def forward(self, x):
+            _ts = torch.randint(1, self.n_T+1, (x.shape[0],)).to(self.device)
+            noise = torch.rand_list(x)
+            x_t = (self.sqrtab[_ts, None, None, None] * x
+                  + self.sqrtmab[_ts, None, None, None] * noise)
+            return self.loss_mse(noise, self.model(x_t, _ts / self.n_T))
+    return
 
 
 @app.cell
@@ -345,7 +422,26 @@ def _(np, torch):
                 x_i_store.append(x_i.detach().cpu().numpy())
         x_i_store = np.array(x_i_store)
         return x_i, x_i_store
-    return (sample,)
+    return
+
+
+@app.cell
+def _(np, torch):
+    @torch.no_grad()
+    def sample_noclass(ddpm, model, n_sample, size, device, step_size=1):
+        x_i = torch.randn(n_sample, *size).to(device)
+        x_i_store = []
+        for i in range(ddpm.n_T, 0, -step_size):
+            t_is = torch.tensor([i / ddpm.n_T]).to(device)
+            t_is = t_is.repeat(n_sample, 1, 1, 1)
+            z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
+            eps = model(x_i, t_is)
+            x_i = ddpm.oneover_sqrta[i] * (x_i - eps * ddpm.mab_over_sqrtmab[i]) + ddpm.sqrt_beta_t[i] * z
+            if i % 20 == 0 or i == ddpm.n_T or i < 8:
+                x_i_store.append(x_i.detach().cpu().numpy())
+        x_i_store = np.array(x_i_store)
+        return x_i, x_i_store
+    return
 
 
 @app.cell
@@ -360,15 +456,34 @@ def _(data_dir, torch):
 
     torch.manual_seed(42)
 
-    tf = transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: 2*(x-0.5)),])
+    #tf = transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: 2*(x-0.5)),])
+    tf = transforms.Compose([transforms.ToTensor()])
     dataset = datasets.FashionMNIST(data_dir, train=True, download=True, transform=tf,)
     return (dataset,)
 
 
 @app.cell
+def _(dataset):
+    dataset[0][0].shape
+    return
+
+
+@app.cell
+def _(dataset, torch):
+    torch.max(dataset[0][0])
+    return
+
+
+@app.cell
+def _(dataset, torch):
+    torch.min(dataset[0][0])
+    return
+
+
+@app.cell
 def _():
     text_labels=['t-shirt', 'trouser', 'pullover', 'dress', 'coat', 'sandal', 'shirt', 'sneaker', 'bag', 'ankle boot']
-    return (text_labels,)
+    return
 
 
 @app.cell
@@ -376,7 +491,7 @@ def _(dataset):
     from torch.utils.data import DataLoader
 
     dataloader = DataLoader(dataset, batch_size=256, shuffle=True)
-    return (dataloader,)
+    return
 
 
 @app.cell
@@ -394,7 +509,7 @@ def _(DDPM, Unet, device, n_classes, torch):
     model=Unet(in_channels=1, n_feat=n_feat, n_classes=n_classes)
     ddpm=DDPM(model, n_T=n_T).to(device)
     optim = torch.optim.AdamW(ddpm.parameters(), lr=lrate)
-    return ddpm, model
+    return (model,)
 
 
 @app.cell
@@ -411,32 +526,58 @@ def _(model_dir):
 
 
 @app.cell
-def _():
-    # from tqdm import tqdm
+def _(device, math, torch, tqdm):
+    def train(ddpm, dataloader, optim, scaler, lrate, n_epoch):
+        for ep in range(n_epoch):
+            print(f'epoch {ep}')
+            ddpm.train()
+            optim.param_groups[0]["lr"] = lrate * (1-ep/n_epoch)
+            pbar = tqdm(dataloader)
+            loss_ema = None
+            for x, cls in pbar:
+                x, cls = x.to(device), cls.to(device)
+                with torch.amp.autocast("cuda"):
+                    loss = ddpm(x, cls)
+                optim.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
+                if math.isnan(loss.item()):
+                    break
+                elif loss_ema is None:
+                    loss_ema = loss.item()
+                else:
+                    loss_ema = 0.95 * loss_ema + 0.05 * loss.item()
+                pbar.set_description(f"loss: {loss_ema:.4f}")
+                optim.step()
+    return
 
-    # for ep in range(n_epoch):
-    #     print(f'epoch {ep}')
-    #     ddpm.train()
-    #     optim.param_groups[0]["lr"]=lrate*(1-ep/n_epoch)
-    #     pbar=tqdm(dataloader)
-    #     loss_ema=None
-    #     for x, cls in pbar: 
-    #         x, cls = x.to(device), cls.to(device)
-    #         with torch.amp.autocast("cuda"):
-    #             loss = ddpm(x,cls)
-    #         optim.zero_grad()
-    #         scaler.scale(loss).backward()
-    #         scaler.step(optim)
-    #         scaler.update()
-    #         if math.isnan(loss.item()):
-    #             break
-    #         elif loss_ema is None:
-    #             loss_ema = loss.item()
-    #         else:
-    #             loss_ema = 0.95 * loss_ema + 0.05 * loss.item()
-    #         pbar.set_description(f"loss: {loss_ema:.4f}")
-    #         optim.step()
-    # torch.save(model.state_dict(), model_file)
+
+@app.cell
+def _(device, math, torch, tqdm):
+    def train_noclass(ddpm, dataloader, optim, scaler, lrate, n_epoch):
+        for ep in range(n_epoch):
+            print(f'epoch {ep}')
+            ddpm.train()
+            optim.param_groups[0]["lr"] = lrate * (1-ep/n_epoch)
+            pbar = tqdm(dataloader)
+            loss_ema = None
+            for x, _ in pbar:
+                x = x.to(device)
+                with torch.amp.autocast("cuda"):
+                    loss = ddpm(x)
+                optim.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
+                if math.isnan(loss.item()):
+                    break
+                elif loss_ema is None:
+                    loss_ema = loss.item()
+                else:
+                    loss_ema = 0.95 * loss_ema + 0.05 * loss.item()
+                pbar.set_description(f"loss: {loss_ema:.4f}")
+                optim.step()
     return
 
 
@@ -453,40 +594,40 @@ def _():
 
 
 @app.cell
-def _(dataloader, ddpm, device, model, n_classes, sample, torch):
-    x,c2=next(iter(dataloader))
-    x,c2=x.to(device),c2.to(device)
-    ddpm.eval()
-    n_sample = n_classes
-    x_gen,x_gen_store=sample(ddpm,model,n_sample,(1,28,28), device,guide_w=2)
-    x_real = torch.Tensor(x_gen.shape).to(device)
-    for kk in range(n_classes):
-        try:
-            idx = torch.squeeze((c2 == kk).nonzero())[0]
-        except:
-            idx = 0
-        x_real[kk] = x[idx]
-    x_all = torch.cat([x_gen, x_real])
-    return (x_all,)
+def _():
+    # x,c2=next(iter(dataloader))
+    # x,c2=x.to(device),c2.to(device)
+    # ddpm.eval()
+    # n_sample = n_classes
+    # x_gen,x_gen_store=sample(ddpm,model,n_sample,(1,28,28), device,guide_w=2)
+    # x_real = torch.Tensor(x_gen.shape).to(device)
+    # for kk in range(n_classes):
+    #     try:
+    #         idx = torch.squeeze((c2 == kk).nonzero())[0]
+    #     except:
+    #         idx = 0
+    #     x_real[kk] = x[idx]
+    # x_all = torch.cat([x_gen, x_real])
+    return
 
 
 @app.cell
-def _(plt, text_labels, x_all):
-    captions=[]
-    for i in range(20):
-        gen="Generated" if i<10 else "Real"
-        num=i%10
-        label_and_num=f"{gen}\n{text_labels[num]} ({num})"
-        captions.append(label_and_num)
-    plt.figure(figsize=(10,3),dpi=100)
-    for i in range(20):
-        plt.subplot(2,10,i+1)
-        plt.imshow(x_all[i].cpu().permute(1,2,0)/2+0.5, cmap="binary")
-        plt.axis('off')
-        plt.title(captions[i],fontsize=10)
-    plt.tight_layout()
-    plt.show()
-    return (i,)
+def _():
+    # captions=[]
+    # for i in range(20):
+    #     gen="Generated" if i<10 else "Real"
+    #     num=i%10
+    #     label_and_num=f"{gen}\n{text_labels[num]} ({num})"
+    #     captions.append(label_and_num)
+    # plt.figure(figsize=(10,3),dpi=100)
+    # for i in range(20):
+    #     plt.subplot(2,10,i+1)
+    #     plt.imshow(x_all[i].cpu().permute(1,2,0)/2+0.5, cmap="binary")
+    #     plt.axis('off')
+    #     plt.title(captions[i],fontsize=10)
+    # plt.tight_layout()
+    # plt.show()
+    return
 
 
 @app.cell
@@ -496,18 +637,18 @@ def _():
 
 
 @app.cell
-def _(ddpm, device, i, model, n_classes, plt, sample, text_labels):
-    n_sample2 = 4*n_classes
-    x_gen2,x_gen_store2=sample(ddpm,model,n_sample2,(1,28,28), device,guide_w=5)
-    plt.figure(figsize=(10,5),dpi=100)
-    for ii in range(40):
-        plt.subplot(4,10,ii+1)
-        plt.imshow(x_gen2[ii].cpu().permute(1,2,0)/2+0.5, cmap="binary")
-        plt.axis('off')
-        c3=i%10
-        plt.title(f"{text_labels[c3]} ({c3})",fontsize=10)
-    plt.tight_layout()
-    plt.show()
+def _():
+    # n_sample2 = 4*n_classes
+    # x_gen2,x_gen_store2=sample(ddpm,model,n_sample2,(1,28,28), device,guide_w=5)
+    # plt.figure(figsize=(10,5),dpi=100)
+    # for ii in range(40):
+    #     plt.subplot(4,10,ii+1)
+    #     plt.imshow(x_gen2[ii].cpu().permute(1,2,0)/2+0.5, cmap="binary")
+    #     plt.axis('off')
+    #     c3=i%10
+    #     plt.title(f"{text_labels[c3]} ({c3})",fontsize=10)
+    # plt.tight_layout()
+    # plt.show()
     return
 
 
