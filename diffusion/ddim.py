@@ -16,6 +16,7 @@ def _():
 
     import math
     import random
+
     import numpy as np
 
     import torch
@@ -27,16 +28,24 @@ def _():
     from torchvision import transforms
     from torchvision.transforms import ToTensor
 
+    from datasets import load_dataset
+    from torchvision.transforms import (CenterCrop, Compose,InterpolationMode,RandomHorizontalFlip, Resize)
+
     import matplotlib.pyplot as plt
     return (
+        CenterCrop,
+        Compose,
         DataLoader,
+        InterpolationMode,
+        RandomHorizontalFlip,
+        Resize,
         ToTensor,
         datasets,
+        load_dataset,
         math,
         nn,
         np,
         plt,
-        random,
         torch,
         torchvision,
         tqdm,
@@ -58,14 +67,14 @@ def _(torch):
 
 @app.cell
 def _():
-    model_dir = 'models/'
-    return (model_dir,)
+    ### unet models
+    return
 
 
 @app.cell
 def _():
-    ### unet models
-    return
+    model_dir = 'models/'
+    return (model_dir,)
 
 
 @app.cell
@@ -423,219 +432,40 @@ def _(DownBlockV2, MidBlockV2, PositionEmbeddingBlockV1, UpBlockV2, nn, torch):
 
 @app.cell
 def _():
-    ### target model
-    return
-
-
-@app.cell
-def _(nn):
-    class EmbedLayer(nn.Module):
-        def __init__(self, input_dim, emb_dim):
-            super().__init__()
-            self.input_dim = input_dim
-            layers = [nn.Linear(input_dim, emb_dim), nn.GELU(), nn.Linear(emb_dim, emb_dim),]
-            self.model = nn.Sequential(*layers)
-        def forward(self, x):
-            x = x.view(-1, self.input_dim)
-            return self.model(x)
-    return (EmbedLayer,)
-
-
-@app.cell
-def _(nn):
-    class ResidualConvBlock(nn.Module):
-        def __init__(self, in_channels, out_channels, is_res = False):
-            super().__init__()
-            self.same_channels = in_channels==out_channels
-            self.is_res = is_res
-            self.conv1 = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 3, 1, 1),
-                nn.BatchNorm2d(out_channels),
-                nn.GELU(),
-            )
-            self.conv2 = nn.Sequential(
-                nn.Conv2d(out_channels, out_channels, 3, 1, 1),
-                nn.BatchNorm2d(out_channels),
-                nn.GELU(),
-            )
-        def forward(self, x):
-            if self.is_res:
-                x1 = self.conv1(x)
-                x2 = self.conv2(x1)
-                if self.same_channels:
-                    out = x + x2
-                else:
-                    out = x1 + x2 
-                return out / 1.414
-            else:
-                x1 = self.conv1(x)
-                x2 = self.conv2(x1)
-                return x2
-    return (ResidualConvBlock,)
-
-
-@app.cell
-def _(ResidualConvBlock, nn):
-    class UnetDown(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super().__init__()
-            layers = [ResidualConvBlock(in_channels, out_channels), nn.MaxPool2d(2)]
-            self.model = nn.Sequential(*layers)
-        def forward(self, x):
-            return self.model(x)
-    return (UnetDown,)
-
-
-@app.cell
-def _(ResidualConvBlock, nn, torch):
-    class UnetUp(nn.Module):
-        def __init__(self, in_channels, out_channels):
-            super().__init__()
-            layers = [
-                nn.ConvTranspose2d(in_channels, out_channels, 2, 2),
-                ResidualConvBlock(out_channels, out_channels),
-                ResidualConvBlock(out_channels, out_channels),
-            ]
-            self.model = nn.Sequential(*layers)
-        def forward(self, x, skip):
-            x = torch.cat((x, skip), 1)
-            x = self.model(x)
-            return x
-    return (UnetUp,)
-
-
-@app.cell
-def _():
-    ### reverse engineered model
-    return
-
-
-@app.cell
-def _(EmbedLayer, ResidualConvBlock, UnetDown, UnetUp, nn, torch):
-    class REUNet(nn.Module):
-        def __init__(self, in_channels, n_T, n_feat = 256, device=torch.device("cpu")):
-            super().__init__()
-            self.in_channels = in_channels
-            self.n_feat = n_feat
-            self.n_T = n_T
-            self.device = device
-            self.init_conv = ResidualConvBlock(in_channels, n_feat, is_res=True)
-            self.down1 = UnetDown(n_feat, n_feat)
-            self.down2 = UnetDown(n_feat, 2 * n_feat)
-            self.to_vec = nn.Sequential(nn.AvgPool2d(7), nn.GELU())
-            self.timeembed1 = EmbedLayer(1, 2*n_feat)
-            self.timeembed2 = EmbedLayer(1, 1*n_feat)
-            self.contextembed1 = EmbedLayer(10, 2*n_feat)
-            self.contextembed2 = EmbedLayer(10, 1*n_feat)
-            self.up0=nn.Sequential(nn.ConvTranspose2d(2*n_feat,2*n_feat,7,7), nn.GroupNorm(8, 2 * n_feat),nn.ReLU(),)
-            self.up1 = UnetUp(4 * n_feat, n_feat)
-            self.up2 = UnetUp(2 * n_feat, n_feat)
-            self.out = nn.Sequential(
-                nn.Conv2d(2 * n_feat, n_feat, 3, 1, 1),
-                nn.GroupNorm(8, n_feat),
-                nn.ReLU(),
-                nn.Conv2d(n_feat, self.in_channels, 3, 1, 1),
-            )
-
-        def forward(self, x, t):
-            context_mask = torch.bernoulli(torch.zeros(x.shape[0])+0.1).to(self.device)
-            t = (t+1.) / self.n_T
-            x = self.init_conv(x)
-            down1 = self.down1(x)
-            down2 = self.down2(down1)
-            hiddenvec = self.to_vec(down2)
-            context_mask = context_mask[:, None]
-            context_mask = context_mask.repeat(1,10)
-            context_mask = (-1*(1-context_mask)) 
-            cemb1 = self.contextembed1(context_mask).view(-1, self.n_feat * 2, 1, 1)
-            temb1 = self.timeembed1(t).view(-1, self.n_feat * 2, 1, 1)
-            cemb2 = self.contextembed2(context_mask).view(-1, self.n_feat, 1, 1)
-            temb2 = self.timeembed2(t).view(-1, self.n_feat, 1, 1)
-            up1 = self.up0(hiddenvec)
-            up2 = self.up1(cemb1*up1+ temb1, down2)  
-            up3 = self.up2(cemb2*up2+ temb2, down1)
-            out = self.out(torch.cat((up3, x), 1))
-            return out
-    return
-
-
-@app.cell
-def _():
     ### noise schedule
     return
 
 
 @app.cell
-def _():
-    # class LinearNoiseScheduler:
-    #     def __init__(self, nts, bs=0.0001, be=0.02, device=torch.device("cpu")):
-    #         self.nts = nts
-    #         self.bs = bs
-    #         self.be = be
-    #         self.n_timesteps = self.nts
-    #         self.device = device
-    #         self._compute_params()
-
-    #     def _compute_params(self):
-    #         # 0th index represent step 1, we never take step nts
-    #         self.bss = torch.linspace(self.bs, self.be, self.nts).to(self.device)
-    #         # at = 1. - bt
-    #         self.ass = 1. - self.bss
-    #         # a_bar = product(at) for t in 1 to t
-    #         self.abar = torch.cumprod(self.ass, dim=0)
-    #         self.s_abar = torch.sqrt(self.abar)
-    #         self.s1abar = torch.sqrt(1. - self.abar)
-
-    #     def add_noise(self, x0, eps, ts):
-    #         sqrt_abar = torch.index_select(self.s_abar, 0, ts)[:, None, None, None]
-    #         sqrt1abar = torch.index_select(self.s1abar, 0, ts)[:, None, None, None]
-    #         return sqrt_abar * x0 + sqrt1abar * eps
-
-    #     def step(self, eps_pred, t, xt):
-    #         # x0 = (xt - sqrt(1-abar) * eps) / sqrt(abar)
-    #         x0 = (xt - self.s1abar[t] * eps_pred) / self.s_abar[t]
-    #         x0 = torch.clamp(x0, -1., 1.)
-    #         # expectation = (1. / sqrt(at)) * (xt - (1 - at) / (sqrt(1 - abar)) * eps)
-    #         mean = xt - self.bss[t] * eps_pred / self.s1abar[t]
-    #         mean = mean / torch.sqrt(self.ass[t])
-    #         if t == 0:
-    #             return mean, x0
-    #         # variance = (1 - at) * (1 - abar[t-1]) / (1 - abar[t])
-    #         var = (1. - self.abar[t-1]) / (1. - self.abar[t])
-    #         var = var * self.bss[t]
-    #         sig = var ** 0.5
-    #         z = torch.randn(xt.shape).to(self.device) #TODO
-    #         return mean + sig * z, x0
-
-    #     def training_timesteps(self):
-    #         return self.n_timesteps
-
-    #     #TODO: need to return a list of tensor
-    #     @property
-    #     def timesteps(self):
-    #         return [torch.tensor([i]) for i in reversed(range(self.n_timesteps))]
-
-    #     @timesteps.setter
-    #     def timesteps(self, value):
-    #         value = min(self.nts, value)
-    #         self.n_timesteps = value
-    return
+def _(math, torch):
+    def cosine_beta_schedule(timesteps, beta_start, beta_end, s=0.008):
+        steps = timesteps + 1
+        x = torch.linspace(0, timesteps, steps, dtype=torch.float32)
+        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi * 0.5)**2
+        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, beta_start, beta_end)
+    return (cosine_beta_schedule,)
 
 
 @app.cell
-def _(device, torch):
+def _(cosine_beta_schedule, torch):
     class LinearNoiseScheduler:
-        def __init__(self, nts, image_sz, bs=0.0001, be=0.02, device=torch.device("cpu")):
+        def __init__(self, nts, image_sz, bs=0.0001, be=0.02, beta_schedule='linear', device=torch.device("cpu")):
             self.nts = nts
             self.bs = bs
             self.be = be
             self.image_sz = image_sz
             self.device = device
             self.n_timesteps = nts
+            self.beta_schedule = beta_schedule
             self._compute_params()
 
         def _compute_params(self):
-            self.beta_t = ((self.be - self.bs) * torch.arange(0, self.n_timesteps + 1, dtype=torch.float32) / self.n_timesteps + self.bs).to(device)
+            if self.beta_schedule == 'linear':
+                self.beta_t = ((self.be - self.bs) * torch.arange(0, self.n_timesteps + 1, dtype=torch.float32) / self.n_timesteps + self.bs).to(self.device)
+            elif self.beta_schedule == 'cosine':
+                self.beta_t = cosine_beta_schedule(self.nts, self.bs, self.be).to(self.device)
             self.sqrt_beta_t = torch.sqrt(self.beta_t)
             self.alpha_t = 1. - self.beta_t
             self.log_alpha_t = torch.log(self.alpha_t)
@@ -670,7 +500,86 @@ def _(device, torch):
         def timesteps(self, value):
             value = min(self.nts, value)
             self.n_timesteps = value
-    return (LinearNoiseScheduler,)
+    return
+
+
+@app.cell
+def _(cosine_beta_schedule, math, torch):
+    class DDIMScheduler:
+        def __init__(self, nts, image_sz, sampling_n, beta_schedule='linear', sampling_method='uniform', eta=0., bs=0.0001, be=0.02, device=torch.device("cpu")):
+            self.nts = nts
+            self.bs = bs
+            self.be = be
+            self.eta = eta
+            self.image_sz = image_sz
+            self.device = device
+            self.n_timesteps = nts
+            self.beta_schedule = beta_schedule
+            # sampling timesteps does not include T
+            if sampling_method == 'uniform':
+                self.sampling_timesteps = torch.arange(0, self.n_timesteps, self.n_timesteps // sampling_n) + 1
+            elif sampling_method == 'quad':
+                self.sampling_timesteps = torch.unique(torch.pow(torch.linspace(0, int(math.sqrt(1000 * 0.8)), sampling_n), 2.).to(dtype=torch.int32), dim=0) + 1
+            self.sampling_timesteps_end = len(self.sampling_timesteps)
+            self._compute_params()
+
+        def _compute_params(self):
+            if self.beta_schedule == 'linear':
+                self.beta_t = ((self.be - self.bs) * torch.arange(0, self.n_timesteps + 1, dtype=torch.float32) / self.n_timesteps + self.bs).to(self.device)
+            elif self.beta_schedule == 'cosine':
+                self.beta_t = cosine_beta_schedule(self.nts, self.bs, self.be).to(self.device)
+            self.sqrt_beta_t = torch.sqrt(self.beta_t)
+            self.alpha_t = 1. - self.beta_t
+            self.log_alpha_t = torch.log(self.alpha_t)
+            self.alpha_bar_t = torch.cumsum(self.log_alpha_t, dim=0).exp()
+            self.sqrtab = torch.sqrt(self.alpha_bar_t)
+            self.sqrtmab = torch.sqrt(1. - self.alpha_bar_t)
+            # sampling parameters
+            self.alpha_bar_s = self.alpha_bar_t[self.sampling_timesteps]
+            self.sqrt_alpha_bar_s = torch.sqrt(self.alpha_bar_s)
+            self.alpha_bar_s_prev = torch.cat([self.alpha_bar_t[0:1], self.alpha_bar_t[self.sampling_timesteps[:-1]]])
+            self.sqrt_alpha_bar_s_prev = torch.sqrt(self.alpha_bar_s_prev)
+            self.sigma = self.eta * torch.sqrt(
+                (1. - self.alpha_bar_s_prev) / (1. - self.alpha_bar_s) * 
+                (1. - self.alpha_bar_s / self.alpha_bar_s_prev)
+            )
+            self.sqrtmas = torch.sqrt(1. - self.alpha_bar_s)
+
+        def add_noise(self, x0, eps, ts):
+            sqrt_abar = torch.index_select(self.sqrtab, 0, ts)[:, None, None, None]
+            sqrt1abar = torch.index_select(self.sqrtmab, 0, ts)[:, None, None, None]
+            return sqrt_abar * x0 + sqrt1abar * eps
+
+        def step(self, eps_pred, tau, xt):
+            x0 = (xt - self.sqrtmas[tau] * eps_pred) / self.sqrt_alpha_bar_s[tau]
+            dxt = torch.sqrt(1. - self.alpha_bar_s_prev[tau] - torch.pow(self.sigma[tau], 2.)) * eps_pred
+            z = torch.randn(xt.shape[0], *self.image_sz).to(self.device) if self.eta != 0. and tau >= 1 else 0.
+            x_tp = self.sqrt_alpha_bar_s_prev[tau] * x0 + dxt + self.sigma[tau] * z
+            return x_tp
+
+        def training_timesteps(self):
+            return self.n_timesteps
+    
+        # sampling timesteps
+        def set_timesteps(self, t):
+            for idx, ti in enumerate(self.sampling_timesteps):
+                if ti == t:
+                    self.sampling_timesteps_end = idx + 1
+                    return
+            self.sampling_timesteps_end = len(self.sampling_timesteps)
+
+        @property
+        def timesteps(self):
+            return [torch.tensor([t]) for t in reversed(range(self.sampling_timesteps_end))]
+
+        @timesteps.setter
+        def timesteps(self, value):
+            for idx, ti in enumerate(self.sampling_timesteps):
+                if ti == value:
+                    self.sampling_timesteps_end = idx + 1
+                    return
+            self.sampling_timesteps_end = len(self.sampling_timesteps)
+    return (DDIMScheduler,)
 
 
 @app.cell
@@ -722,26 +631,9 @@ def _():
 
 
 @app.cell
-def _():
-    # @torch.no_grad()
-    # def ddpm_sample(n_sample, model, scheduler, gen_noise, image_sz, device=torch.device("cpu"), seed=None):
-    #     model.eval()
-    #     if seed is not None:
-    #         torch.manual_seed(seed)
-    #     scheduler.timesteps = 1000
-    #     image = gen_noise(n_sample, image_sz).to(device)
-    #     for t in scheduler.timesteps:
-    #         ts = torch.tensor([t]).repeat(n_sample).to(device)
-    #         eps_pred = model(image, ts)
-    #         image, _ = scheduler.step(eps_pred, t, image)
-    #     return image
-    return
-
-
-@app.cell
-def _(device, np, torch):
+def _(np, torch):
     @torch.no_grad()
-    def ddpm_sample(n_sample, model, scheduler, image_sz, T, device=device, seed=None):
+    def ddpm_sample(n_sample, model, scheduler, image_sz, T, device=torch.device("cpu"), seed=None):
         if seed is not None:
             torch.manual_seed(seed)
         scheduler.set_timesteps(T)
@@ -755,7 +647,27 @@ def _(device, np, torch):
                 xt_store.append(xt.detach().cpu().numpy())
         xt_store = np.array(xt_store)
         return xt, xt_store
-    return (ddpm_sample,)
+    return
+
+
+@app.cell
+def _(np, torch):
+    @torch.no_grad()
+    def ddim_sample(n_sample, model, scheduler, image_sz, T, device=torch.device("cpu"), seed=None):
+        if seed is not None:
+            torch.manual_seed(seed)
+        scheduler.set_timesteps(T)
+        xt = torch.randn(n_sample, *image_sz).to(device)
+        xt_store = []
+        for tau in scheduler.timesteps:
+            ts = scheduler.sampling_timesteps[tau.repeat(n_sample)].to(device)
+            eps_pred = model(xt, ts)
+            xt = scheduler.step(eps_pred, tau.item(), xt)
+            if tau % 10 == 0 or tau < 8:
+                xt_store.append(xt.detach().cpu().numpy())
+        xt_store = np.array(xt_store)
+        return xt, xt_store
+    return (ddim_sample,)
 
 
 @app.cell
@@ -776,7 +688,7 @@ def _(DataLoader, ToTensor, data_dir, datasets, transforms):
     mnist_transform = transforms.Compose([ToTensor()])
     mnist = datasets.MNIST(root=data_dir, train=True, download=True, transform=mnist_transform)
     mnist_loader = DataLoader(mnist, batch_size=32, shuffle=True)
-    return (mnist,)
+    return
 
 
 @app.cell
@@ -785,86 +697,30 @@ def _(DataLoader, ToTensor, data_dir, datasets, transforms):
     fmnist_transform = transforms.Compose([ToTensor()])
     fmnist = datasets.FashionMNIST(root=data_dir, train=True, download=True, transform=ToTensor())
     fmnist_loader = DataLoader(fmnist, batch_size=32, shuffle=True)
-    return (fmnist,)
-
-
-@app.cell
-def _():
-    ### display gradual noise addition
-    return
-
-
-@app.cell
-def _(plt, random, torch, torchvision):
-    def display_noise_addition(dataset, scheduler, idx=None):
-        if idx is None:
-            idx = random.randint(0, dataset.data.size()[0]-1)
-        tsize = 10
-        x0 = dataset[idx][0].unsqueeze(0).repeat(tsize, 1, 1, 1)
-        #eps = (torch.rand_like(x0) - 0.5) * 2
-        eps = torch.rand_like(x0)
-        ts = torch.tensor([0, 100, 200, 300, 400, 500, 600, 700, 800, 900])
-        xt = scheduler.add_noise(x0, eps, ts)
-        grid = torchvision.utils.make_grid(xt / 2 + 0.5, nrow=5)
-        plt.figure(dpi=100)
-        plt.imshow(grid.permute(1,2,0))
-        plt.axis('off')
-        plt.tight_layout()
-        plt.show()
-    return (display_noise_addition,)
-
-
-@app.cell
-def _(LinearNoiseScheduler, display_noise_addition, fmnist):
-    display_noise_addition(fmnist, LinearNoiseScheduler(1000, (1,28,28)))
-    return
-
-
-@app.cell
-def _(random, torch):
-    def noise_min_max(dataset, scheduler, idx=None):
-        if idx is None:
-            idx = random.randint(0, dataset.data.size()[0]-1)
-        tsize = 10
-        x0 = dataset[idx][0].unsqueeze(0).repeat(tsize, 1, 1, 1)
-        eps = (torch.rand_like(x0) - 0.5) * 2
-        #eps = torch.rand_like(x0)
-        ts = torch.tensor([0, 100, 200, 300, 400, 500, 600, 700, 800, 900])
-        xt = scheduler.add_noise(x0, eps, ts)
-        for i in range(tsize):
-            eps_max = torch.max(eps[i])
-            eps_min = torch.min(eps[i])
-            xt_max = torch.max(xt[i])
-            xt_min = torch.min(xt[i])
-            x0_max = torch.max(x0[i])
-            x0_min = torch.min(x0[i])
-            print(f"{i}: eps:({eps_min},{eps_max}) xt:({xt_min},{xt_max}) x0:({x0_min},{x0_max})")
-    return (noise_min_max,)
-
-
-@app.cell
-def _(LinearNoiseScheduler, mnist, noise_min_max):
-    noise_min_max(mnist, LinearNoiseScheduler(1000, (1, 28, 28)))
     return
 
 
 @app.cell
 def _():
-    ### DDPM on MNIST
+    ### shared training parameters
     return
 
 
 @app.cell
-def _(LinearNoiseScheduler, device, mnist_model, nn, torch):
+def _(nn, torch):
     T = 1000
     learning_rate = 0.0001
     n_steps = 20
     scaler = torch.cpu.amp.GradScaler()
     #scaler = torch.cuda.amp.GradScaler()
     loss = nn.MSELoss()
-    scheduler = LinearNoiseScheduler(T, (1,28,28), device=device)
-    optimizer = torch.optim.AdamW(mnist_model.parameters(), lr=learning_rate)
-    return T, scheduler
+    return T, learning_rate
+
+
+@app.cell
+def _():
+    ### DDIM on MNIST
+    return
 
 
 @app.cell
@@ -888,21 +744,28 @@ def _(cpu, mnist_model, mnist_modelfile, torch):
 
 
 @app.cell
+def _(DDIMScheduler, T, device, learning_rate, mnist_model, torch):
+    mnist_scheduler = DDIMScheduler(T, (1,28,28), 600, sampling_method='quad', device=device)
+    mnist_optimizer = torch.optim.AdamW(mnist_model.parameters(), lr=learning_rate)
+    return (mnist_scheduler,)
+
+
+@app.cell
 def _():
-    #train(mnist_model, scheduler, mnist_loader, optimizer, loss, scaler, learning_rate, nsteps, T, device=device)
+    #train(model, scheduler, mnist_loader, optimizer, loss, scaler, learning_rate, nsteps, T, device=device)
     return
 
 
 @app.cell
 def _():
     # save trained model
-    #torch.save(model.state_dict(), mnist_modelfile)
+    #torch.save(mnist_model.state_dict(), mnist_modelfile)
     return
 
 
 @app.cell
-def _(T, cpu, ddpm_sample, device, mnist_model, scheduler):
-    mnist_samples, mnist_sample_timesteps = ddpm_sample(4, mnist_model, scheduler, (1, 28, 28), T, device=device)
+def _(T, cpu, ddim_sample, device, mnist_model, mnist_scheduler):
+    mnist_samples, mnist_sample_timesteps = ddim_sample(4, mnist_model, mnist_scheduler, (1, 28, 28), T, device=device)
     mnist_samples = mnist_samples.to(cpu)
     return (mnist_samples,)
 
@@ -920,7 +783,7 @@ def _(mnist_samples, plt, torchvision):
 
 @app.cell
 def _():
-    ### DDPM on Fashion MNIST
+    ### DDIM on Fashion MNIST
     return
 
 
@@ -945,14 +808,28 @@ def _(cpu, fmnist_model, fmnist_modelfile, torch):
 
 
 @app.cell
+def _(DDIMScheduler, T, device, learning_rate, mnist_model, torch):
+    fmnist_scheduler = DDIMScheduler(T, (1,28,28), 900, sampling_method='quad', device=device)
+    fmnist_optimizer = torch.optim.AdamW(mnist_model.parameters(), lr=learning_rate)
+    return (fmnist_scheduler,)
+
+
+@app.cell
 def _():
     #train(fmnist_model, scheduler, fmnist_loader, optimizer, loss, scaler, learning_rate, nsteps, T, device=device)
     return
 
 
 @app.cell
-def _(T, cpu, ddpm_sample, device, fmnist_model, scheduler):
-    fmnist_samples, fmnist_sample_timesteps = ddpm_sample(4, fmnist_model, scheduler, (1, 28, 28), T, device=device)
+def _():
+    # save trained model
+    #torch.save(fmnist_model.state_dict(), fmnist_modelfile)
+    return
+
+
+@app.cell
+def _(T, cpu, ddim_sample, device, fmnist_model, fmnist_scheduler):
+    fmnist_samples, fmnist_sample_timesteps = ddim_sample(4, fmnist_model, fmnist_scheduler, (1, 28, 28), T, device=device)
     fmnist_samples = fmnist_samples.to(cpu)
     return fmnist_sample_timesteps, fmnist_samples
 
@@ -972,12 +849,65 @@ def _(fmnist_samples, plt, torchvision):
 def _(fmnist_sample_timesteps, plt, torch):
     plt.figure(figsize=(10,5), dpi=100)
 
-    for jjj in range(fmnist_sample_timesteps.shape[0]):
-        plt.subplot(6, 10, jjj+1)
-        im = torch.tensor(fmnist_sample_timesteps[jjj][0]).permute(1,2,0) / 2 + 0.5
+    for k in range(fmnist_sample_timesteps.shape[0]):
+        plt.subplot(8, 10, k+1)
+        im = torch.tensor(fmnist_sample_timesteps[k][0]).permute(1,2,0) / 2 + 0.5
         plt.imshow(im, cmap='binary')
         plt.axis('off')
-        plt.title(f"{jjj}")
+        plt.title(f"{k}")
+    plt.tight_layout()
+    plt.show()
+    return
+
+
+@app.cell
+def _():
+    ### DDIM on hugging face flower dataset (HF)
+    return
+
+
+@app.cell
+def _(
+    CenterCrop,
+    Compose,
+    InterpolationMode,
+    RandomHorizontalFlip,
+    Resize,
+    ToTensor,
+    load_dataset,
+):
+    hf_augmentations = Compose([
+        Resize(64, interpolation=InterpolationMode.BILINEAR),
+        CenterCrop(64),
+        RandomHorizontalFlip(),
+        ToTensor(),
+    ])
+
+    def hf_transforms(examples):
+        images = [hf_augmentations(image.convert("RGB")) for image in examples["image"]]
+        return {"input": images}
+
+    hf_dataset = load_dataset("huggan/flowers-102-categories", split="train",)
+    hf_dataset.set_transform(hf_transforms)
+    return (hf_dataset,)
+
+
+@app.cell
+def _(hf_dataset, torch):
+    hf_dataloader=torch.utils.data.DataLoader(hf_dataset, batch_size=4, shuffle=True)
+    return (hf_dataloader,)
+
+
+@app.cell
+def _(hf_dataloader, plt, torch):
+    plt.figure(figsize=(5.9,4),dpi=150)
+    for col in range(6):
+        imgs=next(iter(hf_dataloader))["input"]
+        for row in range(4):
+            plt.subplot(4,6,col+1+row*6)
+            img=imgs[row].permute(1,2,0) #B
+            plt.imshow(torch.clip(img,0,1)) #C
+            plt.axis('off')
     plt.tight_layout()
     plt.show()
     return
