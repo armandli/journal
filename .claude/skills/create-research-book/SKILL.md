@@ -77,16 +77,19 @@ A markdown cell with:
 ### Section 4 — Model Definition
 
 Follow the **Module Design Rules** in [references/MODULE-PATTERNS.md](references/MODULE-PATTERNS.md) strictly:
-- Every neural network class must have a `VERSION = "v1"` class attribute
-- Modules must be fully self-contained — no references to global variables
-- Modules must compose other custom modules (not just framework primitives)
-- Each module's `__init__` must have explicit typed parameters with defaults
-- Provide a markdown cell documenting the architecture (table or diagram in markdown)
+- Class names use PascalCase with the version number embedded at the end: `MultiLayerPerceptronV1`, `ResidualBlockV1`, `TransformerBlockV1`. Never a separate `VERSION` attribute.
+- To upgrade a module, define a new class with the incremented suffix: `MultiLayerPerceptronV2`.
+- Modules must be fully self-contained — no references to global variables or outer scope.
+- Modules must compose other custom modules (not just raw framework primitives).
+- Each module's `__init__` must have explicit typed parameters with defaults.
+- All standalone functions use snake_case and receive every dependency as an explicit parameter — no global variable access: `def train_model(model, data, lr, epochs):` not `def train_model():`.
+- Provide a markdown cell documenting the architecture (table listing each component class, its version, and output shape).
 
 Write at minimum:
-1. One or more **building-block modules** (e.g. `ResBlock`, `AttentionHead`, `MLPBlock`)
-2. One **top-level model class** that composes the building blocks
-3. A cell that instantiates the model and prints parameter count
+1. One or more **building-block modules** (e.g. `ResidualBlockV1`, `AttentionHeadV1`, `MultiLayerPerceptronV1`)
+2. One **top-level model class** that composes the building blocks (e.g. `ResearchCnnV1`)
+3. Standalone helper functions: `count_parameters(model)`, `compute_loss(model, batch)`, `train_model(model, optimizer, data, epochs)`, `evaluate_model(model, data)`
+4. A cell that instantiates the model and shows parameter count
 
 ### Section 5 — Training
 

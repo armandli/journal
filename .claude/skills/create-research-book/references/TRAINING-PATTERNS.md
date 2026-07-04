@@ -5,14 +5,14 @@
 ```python
 # Training cell template (MLX)
 @app.cell
-def _(ModelClass, train_buf, lr_ui, epochs_ui, bs_ui, wd_ui, train_btn):
+def _(ModelClassV1, train_buf, lr_ui, epochs_ui, bs_ui, wd_ui, train_btn):
     train_losses = []
     trained_model = None
 
     if not train_btn.value:
         mo.output.replace(mo.md("Click **Train** to begin training."))
     else:
-        _model = ModelClass(...)          # instantiate with hyperparams
+        _model = ModelClassV1(...)
         mx.eval(_model.parameters())
         _optimizer = optim.AdamW(
             learning_rate=lr_ui.value,
@@ -53,14 +53,14 @@ def _(ModelClass, train_buf, lr_ui, epochs_ui, bs_ui, wd_ui, train_btn):
 
 ```python
 @app.cell
-def _(ModelClass, train_loader, lr_ui, epochs_ui, wd_ui, train_btn, device):
+def _(ModelClassV1, train_loader, lr_ui, epochs_ui, wd_ui, train_btn, device):
     train_losses = []
     trained_model = None
 
     if not train_btn.value:
         mo.output.replace(mo.md("Click **Train** to begin training."))
     else:
-        _model = ModelClass(...).to(device)
+        _model = ModelClassV1(...).to(device)
         _optimizer = torch.optim.AdamW(
             _model.parameters(), lr=lr_ui.value, weight_decay=wd_ui.value
         )
@@ -109,11 +109,22 @@ def _():
 
 # Search cell (MLX example)
 @app.cell
-def _(hp_search_cb, ModelClass, train_buf, val_buf):
+def _(hp_search_cb, ModelClassV1, train_buf, val_buf):
     mo.stop(
         not hp_search_cb.value,
         mo.md("_Enable hyperparameter search above to run this section._")
     )
+
+    def _compute_val_loss(model, val_buf, batch_size: int) -> float:
+        total = 0.0
+        n = 0
+        for batch in val_buf.to_stream().batch(batch_size):
+            x = mx.array(batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
+            loss, _, _ = model(x)
+            mx.eval(loss)
+            total += float(mx.mean(loss).item())
+            n += 1
+        return total / max(n, 1)
 
     _search_space = {
         "lr": [1e-4, 1e-3, 3e-3],
@@ -125,10 +136,17 @@ def _(hp_search_cb, ModelClass, train_buf, val_buf):
 
     for _lr in _search_space["lr"]:
         for _ld in _search_space["latent_dim"]:
-            _model = ModelClass(latent_dim=_ld)
+            _model = ModelClassV1(latent_dim=_ld)
             mx.eval(_model.parameters())
             _opt = optim.Adam(learning_rate=_lr)
-            _vg_fn = nn.value_and_grad(_model, _loss_fn_for_search)
+
+            def _loss_fn(model, x):
+                recon, mu, logvar = model(x)
+                recon_loss = nn.losses.binary_cross_entropy(recon, x).mean()
+                kl_loss = -0.5 * mx.mean(1 + logvar - mu ** 2 - mx.exp(logvar))
+                return recon_loss + kl_loss
+
+            _vg_fn = nn.value_and_grad(_model, _loss_fn)
 
             for _ep in range(_n_search_epochs):
                 _stream = train_buf.shuffle().to_stream().batch(_bs)
@@ -138,22 +156,13 @@ def _(hp_search_cb, ModelClass, train_buf, val_buf):
                     _opt.update(_model, _grads)
                     mx.eval(_loss, _model.parameters())
 
-            # evaluate on val set
-            _val_loss = 0.0
-            _val_n = 0
-            for _batch in val_buf.to_stream().batch(_bs):
-                _x = mx.array(_batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-                _l, _, _ = _model(_x)
-                mx.eval(_l)
-                _val_loss += float(mx.mean(_l).item())
-                _val_n += 1
-
+            _val_loss = _compute_val_loss(_model, val_buf, _bs)
             _hp_results.append({
                 "lr": _lr,
                 "latent_dim": _ld,
-                "val_loss": _val_loss / max(_val_n, 1),
+                "val_loss": _val_loss,
             })
-            mo.output.replace(mo.md(f"lr={_lr}, latent_dim={_ld} — val_loss={_val_loss/_val_n:.4f}"))
+            mo.output.replace(mo.md(f"lr={_lr}, latent_dim={_ld} — val_loss={_val_loss:.4f}"))
 
     _hp_results.sort(key=lambda r: r["val_loss"])
     hp_results = _hp_results
@@ -213,7 +222,7 @@ def _(trained_model, test_loader, device):
 
 ```python
 @app.cell
-def _(ModelClass, full_dataset, device, lr_ui, epochs_ui):
+def _(ModelClassV1, full_dataset, device, lr_ui, epochs_ui, trained_model):
     if trained_model is None:
         _out = mo.md("_Train first, then cross-validation results will appear._")
     else:
@@ -231,7 +240,7 @@ def _(ModelClass, full_dataset, device, lr_ui, epochs_ui):
             _tl = DataLoader(_train_sub, batch_size=64, shuffle=True)
             _vl = DataLoader(_val_sub, batch_size=256)
 
-            _model = ModelClass(...).to(device)
+            _model = ModelClassV1(...).to(device)
             _opt = torch.optim.Adam(_model.parameters(), lr=lr_ui.value)
             _loss_fn = torch.nn.CrossEntropyLoss()
 
