@@ -23,7 +23,7 @@ def _():
     import tarfile
 
     url = ("https://raw.githubusercontent.com/neychev/" "small_DL_repo/master/datasets/Multi30k/training.tar.gz")
-    dest_dir = "/Users/armandli/data/deu2eng/"
+    dest_dir = "../data/deu2eng/"
     model_dir = 'model/'
     dest_file = dest_dir + "training.tar.gz"
     os.makedirs(dest_dir, exist_ok=True)

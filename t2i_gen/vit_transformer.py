@@ -20,7 +20,7 @@ def _():
 def _():
     import torchvision
 
-    data_dir = '/Users/armandli/data/'
+    data_dir = '../data/'
     model_dir = 'models/'
 
     trainset = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=True)

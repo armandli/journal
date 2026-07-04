@@ -20,7 +20,7 @@ def _():
 def _():
     import pandas as pd
 
-    data_dir = '/Users/armandli/data/'
+    data_dir = '../data/'
     model_dir = 'models/'
 
     df=pd.read_csv(data_dir + r'flickr8k/captions.txt', delimiter=",")

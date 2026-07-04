@@ -44,7 +44,7 @@ def _(torch):
 
 @app.cell
 def _():
-    data_dir = '/Users/armandli/data/'
+    data_dir = '../data/'
     model_dir = 'models/'
     return (data_dir,)
 

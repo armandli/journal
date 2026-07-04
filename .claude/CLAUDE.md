@@ -80,6 +80,16 @@ Marimo's reactivity means:
 - Don't add comments in cells that use mo.sql()
 </sql>
 
+## Environment
+
+The local Python environment is in the `env/` directory at the project root. Use `uv pip` to install packages:
+
+```
+uv pip install <package> --python env/bin/python
+```
+
+Never use `pip install` directly — always use `uv pip`.
+
 ## Troubleshooting
 
 Common issues and solutions:

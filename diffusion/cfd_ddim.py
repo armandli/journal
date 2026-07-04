@@ -585,7 +585,7 @@ def _():
 
 @app.cell
 def _():
-    data_dir = '/Users/armandli/data/'
+    data_dir = '../data/'
     return (data_dir,)
 
 

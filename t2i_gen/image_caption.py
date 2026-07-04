@@ -14,7 +14,7 @@ def _():
 def _():
     import json
 
-    data_dir = '/Users/armandli/data/'
+    data_dir = '../data/'
     model_dir = 'models/'
 
     with open(data_dir + 'flickr8k_caption_datasets/dataset_flickr8k.json', 'r') as fb:

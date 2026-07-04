@@ -628,7 +628,7 @@ def _(mo):
 
 @app.cell
 def _():
-    data_dir = "/Users/armandli/data"
+    data_dir = "../data"
     return (data_dir,)
 
 
