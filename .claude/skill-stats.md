@@ -2,6 +2,6 @@
 
 | Skill Name | Uses | Issues |
 |---|---|---|
-| commit-push | 3 | 0 |
-| create-skill | 2 | 0 |
+| commit-push | 4 | 0 |
+| create-skill | 3 | 0 |
 
