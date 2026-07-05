@@ -23,10 +23,20 @@ def _():
     return (exported_var,)
 ```
 
+### Cell Decorators
+
+| Decorator | Purpose |
+|-----------|---------|
+| `@app.cell` | Reactive cell — the standard cell for logic, UI, and display |
+| `@app.function` | Standalone reusable function — **one function per cell** |
+| `@app.class_definition` | Reusable class definition — **one class per cell** |
+
+`@app.function` and `@app.class_definition` are globally visible across all cells without being in any return tuple. Use them for every helper function and every `nn.Module` subclass.
+
 ### Rules
 - `with app.setup:` — third-party imports only (mlx, torch, numpy, matplotlib, etc.)
 - First `@app.cell` — `import marimo as mo` with plain `return`
-- Cell-local variables: prefix with `_` (not exported, not reusable by other cells)
+- **Avoid `_`-prefixed variables** — extract logic into `@app.function` instead of accumulating `_work_vars` inside a cell. The only acceptable `_` usage: `_out` in conditional-display cells, and one-off lambdas (e.g. `_preprocess`) that are genuinely cell-specific.
 - Cross-cell variables: returned explicitly in `return (var1, var2)`
 - No variable redeclaration across cells
 - Last expression in a cell is displayed (if not inside an `if` block)
@@ -34,15 +44,24 @@ def _():
 
 ### Conditional Display Pattern
 
+Use `_out` as the single cell-local variable in conditional-display cells. Extract the actual computation (plotting, evaluation) into a `@app.function` above so the cell stays minimal.
+
 ```python
+@app.function
+def plot_results(data):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.plot(data)
+    fig.tight_layout()
+    return fig
+
+
 @app.cell
-def _(some_dep):
-    if condition:
-        _out = mo.md("placeholder")
+def _(data, trained_model):
+    if trained_model is None:
+        _out = mo.md("_Train first._")
     else:
-        _fig, _ax = plt.subplots(...)
-        _out = _fig
-    _out   # always the last top-level expression
+        _out = plot_results(data)
+    _out
     return
 ```
 
@@ -95,21 +114,43 @@ def _(hp_search_cb, ...):
 
 ## Matplotlib Display Rules
 
-```python
-# Single axes
-_fig, _ax = plt.subplots(figsize=(8, 4))
-_ax.plot(...)
-_fig.tight_layout()
-_fig   # last expression — displayed by marimo
+Always extract matplotlib code into a `@app.function` that returns the `fig` object. The calling cell is then a single-line expression. Never call `plt.show()`.
 
-# Multiple subplots — same pattern, return _fig
-_fig, _axes = plt.subplots(3, 4, figsize=(12, 9))
-...
-_fig.tight_layout()
-_fig
+```python
+@app.function
+def plot_sample_grid(dataset, n_show: int = 40, rows: int = 5, cols: int = 8):
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 7))
+    for i in range(n_show):
+        sample = dataset[i]
+        img = np.array(sample["image"]).squeeze()
+        label = int(np.array(sample["label"]).item())
+        r, c = divmod(i, cols)
+        axes[r, c].imshow(img, cmap="gray")
+        axes[r, c].set_title(str(label), fontsize=9)
+        axes[r, c].axis("off")
+    fig.suptitle("Sample images", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+@app.cell
+def _(train_ds):
+    plot_sample_grid(train_ds)
+    return
 ```
 
-Never call `plt.show()`.
+For conditional plots (depends on a trained model), use `_out`:
+
+```python
+@app.cell
+def _(trained_model, test_batch):
+    if trained_model is None:
+        _out = mo.md("_Train first._")
+    else:
+        _out = plot_reconstructions(trained_model, test_batch)
+    _out
+    return
+```
 
 ## UI Element Rules
 

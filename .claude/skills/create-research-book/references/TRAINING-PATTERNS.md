@@ -2,11 +2,45 @@
 
 ## MLX Training Loop
 
+Extract per-epoch helpers as `@app.function` cells above the training cell. The training cell then calls them, keeping its own body minimal.
+
 ```python
-# Training cell template (MLX)
+# Helper: one training epoch — defined as @app.function above the training cell
+@app.function
+def run_train_epoch(model, loss_fn, optimizer, train_iter, preprocess_fn) -> float:
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    epoch_loss = 0.0
+    n_batches = 0
+    train_iter.reset()
+    for batch in train_iter:
+        x = preprocess_fn(batch)
+        loss, grads = loss_and_grad_fn(model, x)
+        optimizer.update(model, grads)
+        mx.eval(loss, model.parameters())
+        epoch_loss += loss.item()
+        n_batches += 1
+    return epoch_loss / max(n_batches, 1)
+
+
+@app.function
+def run_evaluate(model, loss_fn, data_iter, preprocess_fn) -> float:
+    total = 0.0
+    n = 0
+    data_iter.reset()
+    for batch in data_iter:
+        x = preprocess_fn(batch)
+        loss = loss_fn(model, x)
+        mx.eval(loss)
+        total += loss.item()
+        n += 1
+    return total / max(n, 1)
+
+
+# Training cell — calls helpers; progress via mo.output.replace
 @app.cell
-def _(ModelClassV1, train_buf, lr_ui, epochs_ui, bs_ui, wd_ui, train_btn):
+def _(train_btn, train_iter, val_iter, lr_ui, epochs_ui, wd_ui, mo):
     train_losses = []
+    val_losses = []
     trained_model = None
 
     if not train_btn.value:
@@ -14,183 +48,147 @@ def _(ModelClassV1, train_buf, lr_ui, epochs_ui, bs_ui, wd_ui, train_btn):
     else:
         _model = ModelClassV1(...)
         mx.eval(_model.parameters())
-        _optimizer = optim.AdamW(
-            learning_rate=lr_ui.value,
-            weight_decay=wd_ui.value,
-        )
-
-        def _loss_fn(model, x, y):
-            logits = model(x)
-            return nn.losses.cross_entropy(logits, y).mean()
-
-        _vg_fn = nn.value_and_grad(_model, _loss_fn)
+        _optimizer = optim.AdamW(learning_rate=lr_ui.value, weight_decay=wd_ui.value)
+        _preprocess = lambda batch: mx.array(batch["image"], dtype=mx.float32) / 255.0
         _n_epochs = epochs_ui.value
-        _bs = int(bs_ui.value)
 
-        for _epoch in range(_n_epochs):
-            _epoch_loss = 0.0
-            _n_batches = 0
-            _stream = train_buf.shuffle().to_stream().batch(_bs)
-            for _batch in _stream:
-                _x = mx.array(_batch["image"], dtype=mx.float32) / 255.0
-                _y = mx.array(_batch["label"])
-                _loss, _grads = _vg_fn(_model, _x, _y)
-                _optimizer.update(_model, _grads)
-                mx.eval(_loss, _model.parameters())
-                _epoch_loss += _loss.item()
-                _n_batches += 1
-            _avg = _epoch_loss / max(_n_batches, 1)
-            train_losses.append(_avg)
-            mo.output.replace(mo.md(f"**Epoch {_epoch+1}/{_n_epochs}** — loss: {_avg:.4f}"))
+        for epoch in range(_n_epochs):
+            tl = run_train_epoch(_model, compute_loss, _optimizer, train_iter, _preprocess)
+            vl = run_evaluate(_model, compute_loss, val_iter, _preprocess)
+            train_losses.append(tl)
+            val_losses.append(vl)
+            mo.output.replace(mo.md(f"**Epoch {epoch+1}/{_n_epochs}** — train: {tl:.4f} | val: {vl:.4f}"))
 
         trained_model = _model
-        mo.output.replace(mo.md(f"**Training complete!** Final loss: {train_losses[-1]:.4f}"))
+        mo.output.replace(mo.md(f"**Training complete!** Final train: {train_losses[-1]:.4f} | val: {val_losses[-1]:.4f}"))
 
-    return train_losses, trained_model
+    return train_losses, val_losses, trained_model
 ```
 
 ## PyTorch Training Loop
 
 ```python
+@app.function
+def run_train_epoch(model, optimizer, train_loader, loss_fn, device) -> float:
+    model.train()
+    epoch_loss = 0.0
+    for x, y in train_loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        loss = loss_fn(model(x), y)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        epoch_loss += loss.item()
+    return epoch_loss / len(train_loader)
+
+
+@app.function
+def run_evaluate(model, data_loader, loss_fn, device) -> float:
+    model.eval()
+    total = 0.0
+    with torch.no_grad():
+        for x, y in data_loader:
+            x, y = x.to(device), y.to(device)
+            total += loss_fn(model(x), y).item()
+    return total / len(data_loader)
+
+
 @app.cell
-def _(ModelClassV1, train_loader, lr_ui, epochs_ui, wd_ui, train_btn, device):
+def _(train_btn, train_loader, val_loader, lr_ui, epochs_ui, wd_ui, device, mo):
     train_losses = []
+    val_losses = []
     trained_model = None
 
     if not train_btn.value:
         mo.output.replace(mo.md("Click **Train** to begin training."))
     else:
         _model = ModelClassV1(...).to(device)
-        _optimizer = torch.optim.AdamW(
-            _model.parameters(), lr=lr_ui.value, weight_decay=wd_ui.value
-        )
-        _scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            _optimizer, T_max=epochs_ui.value
-        )
+        _optimizer = torch.optim.AdamW(_model.parameters(), lr=lr_ui.value, weight_decay=wd_ui.value)
+        _scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(_optimizer, T_max=epochs_ui.value)
         _loss_fn = torch.nn.CrossEntropyLoss()
-        _scaler = torch.cuda.amp.GradScaler()
         _n_epochs = epochs_ui.value
 
-        _model.train()
-        for _epoch in range(_n_epochs):
-            _epoch_loss = 0.0
-            for _x, _y in train_loader:
-                _x, _y = _x.to(device), _y.to(device)
-                _optimizer.zero_grad(set_to_none=True)
-                with torch.autocast(device_type=device.type):
-                    _logits = _model(_x)
-                    _loss = _loss_fn(_logits, _y)
-                _scaler.scale(_loss).backward()
-                _scaler.unscale_(_optimizer)
-                torch.nn.utils.clip_grad_norm_(_model.parameters(), 1.0)
-                _scaler.step(_optimizer)
-                _scaler.update()
-                _epoch_loss += _loss.item()
-            _avg = _epoch_loss / len(train_loader)
-            train_losses.append(_avg)
+        for epoch in range(_n_epochs):
+            tl = run_train_epoch(_model, _optimizer, train_loader, _loss_fn, device)
+            vl = run_evaluate(_model, val_loader, _loss_fn, device)
+            train_losses.append(tl)
+            val_losses.append(vl)
             _scheduler.step()
-            mo.output.replace(mo.md(f"**Epoch {_epoch+1}/{_n_epochs}** — loss: {_avg:.4f}"))
+            mo.output.replace(mo.md(f"**Epoch {epoch+1}/{_n_epochs}** — train: {tl:.4f} | val: {vl:.4f}"))
 
         trained_model = _model
-        mo.output.replace(mo.md(f"**Training complete!** Final loss: {train_losses[-1]:.4f}"))
+        mo.output.replace(mo.md(f"**Training complete!** Final train: {train_losses[-1]:.4f} | val: {val_losses[-1]:.4f}"))
 
-    return train_losses, trained_model
+    return train_losses, val_losses, trained_model
 ```
 
 ## Hyperparameter Search Pattern
 
 ```python
-# Gate cell
 @app.cell
 def _():
     hp_search_cb = mo.ui.checkbox(label="Enable Hyperparameter Search", value=False)
     hp_search_cb
     return (hp_search_cb,)
 
-# Search cell (MLX example)
+
 @app.cell
-def _(hp_search_cb, ModelClassV1, train_buf, val_buf):
+def _(hp_search_cb, train_iter, val_iter, mo):
     mo.stop(
         not hp_search_cb.value,
         mo.md("_Enable hyperparameter search above to run this section._")
     )
+    search_space = {"lr": [1e-4, 1e-3, 3e-3], "latent_dim": [16, 32, 64]}
+    n_search_epochs = 5
+    bs = 128
+    hp_results = []
+    _preprocess = lambda batch: mx.array(batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
 
-    def _compute_val_loss(model, val_buf, batch_size: int) -> float:
-        total = 0.0
-        n = 0
-        for batch in val_buf.to_stream().batch(batch_size):
-            x = mx.array(batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-            loss, _, _ = model(x)
-            mx.eval(loss)
-            total += float(mx.mean(loss).item())
-            n += 1
-        return total / max(n, 1)
+    for lr in search_space["lr"]:
+        for ld in search_space["latent_dim"]:
+            model = ModelClassV1(latent_dim=ld)
+            mx.eval(model.parameters())
+            opt = optim.Adam(learning_rate=lr)
+            for _ in range(n_search_epochs):
+                run_train_epoch(model, compute_loss, opt, train_iter, _preprocess)
+            vl = run_evaluate(model, compute_loss, val_iter, _preprocess)
+            hp_results.append({"lr": lr, "latent_dim": ld, "val_loss": round(vl, 4)})
+            mo.output.replace(mo.md(f"lr={lr}, latent_dim={ld} → val={vl:.4f}"))
 
-    _search_space = {
-        "lr": [1e-4, 1e-3, 3e-3],
-        "latent_dim": [16, 32, 64],
-    }
-    _n_search_epochs = 5
-    _bs = 128
-    _hp_results = []
-
-    for _lr in _search_space["lr"]:
-        for _ld in _search_space["latent_dim"]:
-            _model = ModelClassV1(latent_dim=_ld)
-            mx.eval(_model.parameters())
-            _opt = optim.Adam(learning_rate=_lr)
-
-            def _loss_fn(model, x):
-                recon, mu, logvar = model(x)
-                recon_loss = nn.losses.binary_cross_entropy(recon, x).mean()
-                kl_loss = -0.5 * mx.mean(1 + logvar - mu ** 2 - mx.exp(logvar))
-                return recon_loss + kl_loss
-
-            _vg_fn = nn.value_and_grad(_model, _loss_fn)
-
-            for _ep in range(_n_search_epochs):
-                _stream = train_buf.shuffle().to_stream().batch(_bs)
-                for _batch in _stream:
-                    _x = mx.array(_batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-                    _loss, _grads = _vg_fn(_model, _x)
-                    _opt.update(_model, _grads)
-                    mx.eval(_loss, _model.parameters())
-
-            _val_loss = _compute_val_loss(_model, val_buf, _bs)
-            _hp_results.append({
-                "lr": _lr,
-                "latent_dim": _ld,
-                "val_loss": _val_loss,
-            })
-            mo.output.replace(mo.md(f"lr={_lr}, latent_dim={_ld} — val_loss={_val_loss:.4f}"))
-
-    _hp_results.sort(key=lambda r: r["val_loss"])
-    hp_results = _hp_results
-    mo.ui.table(_hp_results)
+    hp_results.sort(key=lambda r: r["val_loss"])
+    mo.ui.table(hp_results)
     return (hp_results,)
 ```
 
 ## MLX Evaluation Pattern
 
+Extract evaluation logic into `@app.function`; the cell becomes a conditional display.
+
 ```python
+@app.function
+def evaluate_accuracy_mlx(model, test_iter, preprocess_fn) -> tuple[float, int, int]:
+    correct = 0
+    total = 0
+    test_iter.reset()
+    for batch in test_iter:
+        x = preprocess_fn(batch)
+        y = mx.array(batch["label"])
+        preds = mx.argmax(model(x), axis=-1)
+        mx.eval(preds)
+        correct += int(mx.sum(preds == y).item())
+        total += y.shape[0]
+    return correct / total, correct, total
+
+
 @app.cell
-def _(trained_model, test_buf):
+def _(trained_model, test_iter, mo):
     if trained_model is None:
         _out = mo.md("_Train the model first._")
     else:
-        _correct = 0
-        _total = 0
-        _stream = test_buf.to_stream().batch(256)
-        for _batch in _stream:
-            _x = mx.array(_batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-            _y = mx.array(_batch["label"])
-            _logits = trained_model(_x)
-            mx.eval(_logits)
-            _preds = mx.argmax(_logits, axis=-1)
-            _correct += int(mx.sum(_preds == _y).item())
-            _total += _y.shape[0]
-        _acc = _correct / _total
-        _out = mo.md(f"**Test Accuracy: {_acc:.4f}** ({_correct}/{_total} correct)")
+        _preprocess = lambda batch: mx.array(batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
+        acc, correct, total = evaluate_accuracy_mlx(trained_model, test_iter, _preprocess)
+        _out = mo.md(f"**Test Accuracy: {acc:.4f}** ({correct}/{total} correct)")
     _out
     return
 ```
@@ -198,22 +196,27 @@ def _(trained_model, test_buf):
 ## PyTorch Evaluation Pattern
 
 ```python
+@app.function
+def evaluate_accuracy_torch(model, data_loader, device) -> tuple[float, int, int]:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for x, y in data_loader:
+            x, y = x.to(device), y.to(device)
+            preds = model(x).argmax(dim=1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+    return correct / total, correct, total
+
+
 @app.cell
-def _(trained_model, test_loader, device):
+def _(trained_model, test_loader, device, mo):
     if trained_model is None:
         _out = mo.md("_Train the model first._")
     else:
-        trained_model.eval()
-        _correct = 0
-        _total = 0
-        with torch.no_grad():
-            for _x, _y in test_loader:
-                _x, _y = _x.to(device), _y.to(device)
-                _preds = trained_model(_x).argmax(dim=1)
-                _correct += (_preds == _y).sum().item()
-                _total += _y.size(0)
-        _acc = _correct / _total
-        _out = mo.md(f"**Test Accuracy: {_acc:.4f}** ({_correct}/{_total} correct)")
+        acc, correct, total = evaluate_accuracy_torch(trained_model, test_loader, device)
+        _out = mo.md(f"**Test Accuracy: {acc:.4f}** ({correct}/{total} correct)")
     _out
     return
 ```
@@ -221,74 +224,91 @@ def _(trained_model, test_loader, device):
 ## k-Fold Cross-Validation Pattern (PyTorch)
 
 ```python
+@app.function
+def run_fold(full_dataset, train_idx, val_idx, model_cls, lr: float, n_epochs: int, device, batch_size: int = 64) -> float:
+    from torch.utils.data import DataLoader, Subset
+    train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(Subset(full_dataset, val_idx), batch_size=256)
+    model = model_cls().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = torch.nn.CrossEntropyLoss()
+    for _ in range(n_epochs):
+        run_train_epoch(model, optimizer, train_loader, loss_fn, device)
+    acc, _, _ = evaluate_accuracy_torch(model, val_loader, device)
+    return acc
+
+
 @app.cell
-def _(ModelClassV1, full_dataset, device, lr_ui, epochs_ui, trained_model):
+def _(trained_model, full_dataset, device, lr_ui, epochs_ui, mo):
     if trained_model is None:
         _out = mo.md("_Train first, then cross-validation results will appear._")
     else:
         from sklearn.model_selection import KFold
-        import numpy as np
-
-        _k = 5
-        _kf = KFold(n_splits=_k, shuffle=True, random_state=42)
-        _indices = np.arange(len(full_dataset))
-        _fold_metrics = []
-
-        for _fold, (_train_idx, _val_idx) in enumerate(_kf.split(_indices)):
-            _train_sub = torch.utils.data.Subset(full_dataset, _train_idx)
-            _val_sub = torch.utils.data.Subset(full_dataset, _val_idx)
-            _tl = DataLoader(_train_sub, batch_size=64, shuffle=True)
-            _vl = DataLoader(_val_sub, batch_size=256)
-
-            _model = ModelClassV1(...).to(device)
-            _opt = torch.optim.Adam(_model.parameters(), lr=lr_ui.value)
-            _loss_fn = torch.nn.CrossEntropyLoss()
-
-            _model.train()
-            for _ep in range(epochs_ui.value):
-                for _x, _y in _tl:
-                    _x, _y = _x.to(device), _y.to(device)
-                    _opt.zero_grad()
-                    _loss_fn(_model(_x), _y).backward()
-                    _opt.step()
-
-            _model.eval()
-            _correct = _total = 0
-            with torch.no_grad():
-                for _x, _y in _vl:
-                    _x, _y = _x.to(device), _y.to(device)
-                    _correct += (_model(_x).argmax(1) == _y).sum().item()
-                    _total += _y.size(0)
-            _fold_metrics.append(_correct / _total)
-            mo.output.replace(mo.md(f"Fold {_fold+1}/{_k} — acc: {_fold_metrics[-1]:.4f}"))
-
-        _mean = float(np.mean(_fold_metrics))
-        _std = float(np.std(_fold_metrics))
-        cv_results = {"fold_accuracies": _fold_metrics, "mean": _mean, "std": _std}
-        _out = mo.md(f"**{_k}-Fold CV Accuracy: {_mean:.4f} ± {_std:.4f}**")
+        k = 5
+        kf = KFold(n_splits=k, shuffle=True, random_state=42)
+        indices = np.arange(len(full_dataset))
+        fold_metrics = []
+        for fold, (train_idx, val_idx) in enumerate(kf.split(indices)):
+            acc = run_fold(full_dataset, train_idx, val_idx, ModelClassV1, lr_ui.value, epochs_ui.value, device)
+            fold_metrics.append(acc)
+            mo.output.replace(mo.md(f"Fold {fold+1}/{k} — acc: {acc:.4f}"))
+        mean = float(np.mean(fold_metrics))
+        std = float(np.std(fold_metrics))
+        cv_results = {"fold_accuracies": fold_metrics, "mean": mean, "std": std}
+        _out = mo.md(f"**{k}-Fold CV Accuracy: {mean:.4f} ± {std:.4f}**")
     _out
     return (cv_results,)
 ```
 
 ## Results Plot Patterns
 
-```python
-# Loss curve
-_fig, _ax = plt.subplots(figsize=(8, 4))
-_ax.plot(range(1, len(train_losses) + 1), train_losses, "b-o", linewidth=2, markersize=4, label="Train")
-_ax.set_xlabel("Epoch"); _ax.set_ylabel("Loss"); _ax.set_title("Training Loss")
-_ax.legend(); _ax.grid(True, alpha=0.3)
-_fig.tight_layout()
-_fig
+Extract all plots into `@app.function` cells. Calling cells are single-line expressions (or use `_out` for conditional display).
 
-# Confusion matrix (classification)
-from sklearn.metrics import confusion_matrix
-import seaborn as sns
-_cm = confusion_matrix(all_labels, all_preds)
-_fig, _ax = plt.subplots(figsize=(8, 7))
-sns.heatmap(_cm, annot=True, fmt="d", cmap="Blues", ax=_ax)
-_ax.set_xlabel("Predicted"); _ax.set_ylabel("True")
-_ax.set_title("Confusion Matrix")
-_fig.tight_layout()
-_fig
+```python
+@app.function
+def plot_loss_curve(train_losses: list, val_losses: list | None = None):
+    fig, ax = plt.subplots(figsize=(8, 4))
+    epochs = range(1, len(train_losses) + 1)
+    ax.plot(epochs, train_losses, "b-o", lw=2, ms=4, label="Train")
+    if val_losses:
+        ax.plot(epochs, val_losses, "r-s", lw=2, ms=4, label="Val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training Loss")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+@app.function
+def plot_confusion_matrix(all_labels, all_preds, num_classes: int = 10):
+    import seaborn as sns
+    from sklearn.metrics import confusion_matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    fig, ax = plt.subplots(figsize=(8, 7))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax)
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title("Confusion Matrix")
+    fig.tight_layout()
+    return fig
+
+
+# Calling cells (unconditional)
+@app.cell
+def _(train_losses, val_losses):
+    plot_loss_curve(train_losses, val_losses)
+    return
+
+
+# Calling cells (conditional on trained model)
+@app.cell
+def _(trained_model, all_labels, all_preds):
+    if trained_model is None:
+        _out = mo.md("_Train first._")
+    else:
+        _out = plot_confusion_matrix(all_labels, all_preds)
+    _out
+    return
 ```

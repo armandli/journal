@@ -82,42 +82,50 @@ def _(mo, test_ds, train_ds):
     return
 
 
+@app.function
+def plot_mnist_samples(train_ds, n_show=40, rows=5, cols=8):
+    fig, axes = plt.subplots(rows, cols, figsize=(12, 7))
+    for i in range(n_show):
+        sample = train_ds[i]
+        img = np.array(sample["image"]).squeeze()
+        label = int(np.array(sample["label"]).item())
+        r, c = divmod(i, cols)
+        axes[r, c].imshow(img, cmap="gray")
+        axes[r, c].set_title(f"{label}", fontsize=9)
+        axes[r, c].axis("off")
+    fig.suptitle("MNIST training samples (labels shown as titles)", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
 @app.cell
 def _(train_ds):
-    _n_show = 40
-    _rows, _cols = 5, 8
-    _fig, _axes = plt.subplots(_rows, _cols, figsize=(12, 7))
-    for _i in range(_n_show):
-        _sample = train_ds[_i]
-        _img = np.array(_sample["image"]).squeeze()
-        _label = int(np.array(_sample["label"]).item())
-        _r, _c = divmod(_i, _cols)
-        _axes[_r, _c].imshow(_img, cmap="gray")
-        _axes[_r, _c].set_title(f"{_label}", fontsize=9)
-        _axes[_r, _c].axis("off")
-    _fig.suptitle("MNIST training samples (labels shown as titles)", fontsize=13)
-    _fig.tight_layout()
-    _fig
+    plot_mnist_samples(train_ds)
     return
 
 
+@app.function
+def plot_class_distribution(train_ds):
+    labels = np.array(
+        [int(np.array(train_ds[i]["label"]).item()) for i in range(len(train_ds))]
+    )
+    counts = np.bincount(labels, minlength=10)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.bar(np.arange(10), counts, color="steelblue", edgecolor="black")
+    ax.set_xticks(np.arange(10))
+    ax.set_xlabel("Digit")
+    ax.set_ylabel("Count")
+    ax.set_title("MNIST training-set class distribution")
+    for i, c in enumerate(counts):
+        ax.text(i, c + 50, str(int(c)), ha="center", fontsize=8)
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    return fig
+
+
 @app.cell
 def _(train_ds):
-    _labels = np.array(
-        [int(np.array(train_ds[_i]["label"]).item()) for _i in range(len(train_ds))]
-    )
-    _counts = np.bincount(_labels, minlength=10)
-    _fig, _ax = plt.subplots(figsize=(9, 4))
-    _ax.bar(np.arange(10), _counts, color="steelblue", edgecolor="black")
-    _ax.set_xticks(np.arange(10))
-    _ax.set_xlabel("Digit")
-    _ax.set_ylabel("Count")
-    _ax.set_title("MNIST training-set class distribution")
-    for _i, _c in enumerate(_counts):
-        _ax.text(_i, _c + 50, str(int(_c)), ha="center", fontsize=8)
-    _ax.grid(True, alpha=0.3, axis="y")
-    _fig.tight_layout()
-    _fig
+    plot_class_distribution(train_ds)
     return
 
 
@@ -166,260 +174,202 @@ def _(mo):
     return
 
 
-@app.cell
-def _():
-    class MultiLayerPerceptronBlockV1(nn.Module):
-        """Two-layer fully connected block with ReLU activations."""
+@app.class_definition
+class MultiLayerPerceptronBlockV1(nn.Module):
+    def __init__(self, input_dim: int = 784, hidden_dim: int = 512):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
 
-        def __init__(self, input_dim: int = 784, hidden_dim: int = 512):
-            super().__init__()
-            self.fc1 = nn.Linear(input_dim, hidden_dim)
-            self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-
-        def __call__(self, x: mx.array) -> mx.array:
-            return nn.relu(self.fc2(nn.relu(self.fc1(x))))
-
-    class VariationalEncoderV1(nn.Module):
-        """MLP encoder producing (mu, logvar) for the diagonal Gaussian posterior."""
-
-        def __init__(
-            self,
-            input_dim: int = 784,
-            hidden_dim: int = 512,
-            latent_dim: int = 32,
-        ):
-            super().__init__()
-            self.mlp = MultiLayerPerceptronBlockV1(input_dim, hidden_dim)
-            self.fc_mu = nn.Linear(hidden_dim, latent_dim)
-            self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
-
-        def __call__(self, x: mx.array):
-            h = self.mlp(x)
-            return self.fc_mu(h), self.fc_logvar(h)
-
-    class VariationalDecoderV1(nn.Module):
-        """MLP decoder mapping z back to pixels in [0, 1] via sigmoid."""
-
-        def __init__(
-            self,
-            latent_dim: int = 32,
-            hidden_dim: int = 512,
-            output_dim: int = 784,
-        ):
-            super().__init__()
-            self.mlp = MultiLayerPerceptronBlockV1(latent_dim, hidden_dim)
-            self.fc_out = nn.Linear(hidden_dim, output_dim)
-
-        def __call__(self, z: mx.array) -> mx.array:
-            return mx.sigmoid(self.fc_out(self.mlp(z)))
-
-    class VariationalAutoEncoderV1(nn.Module):
-        """Top-level VAE composing an encoder, decoder, and reparameterization."""
-
-        def __init__(
-            self,
-            input_dim: int = 784,
-            hidden_dim: int = 512,
-            latent_dim: int = 32,
-        ):
-            super().__init__()
-            self.encoder = VariationalEncoderV1(input_dim, hidden_dim, latent_dim)
-            self.decoder = VariationalDecoderV1(latent_dim, hidden_dim, input_dim)
-            self.latent_dim = latent_dim
-
-        def reparameterize(self, mu: mx.array, logvar: mx.array) -> mx.array:
-            std = mx.exp(0.5 * logvar)
-            return mu + mx.random.normal(std.shape) * std
-
-        def __call__(self, x: mx.array):
-            mu, logvar = self.encoder(x)
-            z = self.reparameterize(mu, logvar)
-            return self.decoder(z), mu, logvar
-
-        def decode(self, z: mx.array) -> mx.array:
-            return self.decoder(z)
-
-    return (VariationalAutoEncoderV1,)
+    def __call__(self, x: mx.array) -> mx.array:
+        return nn.relu(self.fc2(nn.relu(self.fc1(x))))
 
 
-@app.cell
-def _():
-    class ConvolutionBlockV1(nn.Module):
-        """Conv2d + ReLU building block (MLX channels-last NHWC format)."""
+@app.class_definition
+class VariationalEncoderV1(nn.Module):
+    def __init__(self, input_dim: int = 784, hidden_dim: int = 512, latent_dim: int = 32):
+        super().__init__()
+        self.mlp = MultiLayerPerceptronBlockV1(input_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
 
-        def __init__(
-            self,
-            in_channels: int = 1,
-            out_channels: int = 32,
-            kernel_size: int = 3,
-            stride: int = 1,
-            padding: int = 1,
-        ):
-            super().__init__()
-            self.conv = nn.Conv2d(
-                in_channels, out_channels, kernel_size,
-                stride=stride, padding=padding,
-            )
-
-        def __call__(self, x: mx.array) -> mx.array:
-            return nn.relu(self.conv(x))
-
-    class ConvolutionalEncoderV1(nn.Module):
-        """Two ConvolutionBlockV1 encoder for 28×28 images; outputs (mu, logvar)."""
-
-        def __init__(
-            self,
-            in_channels: int = 1,
-            base_channels: int = 32,
-            latent_dim: int = 32,
-        ):
-            super().__init__()
-            self.block1 = ConvolutionBlockV1(in_channels, base_channels, stride=2)
-            self.block2 = ConvolutionBlockV1(base_channels, base_channels * 2, stride=2)
-            self.fc_mu = nn.Linear(7 * 7 * base_channels * 2, latent_dim)
-            self.fc_logvar = nn.Linear(7 * 7 * base_channels * 2, latent_dim)
-
-        def __call__(self, x: mx.array):
-            h = self.block1(x)            # (B, 14, 14, base_channels)
-            h = self.block2(h)            # (B, 7, 7, base_channels*2)
-            h = h.reshape(h.shape[0], -1)
-            return self.fc_mu(h), self.fc_logvar(h)
-
-    class ConvolutionalDecoderV1(nn.Module):
-        """Two ConvTranspose2d decoder; outputs sigmoid-activated (B, 28, 28, 1)."""
-
-        def __init__(
-            self,
-            latent_dim: int = 32,
-            base_channels: int = 32,
-            out_channels: int = 1,
-        ):
-            super().__init__()
-            self.fc = nn.Linear(latent_dim, 7 * 7 * base_channels * 2)
-            self.deconv1 = nn.ConvTranspose2d(
-                base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1
-            )
-            self.deconv2 = nn.ConvTranspose2d(
-                base_channels, out_channels, kernel_size=4, stride=2, padding=1
-            )
-            self.spatial_c = base_channels * 2
-
-        def __call__(self, z: mx.array) -> mx.array:
-            h = nn.relu(self.fc(z))
-            h = h.reshape(h.shape[0], 7, 7, self.spatial_c)  # (B, 7, 7, base*2)
-            h = nn.relu(self.deconv1(h))                       # (B, 14, 14, base)
-            return mx.sigmoid(self.deconv2(h))                 # (B, 28, 28, out)
-
-    class ConvolutionalVariationalAutoEncoderV1(nn.Module):
-        """Top-level Conv VAE composing ConvolutionalEncoderV1 and ConvolutionalDecoderV1."""
-
-        def __init__(
-            self,
-            in_channels: int = 1,
-            base_channels: int = 32,
-            latent_dim: int = 32,
-        ):
-            super().__init__()
-            self.encoder = ConvolutionalEncoderV1(in_channels, base_channels, latent_dim)
-            self.decoder = ConvolutionalDecoderV1(latent_dim, base_channels, in_channels)
-            self.latent_dim = latent_dim
-
-        def reparameterize(self, mu: mx.array, logvar: mx.array) -> mx.array:
-            std = mx.exp(0.5 * logvar)
-            return mu + mx.random.normal(std.shape) * std
-
-        def __call__(self, x: mx.array):
-            mu, logvar = self.encoder(x)
-            z = self.reparameterize(mu, logvar)
-            return self.decoder(z), mu, logvar
-
-        def decode(self, z: mx.array) -> mx.array:
-            return self.decoder(z)
-
-    return (ConvolutionalVariationalAutoEncoderV1,)
+    def __call__(self, x: mx.array):
+        h = self.mlp(x)
+        return self.fc_mu(h), self.fc_logvar(h)
 
 
-@app.cell
-def _():
-    def count_parameters(model: nn.Module) -> int:
-        return sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
+@app.class_definition
+class VariationalDecoderV1(nn.Module):
+    def __init__(self, latent_dim: int = 32, hidden_dim: int = 512, output_dim: int = 784):
+        super().__init__()
+        self.mlp = MultiLayerPerceptronBlockV1(latent_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, output_dim)
 
-    def compute_vae_loss(model: nn.Module, x: mx.array) -> mx.array:
-        recon, mu, logvar = model(x)
-        x_flat = x.reshape(x.shape[0], -1)
-        recon_flat = recon.reshape(recon.shape[0], -1)
-        recon_loss = mx.mean(mx.sum((recon_flat - x_flat) ** 2, axis=-1))
-        kl_loss = -0.5 * mx.mean(
-            mx.sum(1 + logvar - mu ** 2 - mx.exp(logvar), axis=-1)
-        )
-        return recon_loss + kl_loss
-
-    return compute_vae_loss, count_parameters
+    def __call__(self, z: mx.array) -> mx.array:
+        return mx.sigmoid(self.fc_out(self.mlp(z)))
 
 
-@app.cell
-def _():
-    def run_train_epoch(
-        model: nn.Module,
-        loss_fn,
-        optimizer,
-        train_iter,
-        preprocess_fn,
-    ) -> float:
-        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
-        epoch_loss = 0.0
-        n_batches = 0
-        train_iter.reset()
-        for batch in train_iter:
-            x = preprocess_fn(batch)
-            loss, grads = loss_and_grad_fn(model, x)
-            optimizer.update(model, grads)
-            mx.eval(loss, model.parameters())
-            epoch_loss += loss.item()
-            n_batches += 1
-        return epoch_loss / max(n_batches, 1)
+@app.class_definition
+class VariationalAutoEncoderV1(nn.Module):
+    def __init__(self, input_dim: int = 784, hidden_dim: int = 512, latent_dim: int = 32):
+        super().__init__()
+        self.encoder = VariationalEncoderV1(input_dim, hidden_dim, latent_dim)
+        self.decoder = VariationalDecoderV1(latent_dim, hidden_dim, input_dim)
+        self.latent_dim = latent_dim
 
-    def run_evaluate(
-        model: nn.Module,
-        loss_fn,
-        data_iter,
-        preprocess_fn,
-    ) -> float:
-        total = 0.0
-        n = 0
-        data_iter.reset()
-        for batch in data_iter:
-            x = preprocess_fn(batch)
-            loss = loss_fn(model, x)
-            mx.eval(loss)
-            total += loss.item()
-            n += 1
-        return total / max(n, 1)
+    def reparameterize(self, mu: mx.array, logvar: mx.array) -> mx.array:
+        std = mx.exp(0.5 * logvar)
+        return mu + mx.random.normal(std.shape) * std
 
-    def train_and_validate(
-        model: nn.Module,
-        loss_fn,
-        train_iter,
-        val_iter,
-        n_epochs: int,
-        lr: float,
-        weight_decay: float,
-        preprocess_fn,
-        on_epoch_end=None,
+    def __call__(self, x: mx.array):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decoder(z), mu, logvar
+
+    def decode(self, z: mx.array) -> mx.array:
+        return self.decoder(z)
+
+
+@app.class_definition
+class ConvolutionBlockV1(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        out_channels: int = 32,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 1,
     ):
-        optimizer = optim.AdamW(learning_rate=lr, weight_decay=weight_decay)
-        train_losses = []
-        val_losses = []
-        for epoch in range(n_epochs):
-            tl = run_train_epoch(model, loss_fn, optimizer, train_iter, preprocess_fn)
-            vl = run_evaluate(model, loss_fn, val_iter, preprocess_fn)
-            train_losses.append(tl)
-            val_losses.append(vl)
-            if on_epoch_end is not None:
-                on_epoch_end(epoch, n_epochs, tl, vl)
-        return train_losses, val_losses
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
 
-    return run_evaluate, train_and_validate
+    def __call__(self, x: mx.array) -> mx.array:
+        return nn.relu(self.conv(x))
+
+
+@app.class_definition
+class ConvolutionalEncoderV1(nn.Module):
+    def __init__(self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 32):
+        super().__init__()
+        self.block1 = ConvolutionBlockV1(in_channels, base_channels, stride=2)
+        self.block2 = ConvolutionBlockV1(base_channels, base_channels * 2, stride=2)
+        self.fc_mu = nn.Linear(7 * 7 * base_channels * 2, latent_dim)
+        self.fc_logvar = nn.Linear(7 * 7 * base_channels * 2, latent_dim)
+
+    def __call__(self, x: mx.array):
+        h = self.block1(x)
+        h = self.block2(h)
+        h = h.reshape(h.shape[0], -1)
+        return self.fc_mu(h), self.fc_logvar(h)
+
+
+@app.class_definition
+class ConvolutionalDecoderV1(nn.Module):
+    def __init__(self, latent_dim: int = 32, base_channels: int = 32, out_channels: int = 1):
+        super().__init__()
+        self.fc = nn.Linear(latent_dim, 7 * 7 * base_channels * 2)
+        self.deconv1 = nn.ConvTranspose2d(base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1)
+        self.deconv2 = nn.ConvTranspose2d(base_channels, out_channels, kernel_size=4, stride=2, padding=1)
+        self.spatial_c = base_channels * 2
+
+    def __call__(self, z: mx.array) -> mx.array:
+        h = nn.relu(self.fc(z))
+        h = h.reshape(h.shape[0], 7, 7, self.spatial_c)
+        h = nn.relu(self.deconv1(h))
+        return mx.sigmoid(self.deconv2(h))
+
+
+@app.class_definition
+class ConvolutionalVariationalAutoEncoderV1(nn.Module):
+    def __init__(self, in_channels: int = 1, base_channels: int = 32, latent_dim: int = 32):
+        super().__init__()
+        self.encoder = ConvolutionalEncoderV1(in_channels, base_channels, latent_dim)
+        self.decoder = ConvolutionalDecoderV1(latent_dim, base_channels, in_channels)
+        self.latent_dim = latent_dim
+
+    def reparameterize(self, mu: mx.array, logvar: mx.array) -> mx.array:
+        std = mx.exp(0.5 * logvar)
+        return mu + mx.random.normal(std.shape) * std
+
+    def __call__(self, x: mx.array):
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+        return self.decoder(z), mu, logvar
+
+    def decode(self, z: mx.array) -> mx.array:
+        return self.decoder(z)
+
+
+@app.function
+def count_parameters(model: nn.Module) -> int:
+    return sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
+
+
+@app.function
+def compute_vae_loss(model: nn.Module, x: mx.array) -> mx.array:
+    recon, mu, logvar = model(x)
+    x_flat = x.reshape(x.shape[0], -1)
+    recon_flat = recon.reshape(recon.shape[0], -1)
+    recon_loss = mx.mean(mx.sum((recon_flat - x_flat) ** 2, axis=-1))
+    kl_loss = -0.5 * mx.mean(
+        mx.sum(1 + logvar - mu ** 2 - mx.exp(logvar), axis=-1)
+    )
+    return recon_loss + kl_loss
+
+
+@app.function
+def run_train_epoch(model: nn.Module, loss_fn, optimizer, train_iter, preprocess_fn) -> float:
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    epoch_loss = 0.0
+    n_batches = 0
+    train_iter.reset()
+    for batch in train_iter:
+        x = preprocess_fn(batch)
+        loss, grads = loss_and_grad_fn(model, x)
+        optimizer.update(model, grads)
+        mx.eval(loss, model.parameters())
+        epoch_loss += loss.item()
+        n_batches += 1
+    return epoch_loss / max(n_batches, 1)
+
+
+@app.function
+def run_evaluate(model: nn.Module, loss_fn, data_iter, preprocess_fn) -> float:
+    total = 0.0
+    n = 0
+    data_iter.reset()
+    for batch in data_iter:
+        x = preprocess_fn(batch)
+        loss = loss_fn(model, x)
+        mx.eval(loss)
+        total += loss.item()
+        n += 1
+    return total / max(n, 1)
+
+
+@app.function
+def train_and_validate(
+    model: nn.Module,
+    loss_fn,
+    train_iter,
+    val_iter,
+    n_epochs: int,
+    lr: float,
+    weight_decay: float,
+    preprocess_fn,
+    on_epoch_end=None,
+):
+    optimizer = optim.AdamW(learning_rate=lr, weight_decay=weight_decay)
+    train_losses = []
+    val_losses = []
+    for epoch in range(n_epochs):
+        tl = run_train_epoch(model, loss_fn, optimizer, train_iter, preprocess_fn)
+        vl = run_evaluate(model, loss_fn, val_iter, preprocess_fn)
+        train_losses.append(tl)
+        val_losses.append(vl)
+        if on_epoch_end is not None:
+            on_epoch_end(epoch, n_epochs, tl, vl)
+    return train_losses, val_losses
 
 
 @app.cell
@@ -442,7 +392,7 @@ def _(mo):
 
 
 @app.cell
-def _(VariationalAutoEncoderV1, count_parameters, mo):
+def _(mo):
     _reference_model = VariationalAutoEncoderV1(
         input_dim=784, hidden_dim=512, latent_dim=32
     )
@@ -476,7 +426,7 @@ def _(mo):
 
 
 @app.cell
-def _(ConvolutionalVariationalAutoEncoderV1, count_parameters, mo):
+def _(mo):
     _conv_ref = ConvolutionalVariationalAutoEncoderV1(
         in_channels=1, base_channels=32, latent_dim=32
     )
@@ -547,15 +497,11 @@ def _(bs_ui, test_ds, train_ds):
 
 @app.cell
 def _(
-    ConvolutionalVariationalAutoEncoderV1,
-    VariationalAutoEncoderV1,
-    compute_vae_loss,
     epochs_ui,
     hidden_dim_ui,
     latent_dim_ui,
     lr_ui,
     mo,
-    train_and_validate,
     train_btn,
     train_iter,
     val_iter,
@@ -647,15 +593,7 @@ def _(mo):
 
 
 @app.cell
-def _(
-    VariationalAutoEncoderV1,
-    compute_vae_loss,
-    hp_search_cb,
-    mo,
-    train_and_validate,
-    train_iter,
-    val_iter,
-):
+def _(hp_search_cb, mo, train_iter, val_iter):
     mo.stop(
         not hp_search_cb.value,
         mo.md("_Enable hyperparameter search above._"),
@@ -694,15 +632,7 @@ def _(mo):
 
 
 @app.cell
-def _(
-    compute_vae_loss,
-    conv_trained_model,
-    mo,
-    run_evaluate,
-    test_iter,
-    trained_model,
-    val_iter,
-):
+def _(conv_trained_model, mo, test_iter, trained_model, val_iter):
     if trained_model is None:
         _out = mo.md("_Train the models first._")
     else:
@@ -727,7 +657,7 @@ def _(
 
 
 @app.cell
-def _(VariationalAutoEncoderV1, compute_vae_loss, mo, train_ds, trained_model):
+def _(mo, train_ds, trained_model):
     if trained_model is None:
         _out = mo.md("_Train first._")
         cv_results = {}

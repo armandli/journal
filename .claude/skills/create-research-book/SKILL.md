@@ -49,6 +49,18 @@ Also read /home/armandli/journal/.claude/CLAUDE.md for project-wide marimo conve
 
 ---
 
+## Code Organization Rules (apply to every section)
+
+These rules are mandatory. Violations are bugs, not style choices.
+
+1. **One class per cell** — every `nn.Module` subclass gets its own `@app.class_definition` cell. Never put two classes in one cell.
+2. **One function per cell** — every standalone helper gets its own `@app.function` cell. Never bundle multiple functions.
+3. **No `_`-prefixed variables in cells** — extract logic into `@app.function` instead of writing local `_` work vars inside a cell. The only acceptable `_` vars are: `_out` in conditional-display cells, and short-lived lambdas (e.g. `_preprocess`) that are specific to one cell and genuinely not reusable.
+4. **All dependencies explicit** — every function receives every value it needs as a parameter. No captured globals, no module-level state.
+5. **Maximize reusability** — design every function and class to work for the general case, not just the immediate use. Parameterize what varies; use sensible defaults.
+
+---
+
 Write ALL 8 sections below. Do not skip any. Do not leave stubs or TODO comments.
 
 ### Section 1 — Title & Research Goal
@@ -57,21 +69,22 @@ A markdown cell with the notebook title, research goal statement, and a brief ou
 ### Section 2 — Data Exploration
 - Load or download the dataset to `../data/<dataset_name>/`
 - For MLX + image data: use `mlx.data.datasets.load_mnist(root="../data/mnist", train=True)` if MNIST
-- Show a grid of 20–60 sample images (matplotlib, return `_fig`, never call plt.show())
-- Show a class distribution bar chart
-- Print train / val / test split sizes
+- Extract each visualization as its own `@app.function` (e.g. `plot_sample_grid(dataset)`, `plot_class_distribution(dataset)`). These functions return a `fig` object — never call `plt.show()`. The cell that calls them is a single line returning the figure.
+- Print train / val / test split sizes in a markdown cell
 
 ### Section 3 — Dataset Creation
 - Define train/val/test splits (MNIST standard: use the built-in 60k train + 10k test; split train 85/15 for train/val)
 - Normalize images to [0, 1] float32
-- MLX pipeline: `.shuffle().to_stream().batch(batch_size)` 
+- MLX pipeline: `.shuffle().to_stream().batch(batch_size)`
+- Put the split/iterator creation logic in a single `@app.function` (e.g. `make_datasets(train_ds, test_ds, batch_size)`)
 - Show one batch shape and dtype
 
 ### Section 4 — Model Definition
 Follow MODULE-PATTERNS.md strictly:
 - Class names embed version at end: `MultiLayerPerceptronBlockV1`, `ConvolutionBlockV1`, `VariationalAutoEncoderV1`
+- Each class in its own `@app.class_definition` cell — never group classes
 - No VERSION attribute; no globals; typed parameters with defaults; composition required
-- All standalone functions snake_case; all deps explicit params
+- Each standalone helper (`count_parameters`, `compute_loss`, etc.) in its own `@app.function` cell
 - Write building blocks + at least one top-level model
 - Add a markdown architecture table cell
 - Instantiate model + show parameter count via `count_parameters(model)`
@@ -79,7 +92,8 @@ Follow MODULE-PATTERNS.md strictly:
 ### Section 5 — Training
 - `mo.ui.dropdown` for lr, batch_size, weight_decay; `mo.ui.slider` for epochs
 - `mo.ui.run_button(label="Train")` gate
-- MLX: `nn.value_and_grad` + `mx.eval` each step; live progress via `mo.output.replace()`
+- Extract `run_train_epoch(model, loss_fn, optimizer, train_iter, preprocess_fn)` and `run_evaluate(model, loss_fn, data_iter, preprocess_fn)` as `@app.function` cells
+- The training cell calls those helpers; use `mo.output.replace()` for live progress
 - Return `(train_losses, trained_model)` — initialize to `([], None)` when button not clicked
 
 ### Section 6 — Hyperparameter Search (Optional)
@@ -89,11 +103,12 @@ Follow MODULE-PATTERNS.md strictly:
 - Results in `mo.ui.table` sorted by val_loss
 
 ### Section 7 — Validation & Cross-Validation
-- Evaluate ELBO (reconstruction + KL) on the test set
+- Extract `evaluate_model(model, loss_fn, data_iter, preprocess_fn)` as `@app.function`
+- Evaluate on the test set; report key metrics in a markdown table
 - k=5 fold CV on train data; per-fold metrics + mean ± std
 
 ### Section 8 — Results
-- Training loss curve (matplotlib, return `_fig`)
+- Extract each plot as its own `@app.function` (e.g. `plot_loss_curve(train_losses, val_losses)`, `plot_reconstructions(model, test_batch)`)
 - For VAE/generative models: show a grid of original vs. reconstructed images
 - Model comparison table if multiple variants were defined
 - Final summary markdown
