@@ -21,131 +21,94 @@ Infer from the research goal:
 - **Data domain**: image, text, tabular, audio, or time-series — infer from the goal
 - **Model type**: CNN, Transformer, MLP, RNN, VAE, GAN, diffusion, etc.
 
-## Step 2 — Create the Notebook File
+## Step 2 — Delegate to the notebook-researcher Agent
 
-Write a marimo notebook to `notebook_path`. The notebook must use the modern marimo format:
+Spawn the `notebook-researcher` subagent with the following self-contained prompt. Replace the placeholders before passing:
 
-```python
-import marimo
-
-__generated_with = "0.23.13"
-app = marimo.App(width="medium")
-
-with app.setup:
-    # all third-party imports here (NOT marimo itself)
-
-@app.cell
-def _():
-    import marimo as mo
-    return
-
-# ... all other cells as @app.cell functions
 ```
+Write a complete ML research marimo notebook to the file `<notebook_path>` (path is relative to /home/armandli/journal, the repo root).
 
-Follow all rules from CLAUDE.md and the [notebook structure reference](references/NOTEBOOK-STRUCTURE.md).
+Research goal: <research_goal>
 
-## Step 3 — Write All Notebook Sections in Order
+Framework: <MLX or PyTorch — inferred from goal>
+Data domain: <image / text / tabular / audio / time-series>
+Model type: <CNN / MLP / VAE / Transformer / etc.>
 
-Write every section below. Do not skip any. Each section is one or more marimo cells.
-
-### Section 1 — Title & Research Goal
-
-A markdown cell with:
-- Notebook title (derived from research goal)
-- Research goal statement
-- Brief outline of the sections
-
-### Section 2 — Data Exploration
-
-- Load or download the dataset. Save raw data to `../data/<dataset_name>/`
-- Use mlx-data (`mlx.data.datasets`) if a built-in loader exists, otherwise use torchvision, HuggingFace datasets, or direct download
-- Show 20–60 sample data points (image grid for images, head() for tabular, waveform plot for audio)
-- For **tabular data**: show `.describe()` statistics, null counts, column types, correlation heatmap
-- For **image data**: show sample grid with labels, class distribution bar chart, examples per class grid
-- For **text data**: show sample sentences, token length distribution, vocabulary statistics
-- Display dataset size (train/val/test split sizes)
-
-### Section 3 — Dataset Creation
-
-- Define train/val/test splits (default: 70/15/15 or use standard splits if they exist)
-- Apply any preprocessing: normalization, tokenization, augmentation
-- Build data pipeline using `mlx.data` streams (for MLX) or `torch.utils.data.DataLoader` (for PyTorch)
-- Show one preprocessed batch to confirm shapes and dtypes
-- For MLX: use `.shuffle().to_stream().batch(batch_size)` pattern
-- For PyTorch: use `DataLoader` with `num_workers`, `pin_memory`
-
-### Section 4 — Model Definition
-
-Follow the **Module Design Rules** in [references/MODULE-PATTERNS.md](references/MODULE-PATTERNS.md) strictly:
-- Class names use PascalCase with the version number embedded at the end: `MultiLayerPerceptronV1`, `ResidualBlockV1`, `TransformerBlockV1`. Never a separate `VERSION` attribute.
-- To upgrade a module, define a new class with the incremented suffix: `MultiLayerPerceptronV2`.
-- Modules must be fully self-contained — no references to global variables or outer scope.
-- Modules must compose other custom modules (not just raw framework primitives).
-- Each module's `__init__` must have explicit typed parameters with defaults.
-- All standalone functions use snake_case and receive every dependency as an explicit parameter — no global variable access: `def train_model(model, data, lr, epochs):` not `def train_model():`.
-- Provide a markdown cell documenting the architecture (table listing each component class, its version, and output shape).
-
-Write at minimum:
-1. One or more **building-block modules** (e.g. `ResidualBlockV1`, `AttentionHeadV1`, `MultiLayerPerceptronV1`)
-2. One **top-level model class** that composes the building blocks (e.g. `ResearchCnnV1`)
-3. Standalone helper functions: `count_parameters(model)`, `compute_loss(model, batch)`, `train_model(model, optimizer, data, epochs)`, `evaluate_model(model, data)`
-4. A cell that instantiates the model and shows parameter count
-
-### Section 5 — Training
-
-- UI controls (sliders/dropdowns) for: learning rate, batch size, epochs, weight decay
-- A `mo.ui.run_button(label="Train")` to trigger training
-- Training loop with per-epoch loss logged via `mo.output.replace()`
-- For MLX: use `nn.value_and_grad`, `mx.eval` at each step; see [references/TRAINING-PATTERNS.md](references/TRAINING-PATTERNS.md)
-- For PyTorch: use `autocast`, `GradScaler`, `clip_grad_norm_`
-- Return `(train_losses, trained_model)` from the training cell; initialize to `([], None)` when button not clicked
-
-### Section 6 — Hyperparameter Search (Optional)
-
-- A `mo.ui.checkbox(label="Enable Hyperparameter Search", value=False)` gate
-- Use `mo.stop` to skip this section when unchecked
-- Grid-search or random-search over 2–3 key hyperparameters (lr, hidden_dim, latent_dim)
-- Run short training runs (3–5 epochs) per configuration
-- Show results as a table (`mo.ui.table`) sorted by validation loss
-
-### Section 7 — Validation & Cross-Validation
-
-- Evaluate the trained model on the held-out test set
-- Compute and display relevant metrics (accuracy, F1, MSE, ELBO, FID — match to task)
-- Implement k-fold cross-validation (k=5 default) on the full dataset
-- Show per-fold metrics and mean ± std
-- For MLX: evaluate with `model.eval()` (if applicable) and `mx.eval()`
-- For PyTorch: evaluate with `model.eval()` and `torch.no_grad()`
-
-### Section 8 — Results
-
-- Training loss curve (matplotlib line plot)
-- Validation metrics summary table
-- For image models: show reconstructions or generated samples
-- For classification: confusion matrix heatmap
-- Final summary markdown cell stating what was learned / achieved
-
-## Step 4 — Verify
-
-After writing the file, run:
-
-```bash
-/home/armandli/journal/env/bin/marimo check --fix "$ARGUMENTS[0]"
-```
-
-If errors remain after `--fix`, read the error output and fix them manually, then re-run.
-
-## Step 5 — Report
-
-Tell the user:
-- The file path created
-- The framework used (MLX or PyTorch)
-- The model architecture summary
-- Any assumptions made about the dataset
+Working directory: /home/armandli/journal
+Python environment: /home/armandli/journal/env/bin/python
+marimo binary: /home/armandli/journal/env/bin/marimo
 
 ---
 
-### Final Step — Record Usage
+Read these reference files before writing (they are in /home/armandli/journal/.claude/skills/create-research-book/references/):
+- NOTEBOOK-STRUCTURE.md   — marimo file format rules, cell patterns, UI element rules
+- MODULE-PATTERNS.md      — neural network module naming and design rules
+- TRAINING-PATTERNS.md    — training loop, HP search, evaluation, CV patterns
+
+Also read /home/armandli/journal/.claude/CLAUDE.md for project-wide marimo conventions.
+
+---
+
+Write ALL 8 sections below. Do not skip any. Do not leave stubs or TODO comments.
+
+### Section 1 — Title & Research Goal
+A markdown cell with the notebook title, research goal statement, and a brief outline of all sections.
+
+### Section 2 — Data Exploration
+- Load or download the dataset to `../data/<dataset_name>/`
+- For MLX + image data: use `mlx.data.datasets.load_mnist(root="../data/mnist", train=True)` if MNIST
+- Show a grid of 20–60 sample images (matplotlib, return `_fig`, never call plt.show())
+- Show a class distribution bar chart
+- Print train / val / test split sizes
+
+### Section 3 — Dataset Creation
+- Define train/val/test splits (MNIST standard: use the built-in 60k train + 10k test; split train 85/15 for train/val)
+- Normalize images to [0, 1] float32
+- MLX pipeline: `.shuffle().to_stream().batch(batch_size)` 
+- Show one batch shape and dtype
+
+### Section 4 — Model Definition
+Follow MODULE-PATTERNS.md strictly:
+- Class names embed version at end: `MultiLayerPerceptronBlockV1`, `ConvolutionBlockV1`, `VariationalAutoEncoderV1`
+- No VERSION attribute; no globals; typed parameters with defaults; composition required
+- All standalone functions snake_case; all deps explicit params
+- Write building blocks + at least one top-level model
+- Add a markdown architecture table cell
+- Instantiate model + show parameter count via `count_parameters(model)`
+
+### Section 5 — Training
+- `mo.ui.dropdown` for lr, batch_size, weight_decay; `mo.ui.slider` for epochs
+- `mo.ui.run_button(label="Train")` gate
+- MLX: `nn.value_and_grad` + `mx.eval` each step; live progress via `mo.output.replace()`
+- Return `(train_losses, trained_model)` — initialize to `([], None)` when button not clicked
+
+### Section 6 — Hyperparameter Search (Optional)
+- `mo.ui.checkbox(label="Enable Hyperparameter Search", value=False)` gate
+- `mo.stop(not hp_search_cb.value, ...)` to skip
+- Grid over 2–3 hyperparameters (lr × latent_dim or similar); 3–5 epochs per config
+- Results in `mo.ui.table` sorted by val_loss
+
+### Section 7 — Validation & Cross-Validation
+- Evaluate ELBO (reconstruction + KL) on the test set
+- k=5 fold CV on train data; per-fold metrics + mean ± std
+
+### Section 8 — Results
+- Training loss curve (matplotlib, return `_fig`)
+- For VAE/generative models: show a grid of original vs. reconstructed images
+- Model comparison table if multiple variants were defined
+- Final summary markdown
+
+---
+
+After writing the file, run:
+  /home/armandli/journal/env/bin/marimo check --fix "<notebook_path>"
+
+Fix any remaining errors manually and re-run until clean. Report the file path, framework, architecture summary, and any assumptions made.
+```
+
+Wait for the agent to complete and relay its report to the user.
+
+## Step 3 — Record Usage
 
 ```bash
 python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "create-research-book"
