@@ -288,6 +288,103 @@ def _():
 
 @app.cell
 def _():
+    class ConvolutionBlockV1(nn.Module):
+        """Conv2d + ReLU building block (MLX channels-last NHWC format)."""
+
+        def __init__(
+            self,
+            in_channels: int = 1,
+            out_channels: int = 32,
+            kernel_size: int = 3,
+            stride: int = 1,
+            padding: int = 1,
+        ):
+            super().__init__()
+            self.conv = nn.Conv2d(
+                in_channels, out_channels, kernel_size,
+                stride=stride, padding=padding,
+            )
+
+        def __call__(self, x: mx.array) -> mx.array:
+            return nn.relu(self.conv(x))
+
+    class ConvolutionalEncoderV1(nn.Module):
+        """Two ConvolutionBlockV1 encoder for 28×28 images; outputs (mu, logvar)."""
+
+        def __init__(
+            self,
+            in_channels: int = 1,
+            base_channels: int = 32,
+            latent_dim: int = 32,
+        ):
+            super().__init__()
+            self.block1 = ConvolutionBlockV1(in_channels, base_channels, stride=2)
+            self.block2 = ConvolutionBlockV1(base_channels, base_channels * 2, stride=2)
+            self.fc_mu = nn.Linear(7 * 7 * base_channels * 2, latent_dim)
+            self.fc_logvar = nn.Linear(7 * 7 * base_channels * 2, latent_dim)
+
+        def __call__(self, x: mx.array):
+            h = self.block1(x)            # (B, 14, 14, base_channels)
+            h = self.block2(h)            # (B, 7, 7, base_channels*2)
+            h = h.reshape(h.shape[0], -1)
+            return self.fc_mu(h), self.fc_logvar(h)
+
+    class ConvolutionalDecoderV1(nn.Module):
+        """Two ConvTranspose2d decoder; outputs sigmoid-activated (B, 28, 28, 1)."""
+
+        def __init__(
+            self,
+            latent_dim: int = 32,
+            base_channels: int = 32,
+            out_channels: int = 1,
+        ):
+            super().__init__()
+            self.fc = nn.Linear(latent_dim, 7 * 7 * base_channels * 2)
+            self.deconv1 = nn.ConvTranspose2d(
+                base_channels * 2, base_channels, kernel_size=4, stride=2, padding=1
+            )
+            self.deconv2 = nn.ConvTranspose2d(
+                base_channels, out_channels, kernel_size=4, stride=2, padding=1
+            )
+            self.spatial_c = base_channels * 2
+
+        def __call__(self, z: mx.array) -> mx.array:
+            h = nn.relu(self.fc(z))
+            h = h.reshape(h.shape[0], 7, 7, self.spatial_c)  # (B, 7, 7, base*2)
+            h = nn.relu(self.deconv1(h))                       # (B, 14, 14, base)
+            return mx.sigmoid(self.deconv2(h))                 # (B, 28, 28, out)
+
+    class ConvolutionalVariationalAutoEncoderV1(nn.Module):
+        """Top-level Conv VAE composing ConvolutionalEncoderV1 and ConvolutionalDecoderV1."""
+
+        def __init__(
+            self,
+            in_channels: int = 1,
+            base_channels: int = 32,
+            latent_dim: int = 32,
+        ):
+            super().__init__()
+            self.encoder = ConvolutionalEncoderV1(in_channels, base_channels, latent_dim)
+            self.decoder = ConvolutionalDecoderV1(latent_dim, base_channels, in_channels)
+            self.latent_dim = latent_dim
+
+        def reparameterize(self, mu: mx.array, logvar: mx.array) -> mx.array:
+            std = mx.exp(0.5 * logvar)
+            return mu + mx.random.normal(std.shape) * std
+
+        def __call__(self, x: mx.array):
+            mu, logvar = self.encoder(x)
+            z = self.reparameterize(mu, logvar)
+            return self.decoder(z), mu, logvar
+
+        def decode(self, z: mx.array) -> mx.array:
+            return self.decoder(z)
+
+    return (ConvolutionalVariationalAutoEncoderV1,)
+
+
+@app.cell
+def _():
     def count_parameters(model: nn.Module) -> int:
         return sum(v.size for _, v in mlx.utils.tree_flatten(model.parameters()))
 
@@ -329,6 +426,47 @@ def _():
 
 
 @app.cell
+def _():
+    def compute_conv_vae_loss(model: nn.Module, x: mx.array) -> mx.array:
+        recon, mu, logvar = model(x)
+        x_flat = x.reshape(x.shape[0], -1)
+        recon_flat = recon.reshape(recon.shape[0], -1)
+        recon_loss = mx.mean(mx.sum((recon_flat - x_flat) ** 2, axis=-1))
+        kl_loss = -0.5 * mx.mean(
+            mx.sum(1 + logvar - mu ** 2 - mx.exp(logvar), axis=-1)
+        )
+        return recon_loss + kl_loss
+
+    def train_epoch_conv(
+        model: nn.Module, optimizer, train_buffer, batch_size: int
+    ) -> float:
+        loss_and_grad_fn = nn.value_and_grad(model, compute_conv_vae_loss)
+        epoch_loss = 0.0
+        n_batches = 0
+        for batch in train_buffer.shuffle().to_stream().batch(batch_size):
+            x = mx.array(batch["image"], dtype=mx.float32) / 255.0
+            loss, grads = loss_and_grad_fn(model, x)
+            optimizer.update(model, grads)
+            mx.eval(loss, model.parameters())
+            epoch_loss += loss.item()
+            n_batches += 1
+        return epoch_loss / max(n_batches, 1)
+
+    def evaluate_conv_elbo(model: nn.Module, buf, batch_size: int = 256) -> float:
+        total = 0.0
+        n = 0
+        for batch in buf.to_stream().batch(batch_size):
+            x = mx.array(batch["image"], dtype=mx.float32) / 255.0
+            loss = compute_conv_vae_loss(model, x)
+            mx.eval(loss)
+            total += loss.item()
+            n += 1
+        return total / max(n, 1)
+
+    return evaluate_conv_elbo, train_epoch_conv
+
+
+@app.cell
 def _(mo):
     mo.md("""
     ### Model Architecture — VariationalAutoEncoderV1
@@ -359,6 +497,40 @@ def _(VariationalAutoEncoderV1, count_parameters, mo):
         f"(input=784, hidden=512, latent=32): `{reference_param_count:,}`"
     )
     return (reference_param_count,)
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ### Model Architecture — ConvolutionalVariationalAutoEncoderV1
+
+    | Component | Module | Output Shape |
+    |-----------|--------|--------------|
+    | Conv block 1 | `ConvolutionBlockV1` (k=3, stride=2, pad=1) | `(B, 14, 14, 32)` |
+    | Conv block 2 | `ConvolutionBlockV1` (k=3, stride=2, pad=1) | `(B, 7, 7, 64)` |
+    | Flatten | — | `(B, 3136)` |
+    | `mu` head | `Linear(3136, latent_dim)` | `(B, latent_dim)` |
+    | `logvar` head | `Linear(3136, latent_dim)` | `(B, latent_dim)` |
+    | Reparameterize | `mu + eps * exp(0.5 * logvar)` | `(B, latent_dim)` |
+    | Project + reshape | `Linear → ReLU → (B, 7, 7, 64)` | `(B, 7, 7, 64)` |
+    | Deconv block 1 | `ConvTranspose2d` (k=4, stride=2, pad=1) + ReLU | `(B, 14, 14, 32)` |
+    | Deconv block 2 | `ConvTranspose2d` (k=4, stride=2, pad=1) + sigmoid | `(B, 28, 28, 1)` |
+    """)
+    return
+
+
+@app.cell
+def _(ConvolutionalVariationalAutoEncoderV1, count_parameters, mo):
+    _conv_ref = ConvolutionalVariationalAutoEncoderV1(
+        in_channels=1, base_channels=32, latent_dim=32
+    )
+    mx.eval(_conv_ref.parameters())
+    conv_reference_param_count = count_parameters(_conv_ref)
+    mo.md(
+        f"**Conv VAE reference parameter count** "
+        f"(base_channels=32, latent=32): `{conv_reference_param_count:,}`"
+    )
+    return (conv_reference_param_count,)
 
 
 @app.cell
@@ -413,9 +585,11 @@ def _(mo):
 
 @app.cell
 def _(
+    ConvolutionalVariationalAutoEncoderV1,
     VariationalAutoEncoderV1,
     bs_ui,
     epochs_ui,
+    evaluate_conv_elbo,
     evaluate_elbo,
     hidden_dim_ui,
     latent_dim_ui,
@@ -424,46 +598,71 @@ def _(
     train_btn,
     train_buf,
     train_epoch,
+    train_epoch_conv,
     val_buf,
     wd_ui,
 ):
     train_losses = []
     val_losses = []
+    conv_train_losses = []
+    conv_val_losses = []
     trained_model = None
+    conv_trained_model = None
 
     if not train_btn.value:
-        mo.output.replace(mo.md("Click **Train** to begin."))
+        mo.output.replace(mo.md("Click **Train** to begin training both MLP and Conv VAE."))
     else:
-        _model = VariationalAutoEncoderV1(
+        _mlp = VariationalAutoEncoderV1(
             input_dim=784,
             hidden_dim=int(hidden_dim_ui.value),
             latent_dim=int(latent_dim_ui.value),
         )
-        mx.eval(_model.parameters())
-        _optimizer = optim.AdamW(
-            learning_rate=lr_ui.value, weight_decay=wd_ui.value
+        _conv = ConvolutionalVariationalAutoEncoderV1(
+            in_channels=1,
+            base_channels=32,
+            latent_dim=int(latent_dim_ui.value),
         )
+        mx.eval(_mlp.parameters())
+        mx.eval(_conv.parameters())
+        _mlp_opt = optim.AdamW(learning_rate=lr_ui.value, weight_decay=wd_ui.value)
+        _conv_opt = optim.AdamW(learning_rate=lr_ui.value, weight_decay=wd_ui.value)
         _n = epochs_ui.value
         _bs = int(bs_ui.value)
+
         for _epoch in range(_n):
-            _tl = train_epoch(_model, _optimizer, train_buf, _bs)
-            _vl = evaluate_elbo(_model, val_buf, _bs)
+            _tl = train_epoch(_mlp, _mlp_opt, train_buf, _bs)
+            _vl = evaluate_elbo(_mlp, val_buf, _bs)
+            _ctl = train_epoch_conv(_conv, _conv_opt, train_buf, _bs)
+            _cvl = evaluate_conv_elbo(_conv, val_buf, _bs)
             train_losses.append(_tl)
             val_losses.append(_vl)
+            conv_train_losses.append(_ctl)
+            conv_val_losses.append(_cvl)
             mo.output.replace(
                 mo.md(
-                    f"**Epoch {_epoch + 1}/{_n}** — "
-                    f"train: {_tl:.4f} | val: {_vl:.4f}"
+                    f"**Epoch {_epoch + 1}/{_n}**  \n"
+                    f"MLP  — train: {_tl:.4f} | val: {_vl:.4f}  \n"
+                    f"Conv — train: {_ctl:.4f} | val: {_cvl:.4f}"
                 )
             )
-        trained_model = _model
+
+        trained_model = _mlp
+        conv_trained_model = _conv
         mo.output.replace(
             mo.md(
-                f"**Done!** Final train loss: {train_losses[-1]:.4f} | "
-                f"val loss: {val_losses[-1]:.4f}"
+                f"**Training complete!**  \n"
+                f"MLP  — final train: {train_losses[-1]:.4f} | val: {val_losses[-1]:.4f}  \n"
+                f"Conv — final train: {conv_train_losses[-1]:.4f} | val: {conv_val_losses[-1]:.4f}"
             )
         )
-    return train_losses, trained_model, val_losses
+    return (
+        conv_train_losses,
+        conv_trained_model,
+        conv_val_losses,
+        train_losses,
+        trained_model,
+        val_losses,
+    )
 
 
 @app.cell
@@ -530,20 +729,30 @@ def _(mo):
 
 
 @app.cell
-def _(evaluate_elbo, mo, test_buf, trained_model, val_buf):
+def _(
+    conv_trained_model,
+    evaluate_conv_elbo,
+    evaluate_elbo,
+    mo,
+    test_buf,
+    trained_model,
+    val_buf,
+):
     if trained_model is None:
-        _out = mo.md("_Train the model first._")
+        _out = mo.md("_Train the models first._")
     else:
-        _test_elbo = evaluate_elbo(trained_model, test_buf)
         _val_elbo = evaluate_elbo(trained_model, val_buf)
+        _test_elbo = evaluate_elbo(trained_model, test_buf)
+        _conv_val_elbo = evaluate_conv_elbo(conv_trained_model, val_buf)
+        _conv_test_elbo = evaluate_conv_elbo(conv_trained_model, test_buf)
         _out = mo.md(
             f"""
     **Evaluation Results**
 
-    | Split | ELBO Loss |
-    |-------|-----------|
-    | Validation | {_val_elbo:.4f} |
-    | Test | {_test_elbo:.4f} |
+    | Model | Val ELBO | Test ELBO |
+    |-------|----------|-----------|
+    | MLP VAE | {_val_elbo:.4f} | {_test_elbo:.4f} |
+    | Conv VAE | {_conv_val_elbo:.4f} | {_conv_test_elbo:.4f} |
     """
         )
     _out
@@ -630,32 +839,26 @@ def _(mo):
 
 
 @app.cell
-def _(mo, train_losses, val_losses):
+def _(conv_train_losses, conv_val_losses, mo, train_losses, val_losses):
     if not train_losses:
         _out = mo.md("_Train first._")
     else:
-        _fig, _ax = plt.subplots(figsize=(9, 4))
-        _ax.plot(
-            range(1, len(train_losses) + 1),
-            train_losses,
-            "b-o",
-            lw=2,
-            ms=4,
-            label="Train ELBO",
-        )
-        _ax.plot(
-            range(1, len(val_losses) + 1),
-            val_losses,
-            "r-s",
-            lw=2,
-            ms=4,
-            label="Val ELBO",
-        )
-        _ax.set_xlabel("Epoch")
-        _ax.set_ylabel("ELBO Loss")
-        _ax.set_title("VAE Training Curve")
-        _ax.legend()
-        _ax.grid(True, alpha=0.3)
+        _fig, _axes = plt.subplots(1, 2, figsize=(14, 4))
+        _axes[0].plot(range(1, len(train_losses) + 1), train_losses, "b-o", lw=2, ms=4, label="Train")
+        _axes[0].plot(range(1, len(val_losses) + 1), val_losses, "r-s", lw=2, ms=4, label="Val")
+        _axes[0].set_title("MLP VAE")
+        _axes[0].set_xlabel("Epoch")
+        _axes[0].set_ylabel("ELBO Loss")
+        _axes[0].legend()
+        _axes[0].grid(True, alpha=0.3)
+        _axes[1].plot(range(1, len(conv_train_losses) + 1), conv_train_losses, "b-o", lw=2, ms=4, label="Train")
+        _axes[1].plot(range(1, len(conv_val_losses) + 1), conv_val_losses, "r-s", lw=2, ms=4, label="Val")
+        _axes[1].set_title("Conv VAE")
+        _axes[1].set_xlabel("Epoch")
+        _axes[1].set_ylabel("ELBO Loss")
+        _axes[1].legend()
+        _axes[1].grid(True, alpha=0.3)
+        _fig.suptitle("MLP VAE vs Conv VAE — Training Comparison", fontsize=13)
         _fig.tight_layout()
         _out = _fig
     _out
@@ -663,26 +866,37 @@ def _(mo, train_losses, val_losses):
 
 
 @app.cell
-def _(mo, test_buf, trained_model):
+def _(conv_trained_model, mo, test_buf, trained_model):
     if trained_model is None:
         _out = mo.md("_Train first._")
     else:
         _n_show = 8
         _batch = next(iter(test_buf.to_stream().batch(_n_show)))
-        _orig = mx.array(_batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-        _recon, _, _ = trained_model(_orig)
-        mx.eval(_recon)
-        _orig_np = np.array(_orig).reshape(-1, 28, 28)
-        _recon_np = np.array(_recon).reshape(-1, 28, 28)
-        _fig, _axes = plt.subplots(2, _n_show, figsize=(16, 4))
+
+        _orig_flat = mx.array(_batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
+        _mlp_recon, _, _ = trained_model(_orig_flat)
+        mx.eval(_mlp_recon)
+
+        _orig_4d = mx.array(_batch["image"], dtype=mx.float32) / 255.0
+        _conv_recon, _, _ = conv_trained_model(_orig_4d)
+        mx.eval(_conv_recon)
+
+        _orig_np = np.array(_orig_flat).reshape(-1, 28, 28)
+        _mlp_np = np.array(_mlp_recon).reshape(-1, 28, 28)
+        _conv_np = np.array(_conv_recon).reshape(-1, 28, 28)
+
+        _fig, _axes = plt.subplots(3, _n_show, figsize=(16, 6))
         for _i in range(_n_show):
             _axes[0, _i].imshow(_orig_np[_i], cmap="gray")
             _axes[0, _i].axis("off")
-            _axes[1, _i].imshow(_recon_np[_i], cmap="gray")
+            _axes[1, _i].imshow(_mlp_np[_i], cmap="gray")
             _axes[1, _i].axis("off")
+            _axes[2, _i].imshow(_conv_np[_i], cmap="gray")
+            _axes[2, _i].axis("off")
         _axes[0, 0].set_title("Original", fontsize=9, loc="left")
-        _axes[1, 0].set_title("Reconstructed", fontsize=9, loc="left")
-        _fig.suptitle("VAE Reconstructions (test set)", fontsize=12)
+        _axes[1, 0].set_title("MLP VAE", fontsize=9, loc="left")
+        _axes[2, 0].set_title("Conv VAE", fontsize=9, loc="left")
+        _fig.suptitle("Reconstructions: MLP VAE vs Conv VAE (test set)", fontsize=12)
         _fig.tight_layout()
         _out = _fig
     _out
@@ -690,7 +904,15 @@ def _(mo, test_buf, trained_model):
 
 
 @app.cell
-def _(mo, reference_param_count, train_losses, val_losses):
+def _(
+    conv_reference_param_count,
+    conv_train_losses,
+    conv_val_losses,
+    mo,
+    reference_param_count,
+    train_losses,
+    val_losses,
+):
     if not train_losses:
         _summary = mo.md(
             f"""
@@ -698,32 +920,34 @@ def _(mo, reference_param_count, train_losses, val_losses):
 
     - **Framework**: MLX
     - **Dataset**: MNIST (60k train / 10k test, grayscale 28×28)
-    - **Model**: `VariationalAutoEncoderV1` — MLP encoder / decoder with a
-      32-dim Gaussian latent space
-    - **Reference parameter count**: {reference_param_count:,}
-    - **Loss**: pixel-sum squared error + KL(q(z|x) || N(0, I))
+    - **MLP VAE** (`VariationalAutoEncoderV1`): {reference_param_count:,} parameters — treats pixels independently
+    - **Conv VAE** (`ConvolutionalVariationalAutoEncoderV1`): {conv_reference_param_count:,} parameters — exploits spatial structure via stride-2 convolutions
 
-    Train the model above to populate the final loss numbers here.
+    Train the models above to populate the final loss comparison here.
     """
         )
     else:
+        _mlp_wins = train_losses[-1] < conv_train_losses[-1]
         _summary = mo.md(
             f"""
     ### Summary
 
     - **Framework**: MLX
     - **Dataset**: MNIST (60k train / 10k test, grayscale 28×28)
-    - **Model**: `VariationalAutoEncoderV1` — MLP encoder / decoder with a
-      configurable Gaussian latent space
-    - **Reference parameter count**: {reference_param_count:,}
-    - **Final train ELBO loss**: `{train_losses[-1]:.4f}`
-    - **Final validation ELBO loss**: `{val_losses[-1]:.4f}`
 
-    The training curve above shows train / validation ELBO per epoch. The
-    reconstruction grid demonstrates qualitative fidelity on held-out test
-    digits. Enable the hyperparameter search checkbox for a small sweep over
-    learning rate and latent dimension; the cross-validation cell reports
-    5-fold ELBO with mean ± std.
+    | Model | Parameters | Final Train ELBO | Final Val ELBO |
+    |-------|-----------|-----------------|----------------|
+    | MLP VAE | {reference_param_count:,} | {train_losses[-1]:.4f} | {val_losses[-1]:.4f} |
+    | Conv VAE | {conv_reference_param_count:,} | {conv_train_losses[-1]:.4f} | {conv_val_losses[-1]:.4f} |
+
+    **Lower final train ELBO**: {"MLP VAE" if _mlp_wins else "Conv VAE"}
+
+    The MLP VAE flattens images to 784-dim vectors; the Conv VAE encodes spatial
+    structure with two stride-2 conv blocks (28→14→7) and decodes with two
+    transposed-conv blocks (7→14→28). Compare the reconstruction grids above
+    to see qualitative differences. Enable the hyperparameter search checkbox
+    for a sweep over lr × latent_dim; the cross-validation cell reports 5-fold
+    ELBO with mean ± std.
     """
         )
     _summary
