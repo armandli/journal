@@ -66,21 +66,19 @@ def _():
 
 @app.cell
 def _(mo, test_ds, train_ds):
-    mo.md(
-        f"""
-        ### Dataset overview
+    mo.md(f"""
+    ### Dataset overview
 
-        MNIST is loaded as an `mlx.data` Buffer. Each sample is a dict with:
+    MNIST is loaded as an `mlx.data` Buffer. Each sample is a dict with:
 
-        - `image` — `uint8` array shaped `(28, 28, 1)`
-        - `label` — scalar `uint8` in `[0, 9]`
+    - `image` — `uint8` array shaped `(28, 28, 1)`
+    - `label` — scalar `uint8` in `[0, 9]`
 
-        | Split | Size |
-        |-------|------|
-        | Train (raw) | {len(train_ds):,} |
-        | Test | {len(test_ds):,} |
-        """
-    )
+    | Split | Size |
+    |-------|------|
+    | Train (raw) | {len(train_ds):,} |
+    | Test | {len(test_ds):,} |
+    """)
     return
 
 
@@ -131,75 +129,33 @@ def _(mo):
     return
 
 
-@app.cell
-def _(train_ds):
-    _rng = np.random.default_rng(seed=42)
-    _n_total = len(train_ds)
-    _perm = _rng.permutation(_n_total)
-    _n_val = int(round(_n_total * 0.15))
-    _val_indices = np.sort(_perm[:_n_val])
-    _train_indices = np.sort(_perm[_n_val:])
-    train_buf = train_ds[_train_indices]
-    val_buf = train_ds[_val_indices]
-    return train_buf, val_buf
+@app.function
+def make_datasets(train_ds, test_ds, batch_size, val_fraction=0.15):
+    def normalize(x):
+        return x.astype("float32") / 255.0
 
-
-@app.cell
-def _(test_ds):
-    test_buf = test_ds
-    return (test_buf,)
-
-
-@app.cell
-def _(mo, test_buf, train_buf, val_buf):
-    mo.md(
-        f"""
-        ### Split sizes
-
-        | Split | Buffer | Size |
-        |-------|--------|------|
-        | Train (85%) | `train_buf` | {len(train_buf):,} |
-        | Validation (15%) | `val_buf` | {len(val_buf):,} |
-        | Test | `test_buf` | {len(test_buf):,} |
-
-        Batching is done with the mlx.data streaming API:
-
-        - Training:   `train_buf.shuffle().to_stream().batch(batch_size)`
-        - Val / test: `buf.to_stream().batch(batch_size)`
-
-        Images are normalized to `[0, 1]` and reshaped to `(-1, 784)`
-        inside every batch loop.
-        """
+    n_total = len(train_ds)
+    n_val = int(round(n_total * val_fraction))
+    shuffled = train_ds.shuffle()
+    train_iter = (
+        shuffled[np.arange(n_val, n_total)]
+        .to_stream()
+        .key_transform("image", normalize)
+        .batch(batch_size)
     )
-    return
-
-
-@app.cell
-def _(train_buf):
-    _peek = next(iter(train_buf.to_stream().batch(4)))
-    _peek_x = mx.array(_peek["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-    batch_shape = tuple(_peek_x.shape)
-    batch_dtype = str(_peek_x.dtype)
-    batch_min = float(_peek_x.min().item())
-    batch_max = float(_peek_x.max().item())
-    return batch_dtype, batch_max, batch_min, batch_shape
-
-
-@app.cell
-def _(batch_dtype, batch_max, batch_min, batch_shape, mo):
-    mo.md(
-        f"""
-        ### Batch sanity check
-
-        | Field | Value |
-        |-------|-------|
-        | `x.shape` after reshape | `{batch_shape}` |
-        | `x.dtype` | `{batch_dtype}` |
-        | min value | `{batch_min:.4f}` |
-        | max value | `{batch_max:.4f}` |
-        """
+    val_iter = (
+        shuffled[np.arange(n_val)]
+        .to_stream()
+        .key_transform("image", normalize)
+        .batch(batch_size)
     )
-    return
+    test_iter = (
+        test_ds
+        .to_stream()
+        .key_transform("image", normalize)
+        .batch(batch_size)
+    )
+    return train_iter, val_iter, test_iter
 
 
 @app.cell
@@ -390,45 +346,6 @@ def _():
 
     def compute_vae_loss(model: nn.Module, x: mx.array) -> mx.array:
         recon, mu, logvar = model(x)
-        recon_loss = mx.mean(mx.sum((recon - x) ** 2, axis=-1))
-        kl_loss = -0.5 * mx.mean(
-            mx.sum(1 + logvar - mu ** 2 - mx.exp(logvar), axis=-1)
-        )
-        return recon_loss + kl_loss
-
-    def train_epoch(
-        model: nn.Module, optimizer, train_buffer, batch_size: int
-    ) -> float:
-        loss_and_grad_fn = nn.value_and_grad(model, compute_vae_loss)
-        epoch_loss = 0.0
-        n_batches = 0
-        for batch in train_buffer.shuffle().to_stream().batch(batch_size):
-            x = mx.array(batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-            loss, grads = loss_and_grad_fn(model, x)
-            optimizer.update(model, grads)
-            mx.eval(loss, model.parameters())
-            epoch_loss += loss.item()
-            n_batches += 1
-        return epoch_loss / max(n_batches, 1)
-
-    def evaluate_elbo(model: nn.Module, buf, batch_size: int = 256) -> float:
-        total = 0.0
-        n = 0
-        for batch in buf.to_stream().batch(batch_size):
-            x = mx.array(batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
-            loss = compute_vae_loss(model, x)
-            mx.eval(loss)
-            total += loss.item()
-            n += 1
-        return total / max(n, 1)
-
-    return compute_vae_loss, count_parameters, evaluate_elbo, train_epoch
-
-
-@app.cell
-def _():
-    def compute_conv_vae_loss(model: nn.Module, x: mx.array) -> mx.array:
-        recon, mu, logvar = model(x)
         x_flat = x.reshape(x.shape[0], -1)
         recon_flat = recon.reshape(recon.shape[0], -1)
         recon_loss = mx.mean(mx.sum((recon_flat - x_flat) ** 2, axis=-1))
@@ -437,14 +354,24 @@ def _():
         )
         return recon_loss + kl_loss
 
-    def train_epoch_conv(
-        model: nn.Module, optimizer, train_buffer, batch_size: int
+    return compute_vae_loss, count_parameters
+
+
+@app.cell
+def _():
+    def run_train_epoch(
+        model: nn.Module,
+        loss_fn,
+        optimizer,
+        train_iter,
+        preprocess_fn,
     ) -> float:
-        loss_and_grad_fn = nn.value_and_grad(model, compute_conv_vae_loss)
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
         epoch_loss = 0.0
         n_batches = 0
-        for batch in train_buffer.shuffle().to_stream().batch(batch_size):
-            x = mx.array(batch["image"], dtype=mx.float32) / 255.0
+        train_iter.reset()
+        for batch in train_iter:
+            x = preprocess_fn(batch)
             loss, grads = loss_and_grad_fn(model, x)
             optimizer.update(model, grads)
             mx.eval(loss, model.parameters())
@@ -452,18 +379,47 @@ def _():
             n_batches += 1
         return epoch_loss / max(n_batches, 1)
 
-    def evaluate_conv_elbo(model: nn.Module, buf, batch_size: int = 256) -> float:
+    def run_evaluate(
+        model: nn.Module,
+        loss_fn,
+        data_iter,
+        preprocess_fn,
+    ) -> float:
         total = 0.0
         n = 0
-        for batch in buf.to_stream().batch(batch_size):
-            x = mx.array(batch["image"], dtype=mx.float32) / 255.0
-            loss = compute_conv_vae_loss(model, x)
+        data_iter.reset()
+        for batch in data_iter:
+            x = preprocess_fn(batch)
+            loss = loss_fn(model, x)
             mx.eval(loss)
             total += loss.item()
             n += 1
         return total / max(n, 1)
 
-    return evaluate_conv_elbo, train_epoch_conv
+    def train_and_validate(
+        model: nn.Module,
+        loss_fn,
+        train_iter,
+        val_iter,
+        n_epochs: int,
+        lr: float,
+        weight_decay: float,
+        preprocess_fn,
+        on_epoch_end=None,
+    ):
+        optimizer = optim.AdamW(learning_rate=lr, weight_decay=weight_decay)
+        train_losses = []
+        val_losses = []
+        for epoch in range(n_epochs):
+            tl = run_train_epoch(model, loss_fn, optimizer, train_iter, preprocess_fn)
+            vl = run_evaluate(model, loss_fn, val_iter, preprocess_fn)
+            train_losses.append(tl)
+            val_losses.append(vl)
+            if on_epoch_end is not None:
+                on_epoch_end(epoch, n_epochs, tl, vl)
+        return train_losses, val_losses
+
+    return run_evaluate, train_and_validate
 
 
 @app.cell
@@ -584,22 +540,25 @@ def _(mo):
 
 
 @app.cell
+def _(bs_ui, test_ds, train_ds):
+    train_iter, val_iter, test_iter = make_datasets(train_ds, test_ds, int(bs_ui.value))
+    return test_iter, train_iter, val_iter
+
+
+@app.cell
 def _(
     ConvolutionalVariationalAutoEncoderV1,
     VariationalAutoEncoderV1,
-    bs_ui,
+    compute_vae_loss,
     epochs_ui,
-    evaluate_conv_elbo,
-    evaluate_elbo,
     hidden_dim_ui,
     latent_dim_ui,
     lr_ui,
     mo,
+    train_and_validate,
     train_btn,
-    train_buf,
-    train_epoch,
-    train_epoch_conv,
-    val_buf,
+    train_iter,
+    val_iter,
     wd_ui,
 ):
     train_losses = []
@@ -624,28 +583,33 @@ def _(
         )
         mx.eval(_mlp.parameters())
         mx.eval(_conv.parameters())
-        _mlp_opt = optim.AdamW(learning_rate=lr_ui.value, weight_decay=wd_ui.value)
-        _conv_opt = optim.AdamW(learning_rate=lr_ui.value, weight_decay=wd_ui.value)
-        _n = epochs_ui.value
-        _bs = int(bs_ui.value)
 
-        for _epoch in range(_n):
-            _tl = train_epoch(_mlp, _mlp_opt, train_buf, _bs)
-            _vl = evaluate_elbo(_mlp, val_buf, _bs)
-            _ctl = train_epoch_conv(_conv, _conv_opt, train_buf, _bs)
-            _cvl = evaluate_conv_elbo(_conv, val_buf, _bs)
-            train_losses.append(_tl)
-            val_losses.append(_vl)
-            conv_train_losses.append(_ctl)
-            conv_val_losses.append(_cvl)
+        def _mlp_preprocess(batch):
+            return mx.array(batch["image"]).reshape(-1, 784)
+
+        def _conv_preprocess(batch):
+            return mx.array(batch["image"])
+
+        def _mlp_progress(epoch, n_epochs, tl, vl):
             mo.output.replace(
-                mo.md(
-                    f"**Epoch {_epoch + 1}/{_n}**  \n"
-                    f"MLP  — train: {_tl:.4f} | val: {_vl:.4f}  \n"
-                    f"Conv — train: {_ctl:.4f} | val: {_cvl:.4f}"
-                )
+                mo.md(f"MLP — Epoch {epoch + 1}/{n_epochs}  train: {tl:.4f} | val: {vl:.4f}")
             )
 
+        def _conv_progress(epoch, n_epochs, ctl, cvl):
+            mo.output.replace(
+                mo.md(f"Conv — Epoch {epoch + 1}/{n_epochs}  train: {ctl:.4f} | val: {cvl:.4f}")
+            )
+
+        train_losses, val_losses = train_and_validate(
+            _mlp, compute_vae_loss, train_iter, val_iter,
+            epochs_ui.value, lr_ui.value, wd_ui.value,
+            _mlp_preprocess, _mlp_progress,
+        )
+        conv_train_losses, conv_val_losses = train_and_validate(
+            _conv, compute_vae_loss, train_iter, val_iter,
+            epochs_ui.value, lr_ui.value, wd_ui.value,
+            _conv_preprocess, _conv_progress,
+        )
         trained_model = _mlp
         conv_trained_model = _conv
         mo.output.replace(
@@ -685,12 +649,12 @@ def _(mo):
 @app.cell
 def _(
     VariationalAutoEncoderV1,
-    evaluate_elbo,
+    compute_vae_loss,
     hp_search_cb,
     mo,
-    train_buf,
-    train_epoch,
-    val_buf,
+    train_and_validate,
+    train_iter,
+    val_iter,
 ):
     mo.stop(
         not hp_search_cb.value,
@@ -698,16 +662,18 @@ def _(
     )
     _space = {"lr": [1e-4, 1e-3, 3e-3], "latent_dim": [16, 32, 64]}
     _results = []
+    _preprocess = lambda batch: mx.array(batch["image"]).reshape(-1, 784)
     for _lr in _space["lr"]:
         for _ld in _space["latent_dim"]:
             _m = VariationalAutoEncoderV1(
                 input_dim=784, hidden_dim=512, latent_dim=_ld
             )
             mx.eval(_m.parameters())
-            _opt = optim.AdamW(learning_rate=_lr)
-            for _ in range(5):
-                train_epoch(_m, _opt, train_buf, 128)
-            _vl = evaluate_elbo(_m, val_buf)
+            _, _val_losses = train_and_validate(
+                _m, compute_vae_loss, train_iter, val_iter,
+                5, _lr, 0.0, _preprocess,
+            )
+            _vl = _val_losses[-1]
             _results.append(
                 {"lr": _lr, "latent_dim": _ld, "val_loss": round(_vl, 4)}
             )
@@ -715,7 +681,6 @@ def _(
                 mo.md(f"lr={_lr}, latent_dim={_ld} → val={_vl:.4f}")
             )
     _results.sort(key=lambda r: r["val_loss"])
-    hp_results = _results
     mo.ui.table(_results)
     return
 
@@ -730,21 +695,23 @@ def _(mo):
 
 @app.cell
 def _(
+    compute_vae_loss,
     conv_trained_model,
-    evaluate_conv_elbo,
-    evaluate_elbo,
     mo,
-    test_buf,
+    run_evaluate,
+    test_iter,
     trained_model,
-    val_buf,
+    val_iter,
 ):
     if trained_model is None:
         _out = mo.md("_Train the models first._")
     else:
-        _val_elbo = evaluate_elbo(trained_model, val_buf)
-        _test_elbo = evaluate_elbo(trained_model, test_buf)
-        _conv_val_elbo = evaluate_conv_elbo(conv_trained_model, val_buf)
-        _conv_test_elbo = evaluate_conv_elbo(conv_trained_model, test_buf)
+        _mlp_preprocess = lambda batch: mx.array(batch["image"]).reshape(-1, 784)
+        _conv_preprocess = lambda batch: mx.array(batch["image"])
+        _val_elbo = run_evaluate(trained_model, compute_vae_loss, val_iter, _mlp_preprocess)
+        _test_elbo = run_evaluate(trained_model, compute_vae_loss, test_iter, _mlp_preprocess)
+        _conv_val_elbo = run_evaluate(conv_trained_model, compute_vae_loss, val_iter, _conv_preprocess)
+        _conv_test_elbo = run_evaluate(conv_trained_model, compute_vae_loss, test_iter, _conv_preprocess)
         _out = mo.md(
             f"""
     **Evaluation Results**
@@ -866,18 +833,19 @@ def _(conv_train_losses, conv_val_losses, mo, train_losses, val_losses):
 
 
 @app.cell
-def _(conv_trained_model, mo, test_buf, trained_model):
+def _(conv_trained_model, mo, test_iter, trained_model):
     if trained_model is None:
         _out = mo.md("_Train first._")
     else:
         _n_show = 8
-        _batch = next(iter(test_buf.to_stream().batch(_n_show)))
+        test_iter.reset()
+        _batch = next(test_iter)
 
-        _orig_flat = mx.array(_batch["image"], dtype=mx.float32).reshape(-1, 784) / 255.0
+        _orig_flat = mx.array(_batch["image"]).reshape(-1, 784)[:_n_show]
         _mlp_recon, _, _ = trained_model(_orig_flat)
         mx.eval(_mlp_recon)
 
-        _orig_4d = mx.array(_batch["image"], dtype=mx.float32) / 255.0
+        _orig_4d = mx.array(_batch["image"])[:_n_show]
         _conv_recon, _, _ = conv_trained_model(_orig_4d)
         mx.eval(_conv_recon)
 
