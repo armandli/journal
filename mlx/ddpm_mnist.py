@@ -607,6 +607,86 @@ def ddpm_sample(
     return x
 
 
+@app.function
+def ddim_sample(
+    model: nn.Module,
+    schedule: "DiffusionScheduleV1",
+    labels: mx.array,
+    image_shape: tuple = (28, 28, 1),
+    guidance_scale: float = 3.0,
+    num_steps: int = 50,
+    eta: float = 0.0,
+    progress_callback=None,
+) -> mx.array:
+    """DDIM accelerated sampling with classifier-free guidance.
+
+    Uses num_steps uniformly-spaced timesteps instead of all T=1000 steps.
+    eta=0 is fully deterministic; eta=1 recovers DDPM-style stochasticity.
+    Same trained model as DDPM — only the sampling procedure differs.
+    """
+    T = schedule.num_timesteps
+    batch_size = int(labels.shape[0])
+
+    # Uniformly spaced sampling timesteps (1-indexed to match PyTorch DDIMScheduler convention)
+    step_size = T // num_steps
+    sampling_ts = mx.array(
+        [min(i * step_size, T - 1) for i in range(1, num_steps + 1)],
+        dtype=mx.int32,
+    )  # ascending, shape (num_steps,)
+
+    # alpha_bar at each sampling timestep and its predecessor
+    alpha_bar_s = mx.take(schedule.alphas_cumprod, sampling_ts)
+    alpha_bar_s_prev = mx.concatenate([
+        schedule.alphas_cumprod[0:1],
+        alpha_bar_s[:-1],
+    ])
+
+    sqrt_alpha_bar_s = mx.sqrt(alpha_bar_s)
+    sqrt_alpha_bar_s_prev = mx.sqrt(alpha_bar_s_prev)
+    sqrt_one_minus_alpha_bar_s = mx.sqrt(1.0 - alpha_bar_s)
+
+    # sigma: stochasticity (0 = deterministic DDIM, 1 = DDPM-like)
+    sigma = eta * mx.sqrt(
+        (1.0 - alpha_bar_s_prev) / (1.0 - alpha_bar_s) *
+        (1.0 - alpha_bar_s / alpha_bar_s_prev)
+    )
+    # direction-to-x_t coefficient: sqrt(1 - alpha_bar_s_prev - sigma^2), clamped >= 0
+    dir_coef = mx.sqrt(mx.maximum(1.0 - alpha_bar_s_prev - sigma ** 2, 0.0))
+
+    mx.eval(alpha_bar_s, alpha_bar_s_prev, sqrt_alpha_bar_s, sqrt_alpha_bar_s_prev,
+            sqrt_one_minus_alpha_bar_s, sigma, dir_coef)
+
+    null_labels = mx.full((batch_size,), model.null_class_index, dtype=labels.dtype)
+    x = mx.random.normal((batch_size,) + image_shape)
+    mx.eval(x)
+
+    log_interval = max(num_steps // 10, 1)
+    for tau in range(num_steps - 1, -1, -1):
+        t_actual = int(sampling_ts[tau].item())
+        t_batch = mx.full((batch_size,), t_actual, dtype=mx.int32)
+
+        eps_cond = model(x, t_batch, labels)
+        eps_uncond = model(x, t_batch, null_labels)
+        eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+        sab = float(sqrt_alpha_bar_s[tau].item())
+        sab_prev = float(sqrt_alpha_bar_s_prev[tau].item())
+        s1mab = float(sqrt_one_minus_alpha_bar_s[tau].item())
+        dc = float(dir_coef[tau].item())
+        sig = float(sigma[tau].item())
+
+        x0_pred = (x - s1mab * eps) / sab
+        direction = dc * eps
+        noise = mx.random.normal(x.shape) if (eta > 0.0 and tau > 0) else mx.zeros(x.shape)
+        x = sab_prev * x0_pred + direction + sig * noise
+        mx.eval(x)
+
+        if progress_callback is not None and (tau % log_interval == 0 or tau == 0):
+            progress_callback(tau, num_steps)
+
+    return mx.clip(x, 0.0, 1.0)
+
+
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -804,15 +884,31 @@ def _(mo):
     num_samples_ui = mo.ui.slider(
         1, 16, value=4, step=1, label="Number of samples"
     )
+    sampler_ui = mo.ui.dropdown(
+        options=["DDPM (1000 steps)", "DDIM"],
+        value="DDPM (1000 steps)",
+        label="Sampler",
+    )
+    ddim_steps_ui = mo.ui.slider(
+        10, 200, value=50, step=10, label="DDIM steps"
+    )
     sample_btn = mo.ui.run_button(label="Generate")
     mo.vstack(
         [
             mo.md("### Sampling controls"),
             mo.hstack([digit_ui, guidance_ui, num_samples_ui]),
+            mo.hstack([sampler_ui, ddim_steps_ui]),
             sample_btn,
         ]
     )
-    return digit_ui, guidance_ui, num_samples_ui, sample_btn
+    return (
+        ddim_steps_ui,
+        digit_ui,
+        guidance_ui,
+        num_samples_ui,
+        sample_btn,
+        sampler_ui,
+    )
 
 
 @app.function
@@ -839,11 +935,13 @@ def plot_generated_grid(
 
 @app.cell
 def _(
+    ddim_steps_ui,
     digit_ui,
     guidance_ui,
     mo,
     num_samples_ui,
     sample_btn,
+    sampler_ui,
     trained_model,
     trained_schedule,
 ):
@@ -856,23 +954,38 @@ def _(
         _guidance = float(guidance_ui.value)
         _n = int(num_samples_ui.value)
         _labels = mx.full((_n,), _digit, dtype=mx.int32)
+        _use_ddim = sampler_ui.value == "DDIM"
+        _ddim_steps = int(ddim_steps_ui.value)
+        _sampler_name = f"DDIM ({_ddim_steps} steps)" if _use_ddim else "DDPM (1000 steps)"
 
         def _progress(step, total):
             mo.output.replace(
                 mo.md(
-                    f"Sampling digit {_digit} — step "
-                    f"{total - step}/{total}"
+                    f"{_sampler_name} — digit {_digit} — "
+                    f"step {total - step}/{total}"
                 )
             )
 
-        _samples = ddpm_sample(
-            trained_model,
-            trained_schedule,
-            _labels,
-            image_shape=(28, 28, 1),
-            guidance_scale=_guidance,
-            progress_callback=_progress,
-        )
+        if _use_ddim:
+            _samples = ddim_sample(
+                trained_model,
+                trained_schedule,
+                _labels,
+                image_shape=(28, 28, 1),
+                guidance_scale=_guidance,
+                num_steps=_ddim_steps,
+                eta=0.0,
+                progress_callback=_progress,
+            )
+        else:
+            _samples = ddpm_sample(
+                trained_model,
+                trained_schedule,
+                _labels,
+                image_shape=(28, 28, 1),
+                guidance_scale=_guidance,
+                progress_callback=_progress,
+            )
         mx.eval(_samples)
         _images_np = np.array(_samples)
         _out = plot_generated_grid(_images_np, _digit, _guidance)
