@@ -4,6 +4,7 @@ __generated_with = "0.23.13"
 app = marimo.App(width="medium")
 
 with app.setup:
+    from pathlib import Path
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -849,6 +850,86 @@ def _(
     """
         )
     _summary
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 9 — Save Trained Models
+
+    Persist the trained `VariationalAutoEncoderV1` (MLP) and
+    `ConvolutionalVariationalAutoEncoderV1` (Conv) weights to the
+    project's `models/` directory. The file extension chosen determines
+    the on-disk format: `.safetensors` or `.npz` (both natively
+    supported by MLX).
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mlp_save_filename_ui = mo.ui.text(
+        value="vae_mlp_mnist_v1.safetensors",
+        label="MLP VAE filename (saved into models/)",
+        full_width=True,
+    )
+    mlp_save_btn = mo.ui.run_button(label="Save MLP VAE")
+    conv_save_filename_ui = mo.ui.text(
+        value="vae_conv_mnist_v1.safetensors",
+        label="Conv VAE filename (saved into models/)",
+        full_width=True,
+    )
+    conv_save_btn = mo.ui.run_button(label="Save Conv VAE")
+    mo.vstack(
+        [
+            mo.hstack([mlp_save_filename_ui, mlp_save_btn]),
+            mo.hstack([conv_save_filename_ui, conv_save_btn]),
+        ]
+    )
+    return (
+        conv_save_btn,
+        conv_save_filename_ui,
+        mlp_save_btn,
+        mlp_save_filename_ui,
+    )
+
+
+@app.cell
+def _(mlp_save_btn, mlp_save_filename_ui, mo, trained_model):
+    if trained_model is None:
+        _mlp_out = mo.md("_Train the MLP VAE first (Section 5) before saving._")
+    elif not mlp_save_btn.value:
+        _mlp_out = mo.md(
+            "Enter a filename and click **Save MLP VAE** to write the "
+            "trained weights to `models/`."
+        )
+    else:
+        _models_dir = Path(__file__).resolve().parent.parent / "models"
+        _models_dir.mkdir(parents=True, exist_ok=True)
+        _save_path = _models_dir / mlp_save_filename_ui.value
+        trained_model.save_weights(str(_save_path))
+        _mlp_out = mo.md(f"**Saved!** MLP VAE weights written to `{_save_path}`.")
+    _mlp_out
+    return
+
+
+@app.cell
+def _(conv_save_btn, conv_save_filename_ui, conv_trained_model, mo):
+    if conv_trained_model is None:
+        _conv_out = mo.md("_Train the Conv VAE first (Section 5) before saving._")
+    elif not conv_save_btn.value:
+        _conv_out = mo.md(
+            "Enter a filename and click **Save Conv VAE** to write the "
+            "trained weights to `models/`."
+        )
+    else:
+        _models_dir = Path(__file__).resolve().parent.parent / "models"
+        _models_dir.mkdir(parents=True, exist_ok=True)
+        _save_path = _models_dir / conv_save_filename_ui.value
+        conv_trained_model.save_weights(str(_save_path))
+        _conv_out = mo.md(f"**Saved!** Conv VAE weights written to `{_save_path}`.")
+    _conv_out
     return
 
 

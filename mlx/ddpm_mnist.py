@@ -5,6 +5,7 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import math
+    from pathlib import Path
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -58,6 +59,7 @@ def _(mo):
     5. Training loop
     6. Interactive sampling widget
     7. Results summary
+    8. Save trained model
     """)
     return
 
@@ -1063,6 +1065,49 @@ def _(
     """
         )
     _summary
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 8 — Save Trained Model
+
+    Persist the trained `UNetV1` weights to the project's `models/`
+    directory. The file extension chosen determines the on-disk format:
+    `.safetensors` or `.npz` (both natively supported by MLX).
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    save_filename_ui = mo.ui.text(
+        value="mnist_ddpm_cfd_v1.safetensors",
+        label="Filename (saved into models/)",
+        full_width=True,
+    )
+    save_model_btn = mo.ui.run_button(label="Save Model")
+    mo.vstack([save_filename_ui, save_model_btn])
+    return save_filename_ui, save_model_btn
+
+
+@app.cell
+def _(mo, save_filename_ui, save_model_btn, trained_model):
+    if trained_model is None:
+        _out = mo.md("_Train the model first (Section 5) before saving._")
+    elif not save_model_btn.value:
+        _out = mo.md(
+            "Enter a filename and click **Save Model** to write the "
+            "trained weights to `models/`."
+        )
+    else:
+        _models_dir = Path(__file__).resolve().parent.parent / "models"
+        _models_dir.mkdir(parents=True, exist_ok=True)
+        _save_path = _models_dir / save_filename_ui.value
+        trained_model.save_weights(str(_save_path))
+        _out = mo.md(f"**Saved!** Model weights written to `{_save_path}`.")
+    _out
     return
 
 
