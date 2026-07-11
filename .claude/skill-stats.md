@@ -7,5 +7,5 @@
 | create-skill | 10 | 0 |
 | marimo-notebook | 2 | 0 |
 | marimo-session | 1 | 0 |
-| pull | 1 | 0 |
+| pull | 2 | 0 |
 
