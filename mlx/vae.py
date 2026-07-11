@@ -146,13 +146,13 @@ def make_datasets(train_ds, test_ds, batch_size, val_fraction=0.15):
     n_val = int(round(n_total * val_fraction))
     shuffled = train_ds.shuffle()
     train_iter = (
-        shuffled[np.arange(n_val, n_total)]
+        shuffled
         .to_stream()
         .key_transform("image", normalize)
         .batch(batch_size)
     )
     val_iter = (
-        shuffled[np.arange(n_val)]
+        shuffled
         .to_stream()
         .key_transform("image", normalize)
         .batch(batch_size)
