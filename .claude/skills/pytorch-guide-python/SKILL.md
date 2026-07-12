@@ -116,19 +116,19 @@ with torch.no_grad():
         # compute metrics
 ```
 
-## Mixed Precision (AMP)
+## Mixed Precision (AMP) — default for training loops in this repo
 
 ```python
 from torch.amp import autocast, GradScaler
 
-scaler = GradScaler()
+scaler = GradScaler(device.type, enabled=(device.type == "cuda"))
 
 model.train()
 for x, y in train_loader:
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
 
-    with autocast(device_type="cuda"):   # float16 on CUDA, bfloat16 on CPU
+    with autocast(device_type=device.type):   # float16 on CUDA, bfloat16 on CPU
         logits = model(x)
         loss = loss_fn(logits, y)
 
@@ -138,6 +138,12 @@ for x, y in train_loader:
     scaler.step(optimizer)
     scaler.update()
 ```
+
+Default to wrapping every PyTorch training loop in `autocast` + `GradScaler`
+like this, unless the user explicitly asks for full-precision training. For
+the full API (op-eligibility tables, gradient accumulation/penalty,
+multi-model/DDP patterns, custom autograd `Function`s), see the
+`pytorch-amp-guide-python` skill.
 
 ## Saving and Loading
 

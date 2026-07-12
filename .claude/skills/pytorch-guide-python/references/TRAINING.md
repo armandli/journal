@@ -45,11 +45,15 @@ train_ds, val_ds = random_split(dataset, [0.8, 0.2])
 
 ## Full Training Loop with Best Practices
 
+Mixed precision (`autocast` + `GradScaler`) is the default here — see
+`pytorch-amp-guide-python` for the full AMP API.
+
 ```python
 def train(model, train_loader, val_loader, epochs, device):
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     loss_fn = nn.CrossEntropyLoss()
+    scaler = GradScaler(device.type, enabled=(device.type == "cuda"))
 
     best_val_loss = float("inf")
 
@@ -94,28 +98,12 @@ def train(model, train_loader, val_loader, epochs, device):
 
 ## Mixed Precision (AMP)
 
-```python
-from torch.amp import autocast, GradScaler
-
-scaler = GradScaler()    # only needed for float16; not needed for bfloat16
-
-# float16 on CUDA (use GradScaler)
-with autocast(device_type="cuda", dtype=torch.float16):
-    output = model(x)
-    loss = loss_fn(output, y)
-scaler.scale(loss).backward()
-scaler.unscale_(optimizer)
-nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-scaler.step(optimizer)
-scaler.update()
-
-# bfloat16 on CUDA or CPU (no GradScaler needed)
-with autocast(device_type="cuda", dtype=torch.bfloat16):
-    output = model(x)
-    loss = loss_fn(output, y)
-loss.backward()
-optimizer.step()
-```
+Mixed precision is the default training mode in this repo — the loop above
+already applies it. For the full `torch.amp` API (op-eligibility tables,
+`float16` vs `bfloat16` tradeoffs, gradient accumulation/penalty under
+scaling, multiple models/optimizers, DataParallel/DDP, custom autograd
+`Function`s, and a real anti-pattern this repo's own notebooks fell into),
+see the `pytorch-amp-guide-python` skill.
 
 ## torch.compile
 

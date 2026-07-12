@@ -34,7 +34,7 @@ def _():
 `@app.function` and `@app.class_definition` are globally visible across all cells without being in any return tuple. Use them for every helper function and every `nn.Module` subclass.
 
 ### Rules
-- `with app.setup:` — third-party imports only (mlx, torch, numpy, matplotlib, etc.)
+- `with app.setup:` — third-party imports, plus `from pathlib import Path` (needed by Section 9's model-save cell)
 - First `@app.cell` — `import marimo as mo` with plain `return`
 - **Avoid `_`-prefixed variables** — extract logic into `@app.function` instead of accumulating `_work_vars` inside a cell. The only acceptable `_` usage: `_out` in conditional-display cells, and one-off lambdas (e.g. `_preprocess`) that are genuinely cell-specific.
 - Cross-cell variables: returned explicitly in `return (var1, var2)`
@@ -111,6 +111,7 @@ def _(hp_search_cb, ...):
 | 6 | Hyperparameter Search | `hp_results` (optional) |
 | 7 | Validation & Cross-Validation | `val_metrics`, `cv_results` |
 | 8 | Results | Plots, tables, summary markdown |
+| 9 | Save Trained Model | Weights file written to `models/` |
 
 ## Matplotlib Display Rules
 

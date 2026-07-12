@@ -1,6 +1,6 @@
 ---
 name: create-research-book
-description: Generate a complete ML research marimo notebook (.py file) from a research goal. Produces sections for data exploration, dataset creation, versioned reusable neural network modules (MLX or PyTorch), hyperparameter-controlled training, optional hyperparameter search, cross-validation, and results reporting. Use when user asks to "create a research notebook", "generate a research book for [topic]", "set up an ML experiment for [goal]", or "make a marimo research template". Arguments: [notebook_name.py] [research goal sentence]. Do NOT use for general marimo editing (use marimo-notebook), for non-ML topics, or when no research goal is given.
+description: Generate a complete ML research marimo notebook (.py file) from a research goal. Produces sections for data exploration, dataset creation, versioned reusable neural network modules (MLX or PyTorch), hyperparameter-controlled training, optional hyperparameter search, cross-validation, results reporting, and saving the trained model checkpoint under models/. Use when user asks to "create a research notebook", "generate a research book for [topic]", "set up an ML experiment for [goal]", or "make a marimo research template". Arguments: [notebook_name.py] [research goal sentence]. Do NOT use for general marimo editing (use marimo-notebook), for non-ML topics, or when no research goal is given.
 argument-hint: "[notebook_name.py] [research goal description]"
 ---
 
@@ -61,7 +61,7 @@ These rules are mandatory. Violations are bugs, not style choices.
 
 ---
 
-Write ALL 8 sections below. Do not skip any. Do not leave stubs or TODO comments.
+Write ALL 9 sections below. Do not skip any. Do not leave stubs or TODO comments.
 
 ### Section 1 — Title & Research Goal
 A markdown cell with the notebook title, research goal statement, and a brief outline of all sections.
@@ -93,6 +93,7 @@ Follow MODULE-PATTERNS.md strictly:
 - `mo.ui.dropdown` for lr, batch_size, weight_decay; `mo.ui.slider` for epochs
 - `mo.ui.run_button(label="Train")` gate
 - Extract `run_train_epoch(model, loss_fn, optimizer, train_iter, preprocess_fn)` and `run_evaluate(model, loss_fn, data_iter, preprocess_fn)` as `@app.function` cells
+- **PyTorch only — mixed precision is the default**: wrap the forward pass + loss in each helper in `torch.autocast(device_type=device.type)` and use `torch.amp.GradScaler` for the optimizer step — see TRAINING-PATTERNS.md's PyTorch Training Loop pattern and the `pytorch-amp-guide-python` skill for the full API. Only skip this if the user explicitly asks for full-precision training. (MLX has no autocast/GradScaler equivalent — do not add anything AMP-related to MLX notebooks.)
 - The training cell calls those helpers; use `mo.output.replace()` for live progress
 - Return `(train_losses, trained_model)` — initialize to `([], None)` when button not clicked
 
@@ -112,6 +113,14 @@ Follow MODULE-PATTERNS.md strictly:
 - For VAE/generative models: show a grid of original vs. reconstructed images
 - Model comparison table if multiple variants were defined
 - Final summary markdown
+
+### Section 9 — Save Trained Model
+- Follow the "Save Trained Model Pattern" in TRAINING-PATTERNS.md
+- Resolve the repo-root `models/` directory via `Path(__file__).resolve().parent.parent / "models"` (create it with `mkdir(parents=True, exist_ok=True)`) — never hardcode an absolute path
+- `mo.ui.text` for a custom filename (pre-filled with a sensible default name, e.g. `<dataset>_<model>_v1.safetensors` for MLX or `<dataset>_<model>_v1.pt` for PyTorch) gated behind `mo.ui.run_button(label="Save Model")`
+- Guard on `trained_model is None` — instruct the user to train first (Section 5)
+- MLX: `trained_model.save_weights(str(save_path))`; PyTorch: `torch.save(trained_model.state_dict(), save_path)`
+- Report the resolved save path back to the user in the output markdown
 
 ---
 
