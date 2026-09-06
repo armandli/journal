@@ -19,7 +19,7 @@ with app.setup:
 def _():
     import marimo as mo
 
-    return
+    return (mo,)
 
 
 @app.cell
@@ -47,9 +47,54 @@ def _(DEVICE):
     return
 
 
-@app.cell
-def _():
-    # data distribution
+app._unparsable_cell(
+    r"""
+    ## Flow Matching Basics: Data, Models, and Linear Interpolation
+
+    This notebook introduces the fundamentals of flow matching for generative modeling. We'll explore how to transform a simple latent distribution into complex target distributions by learning velocity fields along interpolating paths.
+    Overview
+
+    Flow matching learns to transport samples from a simple source or "noise" distribution u1 (like a standard Gaussian) to a complex target distribution u0 (our data) by following a time-dependent velocity field vt(x) . The key insight is that we can train a neural network to approximate this velocity field using individual sample pairs.
+
+    First we need to set up our environment.
+
+    """,
+    name="_"
+)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## The Flow Matching Objective
+
+    Our goal is to learn a velocity field vt by approximating it with a neural network v_theta_t.
+
+    Task: Learn vt via neural network v_theta_t
+
+    The ideal loss function would be:
+
+        L(theta) := Et~U(0,T),x~ut[ (v_theta_t(x) - v_t(x))^2 ]
+
+    However, this is not accessible because we don't know ut or vt in practice.
+
+    Key Idea: Make it conditional! We can rewrite the loss (up to a constant) as:
+
+        L(theta) := Et~U(0,T),y~u0,x~ut(.|y)[ (v_theta_t(x) - v_y_t(x))^2 ]
+
+    The conditional velocity fields v_y_t belonging to conditional flows ut(.|y) starting from delta_y are available in analytic form for certain couplings (e.g., from optimal transport).
+
+    All you need is the conditional v_y_t
+
+    ## Target Distributions
+
+    To demonstrate flow matching, we'll work with two 2D distributions that showcase different challenges:
+
+        Two Moons: Two interleaving half-circle shapes forming a classic non-linear classification dataset
+        Grid GMM: Nine Gaussian components arranged in a 3×3 grid
+
+    We define a common interface for these distributions and implement each one with sampling capabilities.
+    """)
     return
 
 
@@ -144,9 +189,20 @@ def _(GridGMM9, TwoMoons):
     return (get_distribution,)
 
 
-@app.cell
-def _():
-    # velocity network
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## velocity network
+
+    The core of flow matching is a neural network that predicts velocity fields conditioned on both spatial position and time . We use a residual MLP with sinusoidal time embeddings, which provides the network with a rich representation of the time variable.
+
+    The architecture consists of:
+
+        Sinusoidal time embedding: Maps scalar time to high-dimensional features
+        Input projection: Projects spatial coordinates to hidden dimension
+        Residual blocks: Process features while conditioning on time
+        Output layer: Predicts velocity in the same space as input
+    """)
     return
 
 
@@ -199,9 +255,19 @@ class VelocityMLP(nn.Module):
         return self.net(h)
 
 
-@app.cell
-def _():
-    # visualization
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Visualization and Utility Functions
+
+    We import several utility functions from fm_utils.py:
+
+        make_latent_sampler: Creates samplers for different latent distributions (gaussian, uniform, student_t)
+        update_ema: Exponential moving average update for model parameters
+        plot_source_target_trajectories: Visualization of flow trajectories
+
+    We also define simple plotting helpers for this notebook.
+    """)
     return
 
 
@@ -221,17 +287,27 @@ def plot_points(ax, samples: torch.Tensor, title: str, color: str, *, alpha: flo
     pts = samples.detach().cpu().numpy()
     ax.scatter(pts[:, 0], pts[:, 1], s=6, alpha=alpha, color=color, linewidths=0)
     ax.set_title(title)
-    
+
     # Compute axis limits with some padding
     x_min, x_max = pts[:, 0].min(), pts[:, 0].max()
     y_min, y_max = pts[:, 1].min(), pts[:, 1].max()
     x_range = x_max - x_min
     y_range = y_max - y_min
     padding = 0.1
-    
+
     ax.set_xlim(x_min - padding * x_range, x_max + padding * x_range)
     ax.set_ylim(y_min - padding * y_range, y_max + padding * y_range)
     ax.set_aspect('equal', 'box')
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Visualizing the Target Distributions
+
+    Let's sample from each of our target distributions to see what we're trying to model. These visualizations show the different challenges: disconnected regions, multiple modes, and varying density.
+    """)
+    return
 
 
 @app.cell
@@ -250,6 +326,58 @@ def _(draw_samples, get_distribution):
 
     plt.tight_layout()
     plt.show()
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Training with Linear Interpolation
+    From Theory to Practice
+
+    In generative modeling, we start with a simple latent distribution u0, choose a target data distribution u1, and consider an interpolating curve of measures ut with a velocity field vt.
+
+    The evolution t -> ut is governed by the continuity equation: dt ut + delta_x * (ut vt) = 0
+
+    Intuitively, ut
+    describes how mass is distributed at time t, and vt(x) tells us in which direction points at x are moving. Although solving this PDE directly is challenging, we can approximate the velocity field with a neural network.
+
+    ## Straight-Line Interpolation
+
+    The simplest approach is to connect a data sample x0 and a latent sample x1 with a straight line: xt = (1 - t) * x0 + t * x1, t in [0, 1]
+
+    The time derivative of this path is: d/dt xt = x1 - x0
+
+    For a conditional flow starting at x0 and ending at y = x, the conditional velocity field is: v_y_t(x) = (y - x) / (1 - t)
+
+    When evaluated along our straight line (where x = xt and y = x1), this simplifies to x1 - x0.
+
+    ## Training Objective
+
+    We train the network v_theta_t by minimizing:
+
+        Et,x0,x1[ (v_theta_t(t, xt) - (x1 - x0))^2 ]
+
+    where x0 ~ u0 (data), x1 ~ u1 (latent), t~U(0, 1), and xt = (1 - t) x0 + t * x1.
+
+    This is the simplest form of flow matching, using independent random pairings between data and latent samples.
+
+    ## Configuration and Training Setup
+
+    We define a simple configuration dictionary to organize our hyperparameters and a training function that returns results in a dictionary.
+
+    🎯 Exercise 1: Complete the training loop
+
+    Before running the training, you'll need to complete the train_linear_flow function below. Fill in the 5 TODO sections:
+
+        Sample random time t
+        Compute interpolated point x_t
+        Compute target velocity
+        Predict velocity with the model
+        Compute the loss
+
+    Refer to the theory section above for the mathematical formulas!
+    """)
     return
 
 
@@ -392,15 +520,15 @@ def _(DEVICE, get_distribution):
             if x0.dim() > 2:
                 x0 = x0.view(x0.shape[0], -1)
             x1 = latent_sampler((config['batch_size'], config['dim']))
-        
+
             # 1: Sample random time t ~ Uniform[0,1]
             # What shape do we need? Think about batch_size
             t = torch.rand(config['batch_size'], 1)
-        
+
             # 2: Compute interpolated point x_t
             # Review the "Straight-Line Interpolation" section above for the formula
             x_t = (torch.ones(config['batch_size'], 1) - t) * x0 + t * x1
-        
+
             # 3: Compute target velocity
             # Review the "Straight-Line Interpolation" section: what is dx_t/dt?
             velocity_target = x1 - x0
@@ -408,7 +536,7 @@ def _(DEVICE, get_distribution):
             # 4: Get model's velocity prediction
             # Check the VelocityMLP.forward() signature - what arguments does it take?
             pred = model(t, x_t)
-        
+
             # 5: Compute MSE loss
             # Structure: compute squared differences, then aggregate appropriately
             loss = nn.functional.mse_loss(pred, velocity_target)
@@ -443,6 +571,21 @@ def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
             p_ema.data.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
 
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Running a Training Session
+
+    Let's train a flow matching model on a target distribution. You can choose either:
+
+        'gridgmm' - Nine Gaussian components in a 3×3 grid (multi-modal)
+        'twomoons' - Two interleaving half-circles (non-linear manifold)
+
+    Try both to see how the model performs on different distribution types!
+    """)
+    return
+
+
 @app.cell
 def _(train_linear_flow):
     config = {
@@ -462,9 +605,13 @@ def _(train_linear_flow):
     return (run,)
 
 
-@app.cell
-def _():
-    # training loss
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## training loss
+
+    Let us plot the MSE Loss during training. We can see it rapidly decreases in the beginning, although it doesn't continue to do so the model performance improves. Therefore training loss does not directly imply sampling performance as you can try out yourself by changing the number of training steps and evaluating the model.
+    """)
     return
 
 
@@ -495,9 +642,23 @@ def _(run):
     return
 
 
-@app.cell
-def _():
-    # sampling from learned flow
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    This is motivated by the noisy training loss - the EMA network provides a smoothed, more stable version of the model. Both run['model'] and run['ema'] can be used identically (same inputs/outputs), but we typically use the EMA version for evaluation and sampling as it tends to generalize better.
+
+    ## Sampling from the Learned Flow
+
+    ODE Integration
+
+    Once trained, we generate samples by integrating the learned velocity field. Starting from a latent point z0
+    at time t=1, we integrate backwards to t=0 following: d/dt x(t) = v_theta_t(t, x(t))
+
+    We use a simple Euler method:
+
+        Create a time grid from T down to 0
+        For each step delta t, update x <- x + delta_t * v_theta_t(t, x)
+    """)
     return
 
 
@@ -512,17 +673,17 @@ def euler_integrate(
 ) -> torch.Tensor:
     """
     Integrate the learned velocity field using Euler method.
-    
+
     Starting from latent z0 at time T, integrate backwards to time 0:
         dx/dt = v_t(x)  =>  x_{t+dt} ≈ x_t + dt * v_t(x_t)
-    
+
     Args:
         model: Trained velocity network
         z0: Initial latent samples (batch_size, dim)
         flow_T: Total flow time (usually 1.0)
         steps: Number of integration steps
         return_path: If True, return full trajectory
-    
+
     Returns:
         Final samples at t=0 (or full trajectory if return_path=True)
     """
@@ -530,30 +691,34 @@ def euler_integrate(
     x = z0
     if return_path:
         states = [x]
-    
+
     for i in range(len(times) - 1):
         t_curr = times[i].expand(z0.shape[0], 1)
         dt = times[i + 1] - times[i]
-        
+
         # 1: Predict velocity at current time and position
         # The model takes (time, position) as inputs
         velocity = model(t_curr, x)
-        
+
         # 2: Update position using Euler step
         # Review the ODE integration formula in the docstring above
         x = x + dt * velocity
-        
+
         if return_path:
             states.append(x)
-    
+
     if return_path:
         return torch.stack(states, dim=0)
     return x
 
 
-@app.cell
-def _():
-    # comparing generated vs target
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## comparing generated vs target
+
+    Let's compare samples from the target distribution with samples generated by our trained model. We also show the latent distribution to visualize the full transformation.
+    """)
     return
 
 
@@ -576,9 +741,13 @@ def _(draw_samples, run):
     return
 
 
-@app.cell
-def _():
-    # visualize flow trejectory
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## visualize flow trejectory
+
+    To understand how the flow transforms latent samples into data, we can visualize the complete trajectories. Each curve shows how a single latent point travels through space over time to reach its final position.
+    """)
     return
 
 
@@ -672,7 +841,7 @@ def plot_source_target_trajectories(
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
     ax.set_aspect("equal", "box")
- 
+
     ax.xaxis.set_major_locator(plt.MaxNLocator(5))
     ax.yaxis.set_major_locator(plt.MaxNLocator(5))
     if title:
@@ -708,10 +877,32 @@ def _(draw_samples, run):
         background=None,
         title='Latents with trajectories',
         ax=ax5,
-    
+
     )
     plt.tight_layout()
     plt.show()
+    return
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## Summary
+
+    In this notebook, we've covered the fundamentals of flow matching:
+
+        The conditional flow matching objective: We showed how to make the intractable marginal flow matching loss tractable by conditioning on target samples
+
+        Straight-line interpolation: The simplest coupling uses xt = (1 - t) * x0 + t * xt, giving us the analytic target velocity x1 - x0
+
+        Neural velocity networks: Time-conditioned MLPs with sinusoidal embeddings effectively learn the velocity field
+
+        ODE integration for sampling: Once trained, we generate samples by integrating the learned velocity field backwards from latent to data
+
+    What's Next?
+
+    This baseline approach uses random pairings between latent and data samples. In the next notebook, we'll explore: Optimal transport pairings
+    """)
     return
 
 
