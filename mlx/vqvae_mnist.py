@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.13"
+__generated_with = "0.24.0"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -58,11 +58,13 @@ def _(mo):
       `log K`, which vanishes from the gradient. This means the model
       cannot suffer from **posterior collapse** the way a continuous
       VAE can.
-    - The training loss is a sum of three terms: reconstruction MSE,
-      the **codebook loss** that pulls codes toward their assigned
-      encoder outputs, and the **commitment loss** (weighted by
-      `beta = 0.25`) that pulls encoder outputs toward their assigned
-      codes.
+    - The training loss is a sum of three terms: the **reconstruction
+      term** — a Bernoulli negative log-likelihood (binary cross-entropy
+      on `[0, 1]` pixels, evaluated from the decoder logits so the
+      gradient does not vanish when the decoder saturates) — the
+      **codebook loss** that pulls codes toward their assigned encoder
+      outputs, and the **commitment loss** (weighted by `beta = 0.25`)
+      that pulls encoder outputs toward their assigned codes.
 
     ### Notebook Outline
 
@@ -73,8 +75,9 @@ def _(mo):
     5. Training
     6. Hyperparameter Search (Optional)
     7. Validation & Cross-Validation
-    8. Results
-    9. Save Trained Model
+    8. Saved-Model Diagnostics
+    9. Results
+    10. Save Trained Model
     """)
     return
 
@@ -173,22 +176,36 @@ def _(mo):
 
 
 @app.function
-def make_datasets(train_ds, test_ds, batch_size: int, val_fraction: float = 0.15):
+def normalize_images(x) -> mx.array:
+    return mx.array(x, dtype=mx.float32) / 255.0
+
+
+@app.function
+def make_datasets(
+    train_ds,
+    test_ds,
+    batch_size: int,
+    val_fraction: float = 0.15,
+    seed: int = 0,
+):
     def _normalize(x):
         return x.astype("float32") / 255.0
 
     n_total = len(train_ds)
     n_val = int(round(n_total * val_fraction))
-    n_train = n_total - n_val
-    shuffled = train_ds.shuffle()
+    perm = np.random.default_rng(seed).permutation(n_total).tolist()
+    val_buf = train_ds.perm(perm[:n_val])
+    train_buf = train_ds.perm(perm[n_val:])
+
     train_iter = (
-        shuffled
+        train_buf
         .to_stream()
         .key_transform("image", _normalize)
+        .shuffle(8192)
         .batch(batch_size)
     )
     val_iter = (
-        shuffled
+        val_buf
         .to_stream()
         .key_transform("image", _normalize)
         .batch(batch_size)
@@ -199,7 +216,7 @@ def make_datasets(train_ds, test_ds, batch_size: int, val_fraction: float = 0.15
         .key_transform("image", _normalize)
         .batch(batch_size)
     )
-    return train_iter, val_iter, test_iter, n_train, n_val
+    return train_iter, val_iter, test_iter, len(train_buf), len(val_buf)
 
 
 @app.cell
@@ -223,12 +240,16 @@ def _(default_n_train, default_n_val, default_train_iter, mo):
         f"""
     ### Split sizes and one-batch inspection
 
+    A seeded permutation carves a genuine held-out val partition from the
+    60k train buffer (`Buffer.perm`) — train and val samples never overlap.
+
     - **Train** (85% of raw 60k): {default_n_train:,}
-    - **Val** (15% of raw 60k): {default_n_val:,}
+    - **Val** (15% of raw 60k, held out): {default_n_val:,}
     - **Test** (raw, held-out): 10,000
 
-    A single training batch after `.shuffle().to_stream().batch(128)`
-    with per-sample normalization to `[0, 1]`:
+    A single training batch after
+    `train_buf.to_stream().key_transform(norm).shuffle(8192).batch(128)`
+    (the shuffle buffer re-randomizes on every epoch `.reset()`):
 
     - batch image shape: `{tuple(_peek.shape)}`
     - batch dtype: `{_peek.dtype}`
@@ -341,10 +362,26 @@ class VectorQuantizerV1(nn.Module):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.commitment_cost = commitment_cost
-        _scale = 1.0 / num_embeddings
-        self.codebook = mx.random.uniform(
-            low=-_scale, high=_scale, shape=(num_embeddings, embedding_dim)
-        )
+        self.codebook = mx.random.normal(
+            shape=(num_embeddings, embedding_dim)
+        ) * (1.0 / embedding_dim ** 0.5)
+
+    def reset_dead_codes(self, z_e_flat: mx.array, hit_counts, min_count: int = 1):
+        counts = np.asarray(hit_counts).reshape(-1)
+        dead = np.nonzero(counts < min_count)[0]
+        pool = np.asarray(z_e_flat)
+        if dead.size == 0 or pool.shape[0] == 0:
+            return 0
+        rng = np.random.default_rng()
+        pick = rng.integers(0, pool.shape[0], size=dead.size)
+        noise = rng.normal(
+            scale=1e-3, size=(dead.size, self.embedding_dim)
+        ).astype(pool.dtype)
+        new_codebook = np.asarray(self.codebook).copy()
+        new_codebook[dead] = pool[pick] + noise
+        self.codebook = mx.array(new_codebook)
+        mx.eval(self.codebook)
+        return int(dead.size)
 
     def __call__(self, z_e: mx.array):
         _b, _h, _w, _d = z_e.shape
@@ -415,13 +452,16 @@ class ConvDecoderV1(nn.Module):
             padding=1,
         )
 
-    def __call__(self, z_q: mx.array) -> mx.array:
+    def decode_logits(self, z_q: mx.array) -> mx.array:
         h = self.post_vq(z_q)
         for block in self.res_blocks:
             h = block(h)
         h = nn.relu(h)
         h = nn.relu(self.up1(h))
-        return mx.sigmoid(self.up2(h))
+        return self.up2(h)
+
+    def __call__(self, z_q: mx.array) -> mx.array:
+        return mx.sigmoid(self.decode_logits(z_q))
 
 
 @app.class_definition
@@ -465,9 +505,11 @@ class VQVAEV1(nn.Module):
         z_q_st, vq_loss, codebook_loss, commitment_loss, perplexity, indices = (
             self.quantizer(z_e)
         )
-        x_hat = self.decoder(z_q_st)
+        logits = self.decoder.decode_logits(z_q_st)
+        x_hat = mx.sigmoid(logits)
         return (
             x_hat,
+            logits,
             vq_loss,
             codebook_loss,
             commitment_loss,
@@ -482,16 +524,23 @@ def count_parameters(model: nn.Module) -> int:
 
 
 @app.function
+def reconstruction_loss(logits: mx.array, x: mx.array) -> mx.array:
+    # Bernoulli negative log-likelihood on [0, 1] pixels, computed from logits
+    # (numerically stable, non-vanishing gradient even when the decoder
+    # saturates — this is what lets a collapsed decoder recover).
+    return mx.mean(nn.losses.binary_cross_entropy(logits, x, with_logits=True))
+
+
+@app.function
 def compute_vqvae_loss(model: nn.Module, x: mx.array) -> mx.array:
-    x_hat, vq_loss, _codebook_loss, _commitment_loss, _perplexity, _idx = model(x)
-    recon_loss = mx.mean((x_hat - x) ** 2)
-    return recon_loss + vq_loss
+    _x_hat, logits, vq_loss, _codebook_loss, _commitment_loss, _perplexity, _idx = model(x)
+    return reconstruction_loss(logits, x) + vq_loss
 
 
 @app.function
 def compute_vqvae_metrics(model: nn.Module, x: mx.array):
-    x_hat, vq_loss, codebook_loss, commitment_loss, perplexity, _idx = model(x)
-    recon_loss = mx.mean((x_hat - x) ** 2)
+    _x_hat, logits, vq_loss, codebook_loss, commitment_loss, perplexity, _idx = model(x)
+    recon_loss = reconstruction_loss(logits, x)
     total = recon_loss + vq_loss
     return total, recon_loss, codebook_loss, commitment_loss, perplexity
 
@@ -516,14 +565,24 @@ def _(mo):
     | Decoder post-VQ 3x3 conv | `Conv2d` 3x3 | `(B, 7, 7, base)` |
     | Decoder residual blocks | `ResidualBlockV1` x N | `(B, 7, 7, base)` |
     | Decoder upsample 1 | `ConvTranspose2d` (k=4, s=2, p=1) + ReLU | `(B, 14, 14, base/2)` |
-    | Decoder upsample 2 | `ConvTranspose2d` (k=4, s=2, p=1) + sigmoid | `(B, 28, 28, 1)` |
+    | Decoder upsample 2 | `ConvTranspose2d` (k=4, s=2, p=1) -> logits; `sigmoid` for display | `(B, 28, 28, 1)` |
 
-    **Loss** = `mean_pixel (x - x_hat)^2 + mean(( sg(z_e) - z_q )^2) + beta * mean(( z_e - sg(z_q) )^2)`
+    **Loss** = `BCE_with_logits(decoder_logits, x) + mean(( sg(z_e) - z_q )^2) + beta * mean(( z_e - sg(z_q) )^2)`
 
-    (`sg` denotes `mx.stop_gradient`; `beta = 0.25` by default.)
+    (`sg` denotes `mx.stop_gradient`; `beta = 0.25` by default. The decoder
+    exposes `decode_logits`; `x_hat = sigmoid(logits)` is used only for
+    display and pixel statistics, never in the loss.)
     We also track **perplexity** = `exp(-sum(p_k log p_k))` where `p_k`
     is the average codebook usage across a batch — a diagnostic for
     codebook collapse (max value `K`, meaning all codes used equally).
+
+    **Anti-collapse safeguards.** The codebook is initialized from
+    `normal(0, 1) / sqrt(D)` (unit-scale vectors, so the nearest-neighbor
+    lookup is not degenerate at step 0), and at the end of every training
+    epoch any code that received **zero** assignments is re-seeded from a
+    random live encoder output (`VectorQuantizerV1.reset_dead_codes`). The
+    Section 5 progress line reports `codes N/K` per epoch so collapse is
+    visible while training, not only afterward.
     """)
     return
 
@@ -560,8 +619,8 @@ def _(mo):
 @app.cell
 def _(mo):
     lr_ui = mo.ui.dropdown(
-        options={"1e-4": 1e-4, "5e-4": 5e-4, "1e-3": 1e-3, "3e-3": 3e-3},
-        value="1e-3",
+        options={"1e-4": 1e-4, "3e-4": 3e-4, "5e-4": 5e-4, "1e-3": 1e-3, "3e-3": 3e-3},
+        value="3e-4",
         label="Learning Rate",
     )
     epochs_ui = mo.ui.slider(1, 50, value=10, step=1, label="Epochs")
@@ -620,6 +679,9 @@ def _(bs_ui, test_ds, train_ds):
 
 @app.function
 def preprocess_image_batch(batch) -> mx.array:
+    # Contract: `batch` comes from a make_datasets stream, whose key_transform
+    # has already scaled "image" to float32 in [0, 1]. This is only a wrap, not
+    # a normalization — build raw batches with normalize_images() instead.
     return mx.array(batch["image"], dtype=mx.float32)
 
 
@@ -631,26 +693,40 @@ def run_train_epoch(
     preprocess_fn,
 ):
     loss_and_grad_fn = nn.value_and_grad(model, compute_vqvae_loss)
+    k = model.quantizer.num_embeddings
     total_loss = 0.0
     total_recon = 0.0
     total_codebook = 0.0
     total_commit = 0.0
     total_ppl = 0.0
     n_batches = 0
+    hit_counts = np.zeros(k, dtype=np.int64)
+    last_x = None
     train_iter.reset()
     for batch in train_iter:
         x = preprocess_fn(batch)
+        last_x = x
         loss, grads = loss_and_grad_fn(model, x)
         optimizer.update(model, grads)
         mx.eval(loss, model.parameters())
-        _, recon, codebook, commit, ppl = compute_vqvae_metrics(model, x)
-        mx.eval(recon, codebook, commit, ppl)
+        _x_hat, logits, _vq, codebook, commit, ppl, indices = model(x)
+        recon = reconstruction_loss(logits, x)
+        mx.eval(recon, codebook, commit, ppl, indices)
+        hit_counts += np.bincount(
+            np.asarray(indices).reshape(-1), minlength=k
+        )
         total_loss += loss.item()
         total_recon += recon.item()
         total_codebook += codebook.item()
         total_commit += commit.item()
         total_ppl += ppl.item()
         n_batches += 1
+    if last_x is not None:
+        _z_e = model.encoder(last_x)
+        mx.eval(_z_e)
+        _pool = mx.array(np.asarray(_z_e).reshape(-1, _z_e.shape[-1]))
+        model.quantizer.reset_dead_codes(_pool, hit_counts)
+    codes_used = int((hit_counts > 0).sum())
     d = max(n_batches, 1)
     return (
         total_loss / d,
@@ -658,6 +734,7 @@ def run_train_epoch(
         total_codebook / d,
         total_commit / d,
         total_ppl / d,
+        codes_used,
     )
 
 
@@ -729,8 +806,9 @@ def _(
             weight_decay=float(wd_ui.value),
         )
         _n_epochs = int(epochs_ui.value)
+        _K = int(num_embeddings_ui.value)
         for _epoch in range(_n_epochs):
-            _tl, _trecon, _tcb, _tcm, _tppl = run_train_epoch(
+            _tl, _trecon, _tcb, _tcm, _tppl, _tcodes = run_train_epoch(
                 _model, _optimizer, train_iter, preprocess_image_batch
             )
             _vl, _vrecon, _vcb, _vcm, _vppl = run_evaluate(
@@ -746,7 +824,8 @@ def _(
                 mo.md(
                     f"**Epoch {_epoch + 1}/{_n_epochs}** — "
                     f"train loss: {_tl:.4f} (recon {_trecon:.4f}, "
-                    f"codebook {_tcb:.4f}, commit {_tcm:.4f}, ppl {_tppl:.2f}) | "
+                    f"codebook {_tcb:.4f}, commit {_tcm:.4f}, ppl {_tppl:.2f}, "
+                    f"codes {_tcodes}/{_K}) | "
                     f"val loss: {_vl:.4f} (recon {_vrecon:.4f}, ppl {_vppl:.2f})"
                 )
             )
@@ -897,7 +976,7 @@ def _(mo, test_iter, trained_model, val_iter):
             f"""
     ### Held-out evaluation of `VQVAEV1`
 
-    | Split | Total Loss | Reconstruction MSE | Codebook Loss | Commitment Loss | Perplexity |
+    | Split | Total Loss | Reconstruction (BCE) | Codebook Loss | Commitment Loss | Perplexity |
     |-------|-----------|--------------------|---------------|-----------------|-----------|
     | Val   | {_val_metrics["total_loss"]:.4f} | {_val_metrics["recon_loss"]:.4f} | {_val_metrics["codebook_loss"]:.4f} | {_val_metrics["commitment_loss"]:.4f} | {_val_metrics["perplexity"]:.2f} |
     | Test  | {_test_metrics["total_loss"]:.4f} | {_test_metrics["recon_loss"]:.4f} | {_test_metrics["codebook_loss"]:.4f} | {_test_metrics["commitment_loss"]:.4f} | {_test_metrics["perplexity"]:.2f} |
@@ -941,16 +1020,33 @@ def run_cv_fold(
     mx.eval(model.parameters())
     optimizer = optim.AdamW(learning_rate=lr)
     loss_and_grad_fn = nn.value_and_grad(model, compute_vqvae_loss)
+    k = model.quantizer.num_embeddings
 
     for _ in range(n_epochs):
         np.random.shuffle(train_indices)
+        hit_counts = np.zeros(k, dtype=np.int64)
+        last_x = None
         for i in range(0, len(train_indices), batch_size):
             idx = train_indices[i : i + batch_size]
             imgs = np.stack([train_ds[j]["image"] for j in idx])
-            x = mx.array(imgs, dtype=mx.float32) / 255.0
+            x = normalize_images(imgs)
+            last_x = x
             loss, grads = loss_and_grad_fn(model, x)
             optimizer.update(model, grads)
             mx.eval(loss, model.parameters())
+            _z_e = model.encoder(x)
+            *_rest, _indices = model.quantizer(_z_e)
+            mx.eval(_indices)
+            hit_counts += np.bincount(
+                np.asarray(_indices).reshape(-1), minlength=k
+            )
+        if last_x is not None:
+            _pool_z = model.encoder(last_x)
+            mx.eval(_pool_z)
+            _pool = mx.array(
+                np.asarray(_pool_z).reshape(-1, _pool_z.shape[-1])
+            )
+            model.quantizer.reset_dead_codes(_pool, hit_counts)
 
     val_total = 0.0
     val_recon = 0.0
@@ -959,7 +1055,7 @@ def run_cv_fold(
     for i in range(0, len(val_indices), 256):
         idx = val_indices[i : i + 256]
         imgs = np.stack([train_ds[j]["image"] for j in idx])
-        x = mx.array(imgs, dtype=mx.float32) / 255.0
+        x = normalize_images(imgs)
         total, recon, _cb, _cm, ppl = compute_vqvae_metrics(model, x)
         mx.eval(total, recon, ppl)
         val_total += total.item()
@@ -1026,7 +1122,7 @@ def _(
     | Metric | Mean | Std |
     |--------|------|-----|
     | Total loss | {cv_results["mean_total"]:.4f} | {cv_results["std_total"]:.4f} |
-    | Reconstruction MSE | {cv_results["mean_recon"]:.4f} | {cv_results["std_recon"]:.4f} |
+    | Reconstruction (BCE) | {cv_results["mean_recon"]:.4f} | {cv_results["std_recon"]:.4f} |
     | Perplexity | {cv_results["mean_ppl"]:.2f} | {cv_results["std_ppl"]:.2f} |
 
     Per-fold total losses: `{[round(v, 4) for v in _fold_totals]}`
@@ -1039,7 +1135,240 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 8 — Results
+    ## Section 8 — Saved-Model Diagnostics
+
+    Load any checkpoint from `models/` and inspect what the decoder
+    actually produces — numeric statistics plus true-scale and
+    contrast-stretched reconstruction rows. This section does **not**
+    require training in the current session; it is the tool for
+    confirming (or ruling out) a collapsed model such as
+    `mnist_vqvae_v1.safetensors`, whose decoder emits an all-black
+    constant.
+    """)
+    return
+
+
+@app.function
+def models_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "models"
+
+
+@app.function
+def list_checkpoints() -> list[str]:
+    d = models_dir()
+    if not d.is_dir():
+        return []
+    names = [p.name for p in d.glob("*.safetensors")] + [
+        p.name for p in d.glob("*.npz")
+    ]
+    return sorted(names)
+
+
+@app.function
+def infer_vqvae_config(state: dict) -> dict:
+    num_embeddings, embedding_dim = (int(v) for v in state["quantizer.codebook"].shape)
+    base_channels = int(state["encoder.down2.conv.weight"].shape[0])
+    residual_hidden_channels = int(
+        state["encoder.res_blocks.0.conv3.weight"].shape[0]
+    )
+    num_residual_blocks = len(
+        {
+            k.split(".")[2]
+            for k in state
+            if k.startswith("encoder.res_blocks.")
+        }
+    )
+    out_channels = int(state["decoder.up2.weight"].shape[0])
+    return {
+        "in_channels": out_channels,
+        "base_channels": base_channels,
+        "num_residual_blocks": num_residual_blocks,
+        "residual_hidden_channels": residual_hidden_channels,
+        "num_embeddings": num_embeddings,
+        "embedding_dim": embedding_dim,
+    }
+
+
+@app.function
+def load_vqvae(path):
+    state = mx.load(str(path))
+    cfg = infer_vqvae_config(state)
+    model = VQVAEV1(**cfg)
+    model.load_weights(str(path))
+    mx.eval(model.parameters())
+    return model, cfg
+
+
+@app.function
+def diagnose_model(model: nn.Module, x: mx.array) -> dict:
+    z_e = model.encoder(x)
+    z_q_st, _vq, _cb, _cm, perplexity, indices = model.quantizer(z_e)
+    logits = model.decoder.decode_logits(z_q_st)
+    x_hat = mx.sigmoid(logits)
+    mx.eval(z_e, logits, x_hat, perplexity, indices)
+
+    recon = np.asarray(x_hat)
+    lg = np.asarray(logits)
+    idx = np.asarray(indices).reshape(-1)
+    k = int(model.quantizer.num_embeddings)
+    codes_used = int(np.unique(idx).size)
+    n_nan = int(np.isnan(recon).sum())
+    n_inf = int(np.isinf(recon).sum())
+    finite = recon[np.isfinite(recon)]
+    std = float(finite.std()) if finite.size else float("nan")
+    mean = float(finite.mean()) if finite.size else float("nan")
+
+    if n_nan or n_inf:
+        verdict = f"❌ NON-FINITE output — {n_nan} NaN / {n_inf} Inf pixels; training diverged"
+    elif std < 1e-5:
+        verdict = (
+            f"❌ COLLAPSED — decoder output is constant (≈ {mean:.3f}); "
+            f"{codes_used}/{k} codebook codes used"
+        )
+    elif codes_used / k < 0.1:
+        verdict = (
+            f"⚠ SEVERE codebook collapse — only {codes_used}/{k} codes used "
+            f"(perplexity {float(perplexity.item()):.1f})"
+        )
+    else:
+        verdict = (
+            f"✓ output varies across inputs — {codes_used}/{k} codes used, "
+            f"perplexity {float(perplexity.item()):.1f}"
+        )
+
+    return {
+        "verdict": verdict,
+        "recon_min": float(finite.min()) if finite.size else float("nan"),
+        "recon_max": float(finite.max()) if finite.size else float("nan"),
+        "recon_mean": mean,
+        "recon_std": std,
+        "frac_black": float((recon == 0.0).mean()),
+        "frac_white": float((recon >= 1.0 - 1e-6).mean()),
+        "n_nan": n_nan,
+        "n_inf": n_inf,
+        "presigmoid_min": float(np.nanmin(lg)),
+        "presigmoid_max": float(np.nanmax(lg)),
+        "z_e_std": float(np.asarray(z_e).std()),
+        "codes_used": codes_used,
+        "num_embeddings": k,
+        "perplexity": float(perplexity.item()),
+    }
+
+
+@app.function
+def format_diag_table(diag: dict) -> str:
+    rows = [
+        ("Recon min / max", f"{diag['recon_min']:.6f} / {diag['recon_max']:.6f}"),
+        ("Recon mean / std", f"{diag['recon_mean']:.6f} / {diag['recon_std']:.6f}"),
+        ("Pixels exactly 0 (black)", f"{100 * diag['frac_black']:.1f}%"),
+        ("Pixels >= 1 (white)", f"{100 * diag['frac_white']:.1f}%"),
+        ("NaN / Inf pixels", f"{diag['n_nan']} / {diag['n_inf']}"),
+        (
+            "Decoder pre-sigmoid min / max",
+            f"{diag['presigmoid_min']:.1f} / {diag['presigmoid_max']:.1f}",
+        ),
+        ("Encoder z_e std", f"{diag['z_e_std']:.4f}"),
+        (
+            "Codebook codes used",
+            f"{diag['codes_used']} / {diag['num_embeddings']}",
+        ),
+        ("Codebook perplexity", f"{diag['perplexity']:.2f}"),
+    ]
+    body = "\n".join(f"| {name} | {val} |" for name, val in rows)
+    return "| Quantity | Value |\n|----------|-------|\n" + body
+
+
+@app.function
+def plot_model_diagnostics(model: nn.Module, x: mx.array, n_show: int = 8):
+    x_hat = model(x)[0]
+    mx.eval(x_hat)
+    orig = np.nan_to_num(np.asarray(x)).squeeze(-1)
+    recon = np.nan_to_num(np.asarray(x_hat)).squeeze(-1)
+    n_show = min(n_show, orig.shape[0])
+
+    fig, axes = plt.subplots(3, n_show, figsize=(2 * n_show, 6))
+    for i in range(n_show):
+        axes[0, i].imshow(orig[i], cmap="gray", vmin=0.0, vmax=1.0)
+        axes[0, i].axis("off")
+
+        axes[1, i].imshow(recon[i], cmap="gray", vmin=0.0, vmax=1.0)
+        axes[1, i].axis("off")
+
+        r = recon[i]
+        lo, hi = float(r.min()), float(r.max())
+        stretched = (r - lo) / (hi - lo + 1e-8)
+        axes[2, i].imshow(stretched, cmap="gray", vmin=0.0, vmax=1.0)
+        axes[2, i].axis("off")
+        axes[2, i].set_title(f"[{lo:.3f}, {hi:.3f}]", fontsize=7)
+
+    for row, lbl in enumerate(["Original", "Recon (true 0-1)", "Recon (stretched)"]):
+        axes[row, 0].axis("on")
+        axes[row, 0].set_xticks([])
+        axes[row, 0].set_yticks([])
+        axes[row, 0].set_ylabel(lbl, fontsize=9)
+
+    fig.suptitle("VQ-VAE decoder output — diagnostics", fontsize=13)
+    fig.tight_layout()
+    return fig
+
+
+@app.cell
+def _(mo):
+    _checkpoints = list_checkpoints() or ["<no checkpoints in models/>"]
+    _default = (
+        "mnist_vqvae_v1.safetensors"
+        if "mnist_vqvae_v1.safetensors" in _checkpoints
+        else _checkpoints[0]
+    )
+    ckpt_ui = mo.ui.dropdown(options=_checkpoints, value=_default, label="Checkpoint")
+    diagnose_btn = mo.ui.run_button(label="Load & Diagnose")
+    mo.vstack(
+        [mo.md("### Load a saved VQ-VAE and inspect its output"), ckpt_ui, diagnose_btn]
+    )
+    return ckpt_ui, diagnose_btn
+
+
+@app.cell
+def _(ckpt_ui, diagnose_btn, mo, test_ds):
+    mo.stop(
+        not diagnose_btn.value,
+        mo.md("Pick a checkpoint and click **Load & Diagnose**."),
+    )
+
+    _ckpt_path = models_dir() / ckpt_ui.value
+    _model, _cfg = load_vqvae(_ckpt_path)
+
+    _raw = np.stack([np.asarray(test_ds[i]["image"]) for i in range(64)])
+    _x = normalize_images(_raw)
+
+    _diag = diagnose_model(_model, _x)
+    _is_bad = _diag["verdict"].startswith(("❌", "⚠"))
+    _banner_colour = "#b3261e" if _is_bad else "#1e7d32"
+    _banner = mo.Html(
+        f'<div style="padding:0.6rem 0.9rem;border-radius:6px;'
+        f'background:{_banner_colour};color:white;font-weight:600">'
+        f'{_diag["verdict"]}</div>'
+    )
+
+    _cfg_line = ", ".join(f"{k}={v}" for k, v in _cfg.items())
+    mo.vstack(
+        [
+            _banner,
+            mo.md(
+                f"**Checkpoint**: `{ckpt_ui.value}` &nbsp; "
+                f"**inferred config**: {_cfg_line}\n\n"
+                + format_diag_table(_diag)
+            ),
+            plot_model_diagnostics(_model, _x, n_show=8),
+        ]
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 9 — Results
     """)
     return
 
@@ -1065,9 +1394,9 @@ def plot_loss_curve(
 
     axes[1].plot(epochs, train_recon_losses, "b-o", lw=2, ms=4, label="Train")
     axes[1].plot(epochs, val_recon_losses, "r-s", lw=2, ms=4, label="Val")
-    axes[1].set_title("Reconstruction MSE")
+    axes[1].set_title("Reconstruction loss (BCE)")
     axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("MSE")
+    axes[1].set_ylabel("BCE")
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
@@ -1109,27 +1438,6 @@ def _(
     return
 
 
-@app.function
-def plot_reconstructions(model: nn.Module, test_batch, n_show: int = 8):
-    x = mx.array(test_batch["image"], dtype=mx.float32)[:n_show]
-    x_hat, _vq, _cb, _cm, _ppl, _idx = model(x)
-    mx.eval(x_hat)
-    orig = np.array(x).squeeze(-1)
-    recon = np.array(x_hat).squeeze(-1)
-
-    fig, axes = plt.subplots(2, n_show, figsize=(2 * n_show, 4))
-    for i in range(n_show):
-        axes[0, i].imshow(orig[i], cmap="gray")
-        axes[0, i].axis("off")
-        axes[1, i].imshow(recon[i], cmap="gray")
-        axes[1, i].axis("off")
-    axes[0, 0].set_title("Original", fontsize=9, loc="left")
-    axes[1, 0].set_title("Reconstructed", fontsize=9, loc="left")
-    fig.suptitle("VQ-VAE reconstructions (test set)", fontsize=13)
-    fig.tight_layout()
-    return fig
-
-
 @app.cell
 def _(mo, test_iter, trained_model):
     if trained_model is None:
@@ -1137,7 +1445,14 @@ def _(mo, test_iter, trained_model):
     else:
         test_iter.reset()
         _batch = next(test_iter)
-        _out = plot_reconstructions(trained_model, _batch, n_show=8)
+        _x = mx.array(_batch["image"], dtype=mx.float32)
+        _diag = diagnose_model(trained_model, _x)
+        _out = mo.vstack(
+            [
+                mo.md(f"**{_diag['verdict']}**\n\n" + format_diag_table(_diag)),
+                plot_model_diagnostics(trained_model, _x, n_show=8),
+            ]
+        )
     _out
     return
 
@@ -1151,7 +1466,7 @@ def plot_codebook_usage(model: nn.Module, data_iter, preprocess_fn, max_batches:
         if batches_seen >= max_batches:
             break
         x = preprocess_fn(batch)
-        _x_hat, _vq, _cb, _cm, _ppl, indices = model(x)
+        *_head, indices = model(x)
         mx.eval(indices)
         idx_np = np.array(indices).reshape(-1)
         binc = np.bincount(idx_np, minlength=model.num_embeddings)
@@ -1251,7 +1566,7 @@ def _(
     | Metric | Final Train | Final Val |
     |--------|-------------|-----------|
     | Total loss | {train_losses[-1]:.4f} | {val_losses[-1]:.4f} |
-    | Reconstruction MSE | {train_recon_losses[-1]:.4f} | {val_recon_losses[-1]:.4f} |
+    | Reconstruction (BCE) | {train_recon_losses[-1]:.4f} | {val_recon_losses[-1]:.4f} |
     | Perplexity | {train_perplexities[-1]:.2f} | {val_perplexities[-1]:.2f} |
 
     {_cv_line}
@@ -1273,7 +1588,7 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 9 — Save Trained Model
+    ## Section 10 — Save Trained Model
 
     Persist the trained `VQVAEV1` weights to the project's `models/`
     directory. The file extension chosen determines the on-disk format:
