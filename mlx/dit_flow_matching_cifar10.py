@@ -5,16 +5,13 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import math
-    import os
-    import pickle
-    import tarfile
-    import urllib.request
     from pathlib import Path
 
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
     import mlx.utils
+    from mlx.data.datasets import load_cifar10
 
     import numpy as np
     import matplotlib
@@ -73,71 +70,49 @@ def _(mo):
 
 
 @app.function
-def download_cifar10(root: str = "../data/cifar10") -> str:
-    root_path = Path(root)
-    root_path.mkdir(parents=True, exist_ok=True)
-    extracted = root_path / "cifar-10-batches-py"
-    if extracted.exists():
-        return str(extracted)
-    url = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
-    tar_path = root_path / "cifar-10-python.tar.gz"
-    if not tar_path.exists():
-        urllib.request.urlretrieve(url, str(tar_path))
-    with tarfile.open(str(tar_path), "r:gz") as tf:
-        tf.extractall(str(root_path))
-    return str(extracted)
+def cifar10_class_names() -> list:
+    return [
+        "airplane", "automobile", "bird", "cat", "deer",
+        "dog", "frog", "horse", "ship", "truck",
+    ]
 
 
 @app.function
-def load_cifar10_batch(path: str) -> tuple[np.ndarray, np.ndarray]:
-    with open(path, "rb") as f:
-        d = pickle.load(f, encoding="bytes")
-    data = d[b"data"].astype(np.float32) / 255.0
-    data = data.reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
-    labels = np.array(d[b"labels"], dtype=np.int32)
-    return data, labels
-
-
-@app.function
-def load_cifar10(root: str = "../data/cifar10") -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list]:
-    extracted = download_cifar10(root)
-    train_images_list = []
-    train_labels_list = []
-    for i in range(1, 6):
-        xi, yi = load_cifar10_batch(os.path.join(extracted, f"data_batch_{i}"))
-        train_images_list.append(xi)
-        train_labels_list.append(yi)
-    x_train = np.concatenate(train_images_list, axis=0)
-    y_train = np.concatenate(train_labels_list, axis=0)
-    x_test, y_test = load_cifar10_batch(os.path.join(extracted, "test_batch"))
-    with open(os.path.join(extracted, "batches.meta"), "rb") as f:
-        meta = pickle.load(f, encoding="bytes")
-    class_names = [name.decode("utf-8") for name in meta[b"label_names"]]
-    return x_train, y_train, x_test, y_test, class_names
+def load_cifar10_arrays(
+    root: str = "../data/cifar10",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list]:
+    train_buf = load_cifar10(root=root, train=True)
+    test_buf = load_cifar10(root=root, train=False)
+    train_all = train_buf.batch(len(train_buf))[0]
+    test_all = test_buf.batch(len(test_buf))[0]
+    x_train = np.asarray(train_all["image"]).astype(np.float32) / 255.0
+    y_train = np.asarray(train_all["label"]).astype(np.int32)
+    x_test = np.asarray(test_all["image"]).astype(np.float32) / 255.0
+    y_test = np.asarray(test_all["label"]).astype(np.int32)
+    return x_train, y_train, x_test, y_test, cifar10_class_names()
 
 
 @app.cell
 def _():
-    x_train_np, y_train_np, x_test_np, y_test_np, class_names = load_cifar10("../data/cifar10")
+    x_train_np, y_train_np, x_test_np, y_test_np, class_names = load_cifar10_arrays("../data/cifar10")
     return class_names, x_test_np, x_train_np, y_test_np, y_train_np
 
 
 @app.cell
 def _(mo, x_test_np, x_train_np):
-    mo.md(
-        f"""
-        ### Dataset overview
+    mo.md(f"""
+    ### Dataset overview
 
-        CIFAR-10 is downloaded from the Toronto mirror and cached under
-        `../data/cifar10/`. Each image is stored as a `float32` array shaped
-        `(32, 32, 3)` in `[0, 1]`; labels are `int32` in `[0, 9]`.
+    CIFAR-10 is loaded via `mlx.data.datasets.load_cifar10` from
+    `../data/cifar10/` (each split's Buffer is collapsed into a single
+    full batch, then materialised to NumPy). Each image is a `float32`
+    array shaped `(32, 32, 3)` in `[0, 1]`; labels are `int32` in `[0, 9]`.
 
-        | Split | Size | Shape |
-        |-------|------|-------|
-        | Train (raw) | {x_train_np.shape[0]:,} | {tuple(x_train_np.shape[1:])} |
-        | Test | {x_test_np.shape[0]:,} | {tuple(x_test_np.shape[1:])} |
-        """
-    )
+    | Split | Size | Shape |
+    |-------|------|-------|
+    | Train (raw) | {x_train_np.shape[0]:,} | {tuple(x_train_np.shape[1:])} |
+    | Test | {x_test_np.shape[0]:,} | {tuple(x_test_np.shape[1:])} |
+    """)
     return
 
 
@@ -470,7 +445,9 @@ def _():
 
 @app.cell
 def _(default_param_count, mo):
-    mo.md(f"**Default model parameter count**: `{default_param_count:,}`")
+    mo.md(f"""
+    **Default model parameter count**: `{default_param_count:,}`
+    """)
     return
 
 
