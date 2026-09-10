@@ -1,12 +1,13 @@
 import marimo
 
-__generated_with = "0.17.0"
+__generated_with = "0.24.0"
 app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -27,6 +28,7 @@ def _():
     from torchvision import transforms
 
     import matplotlib.pyplot as plt
+
     return (
         DataLoader,
         datasets,
@@ -57,7 +59,9 @@ def _(torch):
 
 @app.cell
 def _(mo):
-    mo.md(r"""#model components""")
+    mo.md(r"""
+    #model components
+    """)
     return
 
 
@@ -71,6 +75,7 @@ def _():
 def _(torch):
     def check_nan(mtx):
         return torch.sum(torch.isnan(mtx)) > 0
+
     return
 
 
@@ -113,6 +118,7 @@ def is_image_size_layer_compat(img_sz, ncs):
 def _(nn):
     def relu_activation():
         return nn.ReLU()
+
     return
 
 
@@ -120,6 +126,7 @@ def _(nn):
 def _(nn):
     def leaky_activation():
         return nn.LeakyReLU()
+
     return (leaky_activation,)
 
 
@@ -127,6 +134,7 @@ def _(nn):
 def _(nn):
     def silu_activation():
         return nn.SiLU()
+
     return
 
 
@@ -155,6 +163,7 @@ def _(nn):
             else:
                 out = x1 + out
             return out / 1.414
+
     return (ConvBlockV1,)
 
 
@@ -165,11 +174,12 @@ def _(ConvBlockV1, nn):
             super().__init__()
             self.res = ConvBlockV1(inc, outc, activation, gdivisor=gdivisor)
             self.downsample = nn.Conv2d(outc, outc, 4, stride=2, padding=1) if downsample else nn.Identity()
-        
+    
         def forward(self, x):
             x = self.res(x)
             x = self.downsample(x)
             return x
+
     return (DownBlockV1,)
 
 
@@ -185,6 +195,7 @@ def _(ConvBlockV1, nn):
             x = self.upsample(x)
             x = self.res(x)
             return x
+
     return (UpBlockV1,)
 
 
@@ -212,6 +223,7 @@ def _(nn):
             for layer in self.layers:
                 x = layer(x)
             return x
+
     return (VQVAEDecoderV1,)
 
 
@@ -231,6 +243,7 @@ def _(ConvBlockV1, UpBlockV1, nn):
             for layer in self.layers:
                 x = layer(x)
             return x
+
     return (VQVAEDecoderV2,)
 
 
@@ -257,6 +270,7 @@ def _(nn):
             for layer in self.layers:
                 x = layer(x)
             return x
+
     return (VQVAEEncoderV1,)
 
 
@@ -274,6 +288,7 @@ def _(DownBlockV1, nn):
             for layer in self.layers:
                 x = layer(x)
             return x
+
     return (VQVAEEncoderV2,)
 
 
@@ -293,7 +308,7 @@ def _(nn, torch):
             qout = torch.index_select(self.embedding.weight, 0, qidx.view(-1))
             qout = qout.reshape((batchsize, *embed_sz, self.latent_dim)).permute(0, 3, 1, 2)
             return qout
-    
+
         def forward(self, x):
             B, C, H, W = x.shape
             x = x.permute(0, 2, 3, 1)
@@ -303,7 +318,7 @@ def _(nn, torch):
             min_idx = torch.argmin(dist, dim=-1)
 
             quant_out = torch.index_select(self.embedding.weight, 0, min_idx.view(-1))
-        
+    
             x = x.reshape((-1, x.size(-1)))
             commitment_loss = torch.mean((quant_out.detach() - x) ** 2.)
             codebook_loss = torch.mean((quant_out - x.detach()) ** 2.)
@@ -312,6 +327,7 @@ def _(nn, torch):
             quant_out = quant_out.reshape((B, H, W, C)).permute(0, 3, 1, 2)
             min_idx = min_idx.reshape((-1, quant_out.size(-2), quant_out.size(-1)))
             return quant_out, commitment_loss, codebook_loss, min_idx
+
     return (VQVAEQuantizerV1,)
 
 
@@ -333,6 +349,7 @@ def _(VQVAEDecoderV1, VQVAEEncoderV1, VQVAEQuantizerV1, nn):
             out = self.post_quant_conv(qout)
             out = self.decoder(out)
             return out, qout, commitment_loss, codebook_loss, qidx
+
     return
 
 
@@ -343,7 +360,7 @@ def _(VQVAEDecoderV2, VQVAEEncoderV2, VQVAEQuantizerV1, nn):
             super().__init__()
 
             assert len(csz) >= 2, "VQVAEV2 require at least one image channel size + one intermediate layer channel size"
-        
+    
             gdivisors = calculate_group_divisors(csz)
 
             assert is_group_divisors_valid(csz, gdivisors), f"Invalid group divisors {gdivisors} for {csz}"
@@ -351,7 +368,7 @@ def _(VQVAEDecoderV2, VQVAEEncoderV2, VQVAEQuantizerV1, nn):
 
             self.codebook_sz = codebook_sz
             self.embed_sz = embed_sz
-        
+    
             self.encoder = VQVAEEncoderV2(csz, activation, gdivisors)
             self.pre_quant_conv = nn.Conv2d(csz[-1], latent_dim, kernel_size=1)
             self.decoder = VQVAEDecoderV2(csz[::-1], activation, gdivisors[::-1])
@@ -371,7 +388,7 @@ def _(VQVAEDecoderV2, VQVAEEncoderV2, VQVAEQuantizerV1, nn):
             out = self.post_quant_conv(out)
             out = self.decoder(out)
             return out
-    
+
         def forward(self, x):
             x = self.encoder(x)
             x = self.pre_quant_conv(x)
@@ -379,10 +396,11 @@ def _(VQVAEDecoderV2, VQVAEEncoderV2, VQVAEQuantizerV1, nn):
             qout, commitment_loss, codebook_loss, qidx = self.quantizer(x)
 
             assert qidx.shape[1:] == self.embed_sz, f"Model Embedding matrix size is set incorrectly, decode function is unusable. embedding size should be set to {qidx.shape[1:]}"
-        
+    
             out = self.post_quant_conv(qout)
             out = self.decoder(out)
             return out, qout, commitment_loss, codebook_loss, qidx
+
     return (VQVAEV2,)
 
 
@@ -439,12 +457,15 @@ def _(nn, torch):
             decoder_input = self.post_quant_conv(quant_out)
             output = self.decoder(decoder_input)
             return output, quantize_loss
+
     return
 
 
 @app.cell
 def _(mo):
-    mo.md(r"""### Training and Test""")
+    mo.md(r"""
+    ### Training and Test
+    """)
     return
 
 
@@ -512,6 +533,7 @@ def _(math, torch, tqdm):
                 torch.save(model.state_dict(), modelfile)
             if to_stop:
                 break
+
     return
 
 
@@ -524,6 +546,7 @@ def _(torch):
         embed = torch.randint(0, model.codebook_sz, (n_sample, *model.embed_sz), device=device)
         out = model.decode(embed)
         return out
+
     return (sample,)
 
 
@@ -544,6 +567,7 @@ def _(np, random, torch):
             images.append(output.detach().cpu().numpy())
         images = np.array(images)
         return images
+
     return (sample_comparison,)
 
 
@@ -582,7 +606,9 @@ def _(nn, torch):
 
 @app.cell
 def _(mo):
-    mo.md(r"""MNIST""")
+    mo.md(r"""
+    MNIST
+    """)
     return
 
 
@@ -622,7 +648,9 @@ def _(device, mnist_model, mnist_model_file, torch):
 
 @app.cell
 def _(mo):
-    mo.md("""Simple MNIST Model and Training""")
+    mo.md("""
+    Simple MNIST Model and Training
+    """)
     return
 
 
