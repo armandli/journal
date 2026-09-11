@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.24.0"
+__generated_with = "0.21.1"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -372,6 +372,20 @@ def euler_solve(model: nn.Module, x0: mx.array, y: mx.array, num_steps: int = 50
         x = x + dt * v
         mx.eval(x)
     return x
+
+
+@app.function
+def euler_solve_trajectory(model: nn.Module, x0: mx.array, y: mx.array, num_steps: int = 50) -> list:
+    dt = 1.0 / num_steps
+    x = x0
+    trajectory = [x]
+    for i in range(num_steps):
+        t = mx.full((x.shape[0],), i * dt, dtype=mx.float32)
+        v = model(x, t, y)
+        x = x + dt * v
+        mx.eval(x)
+        trajectory.append(x)
+    return trajectory
 
 
 @app.function
@@ -834,6 +848,34 @@ def plot_solver_comparison(
     return fig
 
 
+@app.function
+def plot_euler_trajectory(
+    model: nn.Module,
+    class_idx: int,
+    class_names: list,
+    num_steps: int,
+    num_frames: int = 10,
+):
+    y = mx.array(np.array([class_idx], dtype=np.int32))
+    x0 = mx.random.normal(shape=(1, 32, 32, 3))
+    trajectory = euler_solve_trajectory(model, x0, y, num_steps)
+    frame_idx = sorted(set(np.linspace(0, num_steps, num_frames).round().astype(int).tolist()))
+    n = len(frame_idx)
+    fig, axes = plt.subplots(1, n, figsize=(n * 1.7, 2.0))
+    for col, step in enumerate(frame_idx):
+        img = denormalize_cifar(trajectory[step])[0]
+        ax = axes[col] if n > 1 else axes
+        ax.imshow(img)
+        ax.set_title(f"t={step / num_steps:.2f}", fontsize=9)
+        ax.axis("off")
+    fig.suptitle(
+        f"Euler solver trajectory — class `{class_names[class_idx]}` ({num_steps} steps)",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    return fig
+
+
 @app.cell
 def _(class_names, mo):
     solver_ui = mo.ui.dropdown(
@@ -847,8 +889,16 @@ def _(class_names, mo):
         value=class_names[0],
         label="Class to generate",
     )
-    mo.vstack([mo.md("### Sampling controls"), mo.hstack([solver_ui, steps_ui, class_ui])])
-    return class_ui, solver_ui, steps_ui
+    sample_btn = mo.ui.run_button(label="Sample")
+    compare_btn = mo.ui.run_button(label="Compare Solvers")
+    mo.vstack(
+        [
+            mo.md("### Sampling controls"),
+            mo.hstack([solver_ui, steps_ui, class_ui]),
+            mo.hstack([sample_btn, compare_btn]),
+        ]
+    )
+    return class_ui, compare_btn, sample_btn, solver_ui, steps_ui
 
 
 @app.function
@@ -857,9 +907,11 @@ def resolve_solver(name: str):
 
 
 @app.cell
-def _(class_names, mo, solver_ui, steps_ui, trained_model):
+def _(class_names, mo, sample_btn, solver_ui, steps_ui, trained_model):
     if trained_model is None:
         _out = mo.md("_Train the model first to generate samples._")
+    elif not sample_btn.value:
+        _out = mo.md("Click **Sample** to generate a grid of images for every class.")
     else:
         _out = plot_generated_grid(
             trained_model, resolve_solver(solver_ui.value), steps_ui.value, class_names, num_per_class=4
@@ -869,12 +921,73 @@ def _(class_names, mo, solver_ui, steps_ui, trained_model):
 
 
 @app.cell
-def _(class_names, class_ui, mo, trained_model):
+def _(class_names, class_ui, compare_btn, mo, trained_model):
     if trained_model is None:
         _out = mo.md("_Train the model first to compare solvers._")
+    elif not compare_btn.value:
+        _out = mo.md("Click **Compare Solvers** to run Euler / Midpoint / RK4 at several step counts.")
     else:
         _out = plot_solver_comparison(
             trained_model, int(class_ui.value), class_names, [10, 25, 50, 100]
+        )
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ### Euler Solver Trajectory — Watching the Model Denoise
+
+    The Euler solver integrates the learned velocity field one small step
+    at a time, starting from pure Gaussian noise (`t=0`) and arriving at a
+    generated image (`t=1`). The frames below sample intermediate states
+    `x_t` along a single trajectory, making the model's step-by-step
+    progress toward a coherent image directly visible.
+    """)
+    return
+
+
+@app.cell
+def _(class_names, mo):
+    traj_class_ui = mo.ui.dropdown(
+        options={name: i for i, name in enumerate(class_names)},
+        value=class_names[0],
+        label="Class to generate",
+    )
+    traj_steps_ui = mo.ui.slider(10, 200, value=50, step=1, label="Euler Steps")
+    traj_frames_ui = mo.ui.slider(4, 20, value=10, step=1, label="Frames to display")
+    traj_btn = mo.ui.run_button(label="Generate Trajectory")
+    mo.vstack(
+        [
+            mo.hstack([traj_class_ui, traj_steps_ui, traj_frames_ui]),
+            traj_btn,
+        ]
+    )
+    return traj_btn, traj_class_ui, traj_frames_ui, traj_steps_ui
+
+
+@app.cell
+def _(
+    class_names,
+    mo,
+    trained_model,
+    traj_btn,
+    traj_class_ui,
+    traj_frames_ui,
+    traj_steps_ui,
+):
+    if trained_model is None:
+        _out = mo.md("_Train the model first to visualize the sampling trajectory._")
+    elif not traj_btn.value:
+        _out = mo.md("Click **Generate Trajectory** to watch the Euler solver denoise step by step.")
+    else:
+        _out = plot_euler_trajectory(
+            trained_model,
+            int(traj_class_ui.value),
+            class_names,
+            traj_steps_ui.value,
+            num_frames=traj_frames_ui.value,
         )
     _out
     return
