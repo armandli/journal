@@ -5,13 +5,11 @@ app = marimo.App(width="medium")
 
 with app.setup:
     from pathlib import Path
-    import pickle
-    import tarfile
-    import urllib.request
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
     import mlx.utils
+    from mlx.data.datasets import load_cifar10
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
@@ -42,8 +40,11 @@ def _(mo):
     ### Notebook outline
 
     1. **Title & Research Goal** — this cell
-    2. **Data Exploration** — download CIFAR-10, visualize samples and class distribution
-    3. **Dataset Creation** — train / val / test splits, normalization, batch iterators
+    2. **Data Exploration** — load CIFAR-10 via `mlx.data.datasets.load_cifar10`
+       (auto-downloads to `../data/cifar10` on first use), visualize samples and
+       class distribution
+    3. **Dataset Creation** — `mlx.data` Buffer/Stream pipeline: train / val / test
+       splits, per-channel standardization, reshuffled batch streams
     4. **Model Definition** — `PatchEmbeddingV1`, `MultiHeadSelfAttentionV1`,
        `TransformerEncoderBlockV1`, `VisionTransformerV1`
     5. **Training** — interactive hyperparameter controls with live progress
@@ -59,87 +60,73 @@ def _(mo):
 def _(mo):
     mo.md("""
     ## Section 2 — Data Exploration
+
+    CIFAR-10 is loaded as an `mlx.data` `Buffer` via
+    `mlx.data.datasets.load_cifar10`. The loader downloads and preprocesses the
+    dataset into `../data/cifar10/` on first use and reads the cached pickle
+    files thereafter.
     """)
     return
 
 
 @app.function
-def download_cifar10(data_dir: Path) -> Path:
-    url = "https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz"
-    data_dir.mkdir(parents=True, exist_ok=True)
-    tgz_path = data_dir / "cifar-10-python.tar.gz"
-    extracted = data_dir / "cifar-10-batches-py"
-    if extracted.exists():
-        return extracted
-    if not tgz_path.exists():
-        urllib.request.urlretrieve(url, tgz_path)
-    with tarfile.open(tgz_path, "r:gz") as tar:
-        tar.extractall(path=data_dir)
-    return extracted
+def cifar10_class_names() -> list[str]:
+    return [
+        "airplane", "automobile", "bird", "cat", "deer",
+        "dog", "frog", "horse", "ship", "truck",
+    ]
 
 
 @app.function
-def load_cifar10_batch(batch_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    with open(batch_path, "rb") as f:
-        raw = pickle.load(f, encoding="bytes")
-    data = raw[b"data"].reshape(-1, 3, 32, 32).transpose(0, 2, 3, 1)
-    labels = np.array(raw[b"labels"], dtype=np.int64)
-    return data.astype(np.uint8), labels
-
-
-@app.function
-def load_cifar10(data_dir: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    root = download_cifar10(data_dir)
-    train_data_parts = []
-    train_labels_parts = []
-    for i in range(1, 6):
-        d, l = load_cifar10_batch(root / f"data_batch_{i}")
-        train_data_parts.append(d)
-        train_labels_parts.append(l)
-    x_train = np.concatenate(train_data_parts, axis=0)
-    y_train = np.concatenate(train_labels_parts, axis=0)
-    x_test, y_test = load_cifar10_batch(root / "test_batch")
-    with open(root / "batches.meta", "rb") as f:
-        meta = pickle.load(f, encoding="bytes")
-    class_names = [n.decode("utf-8") for n in meta[b"label_names"]]
-    return x_train, y_train, x_test, y_test, class_names
+def collect_labels(buffer) -> np.ndarray:
+    return np.array(
+        [int(np.asarray(buffer[i]["label"])) for i in range(len(buffer))],
+        dtype=np.int64,
+    )
 
 
 @app.cell
 def _():
-    data_dir = Path("../data/cifar10").resolve()
-    x_train_raw, y_train_raw, x_test_raw, y_test_raw, class_names = load_cifar10(data_dir)
-    return class_names, x_test_raw, x_train_raw, y_test_raw, y_train_raw
+    data_dir = Path("../data/cifar10")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    train_buffer = load_cifar10(root=str(data_dir), train=True, quiet=True)
+    test_buffer = load_cifar10(root=str(data_dir), train=False, quiet=True)
+    class_names = cifar10_class_names()
+    return class_names, test_buffer, train_buffer
 
 
 @app.cell
-def _(class_names, mo, x_test_raw, x_train_raw, y_test_raw, y_train_raw):
+def _(class_names, mo, test_buffer, train_buffer):
+    _image_shape = tuple(np.asarray(train_buffer[0]["image"]).shape)
     mo.md(f"""
     ### CIFAR-10 dataset overview
 
     CIFAR-10 consists of 60,000 color images in 10 classes, with 6,000 images per class.
     There are 50,000 training images and 10,000 test images.
 
-    - Image shape: `{tuple(x_train_raw.shape[1:])}` (uint8, H x W x C)
+    The data is delivered as an `mlx.data` Buffer cached under `../data/cifar10/`.
+    Each sample is a dict with `image` (`uint8`, H x W x C) and `label`
+    (scalar int in `[0, 9]`).
+
+    - Image shape: `{_image_shape}`
     - Number of classes: **{len(class_names)}**
     - Class names: {", ".join(f"`{c}`" for c in class_names)}
 
     | Split | Size |
     |-------|------|
-    | Train (raw) | {len(x_train_raw):,} |
-    | Test | {len(x_test_raw):,} |
-    | Total labels: train | {len(y_train_raw):,} |
-    | Total labels: test | {len(y_test_raw):,} |
+    | Train | {len(train_buffer):,} |
+    | Test | {len(test_buffer):,} |
     """)
     return
 
 
 @app.function
-def plot_sample_grid(images: np.ndarray, labels: np.ndarray, class_names: list[str], n_show: int = 40, rows: int = 5, cols: int = 8):
+def plot_sample_grid(buffer, class_names: list[str], n_show: int = 40, rows: int = 5, cols: int = 8):
     fig, axes = plt.subplots(rows, cols, figsize=(12, 8))
     for i in range(n_show):
-        img = images[i]
-        label = int(labels[i])
+        sample = buffer[i]
+        img = np.asarray(sample["image"])
+        label = int(np.asarray(sample["label"]))
         r, c = divmod(i, cols)
         axes[r, c].imshow(img)
         axes[r, c].set_title(class_names[label], fontsize=9)
@@ -150,8 +137,8 @@ def plot_sample_grid(images: np.ndarray, labels: np.ndarray, class_names: list[s
 
 
 @app.cell
-def _(class_names, x_train_raw, y_train_raw):
-    plot_sample_grid(x_train_raw, y_train_raw, class_names)
+def _(class_names, train_buffer):
+    plot_sample_grid(train_buffer, class_names)
     return
 
 
@@ -173,8 +160,8 @@ def plot_class_distribution(labels: np.ndarray, class_names: list[str]):
 
 
 @app.cell
-def _(class_names, y_train_raw):
-    plot_class_distribution(y_train_raw, class_names)
+def _(class_names, train_buffer):
+    plot_class_distribution(collect_labels(train_buffer), class_names)
     return
 
 
@@ -187,92 +174,72 @@ def _(mo):
 
 
 @app.function
-def normalize_cifar(images: np.ndarray) -> np.ndarray:
-    mean = np.array([0.4914, 0.4822, 0.4465], dtype=np.float32).reshape(1, 1, 1, 3)
-    std = np.array([0.2470, 0.2435, 0.2616], dtype=np.float32).reshape(1, 1, 1, 3)
+def normalize_image(images: np.ndarray) -> np.ndarray:
+    mean = np.array([0.4914, 0.4822, 0.4465], dtype=np.float32)
+    std = np.array([0.2470, 0.2435, 0.2616], dtype=np.float32)
     scaled = images.astype(np.float32) / 255.0
     return (scaled - mean) / std
 
 
 @app.function
-def make_batches(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool = False, seed: int = 0) -> tuple[list, list]:
-    n = x.shape[0]
-    idx = np.arange(n)
-    if shuffle:
-        rng = np.random.default_rng(seed)
-        rng.shuffle(idx)
-    x_batches = []
-    y_batches = []
-    for start in range(0, n, batch_size):
-        chunk = idx[start:start + batch_size]
-        x_batches.append(mx.array(x[chunk]))
-        y_batches.append(mx.array(y[chunk]))
-    return x_batches, y_batches
+def split_train_val(train_buffer, val_fraction: float = 0.15, seed: int = 0):
+    n_total = len(train_buffer)
+    n_val = int(round(n_total * val_fraction))
+    perm = np.random.default_rng(seed).permutation(n_total)
+    val_idx = perm[:n_val].tolist()
+    train_idx = perm[n_val:].tolist()
+    return train_buffer.perm(train_idx), train_buffer.perm(val_idx)
 
 
 @app.function
-def make_datasets(
-    x_train: np.ndarray,
-    y_train: np.ndarray,
-    x_test: np.ndarray,
-    y_test: np.ndarray,
-    batch_size: int = 128,
-    val_fraction: float = 0.15,
-    seed: int = 0,
-) -> dict:
-    x_train_n = normalize_cifar(x_train)
-    x_test_n = normalize_cifar(x_test)
-
-    n_total = x_train_n.shape[0]
-    n_val = int(round(n_total * val_fraction))
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n_total)
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
-
-    x_tr = x_train_n[train_idx]
-    y_tr = y_train[train_idx]
-    x_val = x_train_n[val_idx]
-    y_val = y_train[val_idx]
-
-    train_x_batches, train_y_batches = make_batches(x_tr, y_tr, batch_size, shuffle=True, seed=seed)
-    val_x_batches, val_y_batches = make_batches(x_val, y_val, batch_size, shuffle=False)
-    test_x_batches, test_y_batches = make_batches(x_test_n, y_test, batch_size, shuffle=False)
-
-    return {
-        "train_x": train_x_batches,
-        "train_y": train_y_batches,
-        "val_x": val_x_batches,
-        "val_y": val_y_batches,
-        "test_x": test_x_batches,
-        "test_y": test_y_batches,
-        "sizes": {"train": len(x_tr), "val": len(x_val), "test": len(x_test_n)},
-    }
+def make_stream(buffer, batch_size: int, shuffle: bool = False, seed: int = 0):
+    buf = buffer
+    if shuffle:
+        order = np.random.default_rng(seed).permutation(len(buffer)).tolist()
+        buf = buffer.perm(order)
+    return (
+        buf
+        .batch(batch_size)
+        .key_transform("image", normalize_image)
+        .ordered_prefetch(4, 2)
+    )
 
 
 @app.cell
-def _(x_test_raw, x_train_raw, y_test_raw, y_train_raw):
-    datasets = make_datasets(x_train_raw, y_train_raw, x_test_raw, y_test_raw, batch_size=128, val_fraction=0.15, seed=42)
+def _(test_buffer, train_buffer):
+    train_split, val_split = split_train_val(train_buffer, val_fraction=0.15, seed=42)
+    datasets = {
+        "train": train_split,
+        "val": val_split,
+        "test": test_buffer,
+        "sizes": {
+            "train": len(train_split),
+            "val": len(val_split),
+            "test": len(test_buffer),
+        },
+    }
     return (datasets,)
 
 
 @app.cell
 def _(datasets, mo):
-    first_x = datasets["train_x"][0]
-    first_y = datasets["train_y"][0]
+    _peek = make_stream(datasets["train"], 128, shuffle=False)
+    _peek.reset()
+    _batch = next(_peek)
+    _x, _y = _batch["image"], _batch["label"]
     mo.md(f"""
     ### Split sizes
 
-    | Split | Size | Batches |
-    |-------|------|---------|
-    | Train | {datasets["sizes"]["train"]:,} | {len(datasets["train_x"])} |
-    | Val   | {datasets["sizes"]["val"]:,}   | {len(datasets["val_x"])} |
-    | Test  | {datasets["sizes"]["test"]:,}  | {len(datasets["test_x"])} |
+    | Split | Size |
+    |-------|------|
+    | Train | {datasets["sizes"]["train"]:,} |
+    | Val   | {datasets["sizes"]["val"]:,}   |
+    | Test  | {datasets["sizes"]["test"]:,}  |
 
-    ### Example batch
+    ### Example batch (from an `mlx.data` Stream)
 
-    - `x` shape: `{tuple(first_x.shape)}` — dtype `{first_x.dtype}`
-    - `y` shape: `{tuple(first_y.shape)}` — dtype `{first_y.dtype}`
+    - `image` shape: `{tuple(_x.shape)}` — dtype `{_x.dtype}` — mean `{_x.mean():.3f}`
+    - `label` shape: `{tuple(_y.shape)}` — dtype `{_y.dtype}`
     """)
     return
 
@@ -500,44 +467,32 @@ def _(mo):
 
 
 @app.function
-def run_train_epoch(model: nn.Module, loss_and_grad_fn, optimizer, x_batches: list, y_batches: list) -> float:
+def run_train_epoch(model: nn.Module, loss_and_grad_fn, optimizer, stream) -> float:
+    stream.reset()
     epoch_loss = 0.0
-    n_batches = len(x_batches)
-    for x, y in zip(x_batches, y_batches):
+    n_batches = 0
+    for batch in stream:
+        x = mx.array(batch["image"])
+        y = mx.array(batch["label"])
         loss, grads = loss_and_grad_fn(model, x, y)
         optimizer.update(model, grads)
         mx.eval(loss, model.parameters())
         epoch_loss += loss.item()
+        n_batches += 1
     return epoch_loss / max(n_batches, 1)
 
 
 @app.function
-def run_evaluate(model: nn.Module, x_batches: list, y_batches: list) -> float:
+def run_evaluate(model: nn.Module, stream) -> float:
+    stream.reset()
     total = 0.0
-    n = len(x_batches)
-    for x, y in zip(x_batches, y_batches):
-        loss = compute_loss(model, x, y)
+    n = 0
+    for batch in stream:
+        loss = compute_loss(model, mx.array(batch["image"]), mx.array(batch["label"]))
         mx.eval(loss)
         total += loss.item()
+        n += 1
     return total / max(n, 1)
-
-
-@app.function
-def reshuffle_batches(x_arrays: list, y_arrays: list, batch_size: int, seed: int) -> tuple[list, list]:
-    x_cat = mx.concatenate(x_arrays, axis=0)
-    y_cat = mx.concatenate(y_arrays, axis=0)
-    n = x_cat.shape[0]
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(n)
-    perm_mx = mx.array(perm)
-    x_shuffled = x_cat[perm_mx]
-    y_shuffled = y_cat[perm_mx]
-    x_out = []
-    y_out = []
-    for start in range(0, n, batch_size):
-        x_out.append(x_shuffled[start:start + batch_size])
-        y_out.append(y_shuffled[start:start + batch_size])
-    return x_out, y_out
 
 
 @app.cell
@@ -557,11 +512,10 @@ def _(bs_ui, datasets, epochs_ui, lr_ui, mo, model_config, train_btn, wd_ui):
         _bs = bs_ui.value
 
         for _epoch in range(_n_epochs):
-            _x_train_shuffled, _y_train_shuffled = reshuffle_batches(
-                datasets["train_x"], datasets["train_y"], _bs, seed=_epoch
-            )
-            _tl = run_train_epoch(_model, _loss_and_grad_fn, _optimizer, _x_train_shuffled, _y_train_shuffled)
-            _vl = run_evaluate(_model, datasets["val_x"], datasets["val_y"])
+            _train_stream = make_stream(datasets["train"], _bs, shuffle=True, seed=_epoch)
+            _val_stream = make_stream(datasets["val"], _bs, shuffle=False)
+            _tl = run_train_epoch(_model, _loss_and_grad_fn, _optimizer, _train_stream)
+            _vl = run_evaluate(_model, _val_stream)
             train_losses.append(_tl)
             val_losses.append(_vl)
             mo.output.replace(
@@ -603,6 +557,7 @@ def train_hp_config(
     n_epochs: int = 5,
     weight_decay: float = 1e-4,
     seed: int = 0,
+    batch_size: int = 128,
 ) -> dict:
     config = dict(model_config)
     config["embed_dim"] = embed_dim
@@ -612,11 +567,9 @@ def train_hp_config(
     loss_and_grad_fn = nn.value_and_grad(model, compute_loss)
     final_tl = 0.0
     for epoch in range(n_epochs):
-        x_batches, y_batches = reshuffle_batches(
-            datasets["train_x"], datasets["train_y"], datasets["train_x"][0].shape[0], seed=seed + epoch
-        )
-        final_tl = run_train_epoch(model, loss_and_grad_fn, optimizer, x_batches, y_batches)
-    vl = run_evaluate(model, datasets["val_x"], datasets["val_y"])
+        stream = make_stream(datasets["train"], batch_size, shuffle=True, seed=seed + epoch)
+        final_tl = run_train_epoch(model, loss_and_grad_fn, optimizer, stream)
+    vl = run_evaluate(model, make_stream(datasets["val"], batch_size, shuffle=False))
     return {"lr": lr, "embed_dim": embed_dim, "train_loss": round(final_tl, 4), "val_loss": round(vl, 4)}
 
 
@@ -649,12 +602,15 @@ def _(mo):
 
 
 @app.function
-def evaluate_model(model: nn.Module, x_batches: list, y_batches: list) -> tuple[float, float]:
+def evaluate_model(model: nn.Module, stream) -> tuple[float, float]:
+    stream.reset()
     total_loss = 0.0
     correct = 0
     total = 0
-    n = len(x_batches)
-    for x, y in zip(x_batches, y_batches):
+    n = 0
+    for batch in stream:
+        x = mx.array(batch["image"])
+        y = mx.array(batch["label"])
         logits = model(x)
         loss = nn.losses.cross_entropy(logits, y).mean()
         preds = mx.argmax(logits, axis=-1)
@@ -662,6 +618,7 @@ def evaluate_model(model: nn.Module, x_batches: list, y_batches: list) -> tuple[
         total_loss += loss.item()
         correct += int(mx.sum(preds == y).item())
         total += y.shape[0]
+        n += 1
     accuracy = correct / max(total, 1)
     avg_loss = total_loss / max(n, 1)
     return accuracy, avg_loss
@@ -672,7 +629,7 @@ def _(datasets, mo, trained_model):
     if trained_model is None:
         _out = mo.md("_Train the model first (Section 5) to compute test metrics._")
     else:
-        _acc, _loss = evaluate_model(trained_model, datasets["test_x"], datasets["test_y"])
+        _acc, _loss = evaluate_model(trained_model, make_stream(datasets["test"], 128, shuffle=False))
         _out = mo.md(f"""
         ### Test Set Evaluation
 
@@ -688,29 +645,27 @@ def _(datasets, mo, trained_model):
 
 @app.function
 def run_fold(
-    x_train_full: np.ndarray,
-    y_train_full: np.ndarray,
-    train_idx: np.ndarray,
-    val_idx: np.ndarray,
+    cv_buffer,
+    train_idx,
+    val_idx,
     model_config: dict,
     lr: float,
     weight_decay: float,
     n_epochs: int,
     batch_size: int,
 ) -> tuple[float, float]:
-    x_tr = x_train_full[train_idx]
-    y_tr = y_train_full[train_idx]
-    x_val = x_train_full[val_idx]
-    y_val = y_train_full[val_idx]
-    train_x_batches, train_y_batches = make_batches(x_tr, y_tr, batch_size, shuffle=True, seed=0)
-    val_x_batches, val_y_batches = make_batches(x_val, y_val, batch_size, shuffle=False)
+    train_fold = cv_buffer.perm(list(train_idx))
+    val_fold = cv_buffer.perm(list(val_idx))
     model = VisionTransformerV1(**model_config)
     mx.eval(model.parameters())
     optimizer = optim.AdamW(learning_rate=lr, weight_decay=weight_decay)
     loss_and_grad_fn = nn.value_and_grad(model, compute_loss)
-    for _ in range(n_epochs):
-        run_train_epoch(model, loss_and_grad_fn, optimizer, train_x_batches, train_y_batches)
-    acc, loss = evaluate_model(model, val_x_batches, val_y_batches)
+    for _epoch in range(n_epochs):
+        run_train_epoch(
+            model, loss_and_grad_fn, optimizer,
+            make_stream(train_fold, batch_size, shuffle=True, seed=_epoch),
+        )
+    acc, loss = evaluate_model(model, make_stream(val_fold, batch_size, shuffle=False))
     return acc, loss
 
 
@@ -722,28 +677,26 @@ def _(mo):
 
 
 @app.cell
-def _(cv_enable_cb, mo, model_config, x_train_raw, y_train_raw):
+def _(cv_enable_cb, mo, model_config, train_buffer):
     mo.stop(not cv_enable_cb.value, mo.md("_Enable 5-fold cross-validation above to run this section._"))
 
     _k = 5
     _n_epochs = 3
     _batch_size = 128
     _cv_subset_size = 5000
-    _rng = np.random.default_rng(0)
-    _sub_idx = _rng.permutation(len(x_train_raw))[:_cv_subset_size]
-    _x_cv = normalize_cifar(x_train_raw[_sub_idx])
-    _y_cv = y_train_raw[_sub_idx]
+    _sub_idx = np.random.default_rng(0).permutation(len(train_buffer))[:_cv_subset_size].tolist()
+    _cv_buffer = train_buffer.perm(_sub_idx)
 
     _fold_size = _cv_subset_size // _k
     fold_metrics = []
     for _fold in range(_k):
         _val_start = _fold * _fold_size
         _val_end = _val_start + _fold_size
-        _val_indices = np.arange(_val_start, _val_end)
-        _train_indices = np.concatenate([np.arange(0, _val_start), np.arange(_val_end, _cv_subset_size)])
+        _val_indices = list(range(_val_start, _val_end))
+        _train_indices = list(range(0, _val_start)) + list(range(_val_end, _cv_subset_size))
         mo.output.replace(mo.md(f"Running fold {_fold + 1}/{_k}..."))
         _acc, _loss = run_fold(
-            _x_cv, _y_cv, _train_indices, _val_indices, model_config,
+            _cv_buffer, _train_indices, _val_indices, model_config,
             lr=3e-4, weight_decay=1e-4, n_epochs=_n_epochs, batch_size=_batch_size,
         )
         fold_metrics.append({"fold": _fold + 1, "accuracy": round(_acc, 4), "loss": round(_loss, 4)})
@@ -806,15 +759,14 @@ def _(mo, train_losses, trained_model, val_losses):
 
 
 @app.function
-def plot_confusion_matrix(model: nn.Module, x_test_batches: list, y_test_batches: list, class_names: list[str]):
+def plot_confusion_matrix(model: nn.Module, stream, class_names: list[str]):
     n_classes = len(class_names)
     cm = np.zeros((n_classes, n_classes), dtype=np.int64)
-    for x, y in zip(x_test_batches, y_test_batches):
-        preds = mx.argmax(model(x), axis=-1)
+    stream.reset()
+    for batch in stream:
+        preds = mx.argmax(model(mx.array(batch["image"])), axis=-1)
         mx.eval(preds)
-        preds_np = np.array(preds)
-        y_np = np.array(y)
-        for t, p in zip(y_np, preds_np):
+        for t, p in zip(np.asarray(batch["label"]), np.asarray(preds)):
             cm[int(t), int(p)] += 1
     fig, ax = plt.subplots(figsize=(9, 8))
     im = ax.imshow(cm, interpolation="nearest", cmap="Blues")
@@ -843,7 +795,9 @@ def _(class_names, datasets, mo, trained_model):
     if trained_model is None:
         _out = mo.md("_Train the model first (Section 5) to see the confusion matrix._")
     else:
-        _out = plot_confusion_matrix(trained_model, datasets["test_x"], datasets["test_y"], class_names)
+        _out = plot_confusion_matrix(
+            trained_model, make_stream(datasets["test"], 128, shuffle=False), class_names
+        )
     _out
     return
 
@@ -851,17 +805,16 @@ def _(class_names, datasets, mo, trained_model):
 @app.function
 def plot_sample_predictions(
     model: nn.Module,
-    x_test: np.ndarray,
-    y_test: np.ndarray,
+    test_buffer,
     class_names: list[str],
     n: int = 16,
     seed: int = 0,
 ):
     rng = np.random.default_rng(seed)
-    idx = rng.choice(x_test.shape[0], size=n, replace=False)
-    x_sel_raw = x_test[idx]
-    y_sel = y_test[idx]
-    x_norm = normalize_cifar(x_sel_raw)
+    idx = rng.choice(len(test_buffer), size=n, replace=False)
+    x_sel_raw = np.stack([np.asarray(test_buffer[int(i)]["image"]) for i in idx])
+    y_sel = np.array([int(np.asarray(test_buffer[int(i)]["label"])) for i in idx])
+    x_norm = normalize_image(x_sel_raw)
     logits = model(mx.array(x_norm))
     preds = mx.argmax(logits, axis=-1)
     mx.eval(preds)
@@ -884,11 +837,11 @@ def plot_sample_predictions(
 
 
 @app.cell
-def _(class_names, mo, trained_model, x_test_raw, y_test_raw):
+def _(class_names, mo, test_buffer, trained_model):
     if trained_model is None:
         _out = mo.md("_Train the model first (Section 5) to see sample predictions._")
     else:
-        _out = plot_sample_predictions(trained_model, x_test_raw, y_test_raw, class_names, n=16)
+        _out = plot_sample_predictions(trained_model, test_buffer, class_names, n=16)
     _out
     return
 
@@ -898,7 +851,9 @@ def _(datasets, mo, train_losses, trained_model, val_losses):
     if trained_model is None:
         _out = mo.md("_Train the model first (Section 5) to see the final summary._")
     else:
-        _test_acc, _test_loss = evaluate_model(trained_model, datasets["test_x"], datasets["test_y"])
+        _test_acc, _test_loss = evaluate_model(
+            trained_model, make_stream(datasets["test"], 128, shuffle=False)
+        )
         _out = mo.md(f"""
         ### Summary
 
