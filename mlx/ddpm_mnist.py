@@ -50,6 +50,9 @@ def _(mo):
     - Sinusoidal time embedding + one-hot class embedding fused as `cond`
     - Loss: MSE between predicted and true noise
     - Sampling: **1000-step DDPM reverse process** with CFG guidance scale
+    - Training stability: bias-corrected AdamW, gradient-norm clipping, and
+      an EMA of the weights used for sampling (see Section 4's note and
+      Section 6's debug view)
 
     ### Notebook Outline
     1. Title & research goal (this cell)
@@ -57,9 +60,10 @@ def _(mo):
     3. Dataset creation
     4. Model definition (schedule, UNet, loss, sampler)
     5. Training loop
-    6. Interactive sampling widget
-    7. Results summary
-    8. Save trained model
+    6. Debug: sampling & denoising progression
+    7. Interactive sampling widget
+    8. Results summary
+    9. Save trained model
     """)
     return
 
@@ -182,18 +186,28 @@ def make_ddpm_datasets(
     test_ds,
     batch_size: int = 128,
     val_fraction: float = 0.15,
+    split_seed: int = 0,
 ):
     n_total = len(train_ds)
     n_val = int(round(n_total * val_fraction))
-    shuffled = train_ds.shuffle()
+    split_rng = np.random.default_rng(split_seed)
+    shuffled_indices = split_rng.permutation(n_total)
+    val_indices = shuffled_indices[:n_val].tolist()
+    train_indices = shuffled_indices[n_val:].tolist()
+    # NOTE: the previous version built both train_iter and val_iter from the
+    # same `train_ds.shuffle()` buffer, so "validation" was silently just
+    # re-reading training data. `.perm(...)` carves out disjoint index sets.
+    train_subset = train_ds.perm(train_indices)
+    val_subset = train_ds.perm(val_indices)
     train_iter = (
-        shuffled
+        train_subset
+        .shuffle()
         .to_stream()
         .key_transform("image", normalize_to_unit_interval)
         .batch(batch_size)
     )
     val_iter = (
-        shuffled
+        val_subset
         .to_stream()
         .key_transform("image", normalize_to_unit_interval)
         .batch(batch_size)
@@ -243,9 +257,19 @@ def _(mo):
     3. `ResidualBlockV1` — GroupNorm-conditioned conv residual block
     4. `DownBlockV1` — 2 residual blocks + stride-2 conv downsample
     5. `UpBlockV1` — ConvTranspose upsample + skip concat + 2 residual blocks
-    6. `UNetV1` — full model with time + class conditioning
+    6. `UNetV1` — full model with time + class conditioning (final layer zero-initialized)
     7. `compute_ddpm_loss` — MSE noise-prediction loss with CFG dropout
-    8. `ddpm_sample` — 1000-step reverse process with classifier-free guidance
+    8. `clip_grad_norm` / `update_ema_params` — training stability helpers (see note below)
+    9. `ddpm_sample` / `ddim_sample` — reverse process with classifier-free guidance
+    10. `ddpm_sample_with_history` — same as `ddpm_sample`, plus recorded intermediate steps for the Section 6 debug view
+
+    **Training stability note**: `mlx.optimizers.AdamW` defaults to
+    `bias_correction=False`, which is *not* the standard Adam algorithm and
+    was found (empirically, on this exact model/schedule) to leave the
+    network stuck predicting ~zero noise no matter how many epochs were run.
+    Section 5 now passes `bias_correction=True` explicitly, clips gradients
+    by global norm, and keeps an exponential moving average (EMA) of the
+    weights for sampling — all standard DDPM training practice.
     """)
     return
 
@@ -479,6 +503,11 @@ class UNetV1(nn.Module):
 
         self.out_norm = nn.GroupNorm(gn_lookup[ch[0]], ch[0], pytorch_compatible=True)
         self.out_conv = nn.Conv2d(ch[0], image_channels, kernel_size=1)
+        # Zero-init the final projection so the network starts by predicting
+        # zero noise (a stable, well-defined prior) instead of an arbitrary
+        # random signal -- a standard DDPM/ADM stability trick.
+        self.out_conv.weight = mx.zeros_like(self.out_conv.weight)
+        self.out_conv.bias = mx.zeros_like(self.out_conv.bias)
 
     def encode_condition(self, t: mx.array, labels: mx.array) -> mx.array:
         t_emb = self.time_pos(t)
@@ -549,13 +578,48 @@ def compute_ddpm_loss(
 
 
 @app.function
+def clip_grad_norm(grads: dict, max_norm: float = 1.0) -> tuple:
+    """Clip a gradient pytree by its global L2 norm (mlx has no built-in equivalent)."""
+    leaves = mlx.utils.tree_flatten(grads)
+    total_norm_sq = sum(mx.sum(v.astype(mx.float32) ** 2) for _, v in leaves)
+    total_norm = mx.sqrt(total_norm_sq)
+    scale = mx.minimum(1.0, max_norm / (total_norm + 1e-6))
+    clipped = mlx.utils.tree_map(lambda g: g * scale, grads)
+    return clipped, total_norm
+
+
+@app.function
+def compute_ema_decay(step: int, base_decay: float = 0.999, warmup: int = 10) -> float:
+    """Bias-corrected-style EMA warmup: ramps from fast tracking to base_decay.
+
+    Without this, a fixed high decay (e.g. 0.999) barely moves away from the
+    random initial weights over a short (few-thousand-step) run, since it
+    takes roughly 1/(1-decay) steps to meaningfully incorporate new weights.
+    """
+    return min(base_decay, (step + 1) / (step + warmup))
+
+
+@app.function
+def update_ema_params(ema_params: dict, model_params: dict, step: int,
+                       base_decay: float = 0.999, warmup: int = 10) -> dict:
+    decay = compute_ema_decay(step, base_decay, warmup)
+    return mlx.utils.tree_map(
+        lambda ema, cur: decay * ema + (1.0 - decay) * cur, ema_params, model_params
+    )
+
+
+@app.function
 def run_ddpm_train_epoch(
     model: nn.Module,
     schedule: "DiffusionScheduleV1",
     optimizer,
     train_iter,
+    ema_params: dict,
+    global_step: int,
     p_uncond: float = 0.1,
-) -> float:
+    max_grad_norm: float = 1.0,
+    ema_decay: float = 0.999,
+) -> tuple:
     def loss_fn(model_, x0, labels):
         return compute_ddpm_loss(model_, x0, labels, schedule, p_uncond)
 
@@ -567,11 +631,14 @@ def run_ddpm_train_epoch(
         x0 = mx.array(batch["image"], dtype=mx.float32)
         labels = mx.array(batch["label"])
         loss, grads = loss_and_grad(model, x0, labels)
+        grads, _grad_norm = clip_grad_norm(grads, max_grad_norm)
         optimizer.update(model, grads)
-        mx.eval(loss, model.parameters())
+        ema_params = update_ema_params(ema_params, model.parameters(), global_step, ema_decay)
+        mx.eval(loss, model.parameters(), ema_params)
         epoch_loss += float(loss.item())
         n_batches += 1
-    return epoch_loss / max(n_batches, 1)
+        global_step += 1
+    return epoch_loss / max(n_batches, 1), ema_params, global_step
 
 
 @app.function
@@ -687,6 +754,104 @@ def ddim_sample(
             progress_callback(tau, num_steps)
 
     return mx.clip(x, 0.0, 1.0)
+
+
+@app.function
+def ddpm_sample_with_history(
+    model: nn.Module,
+    schedule: "DiffusionScheduleV1",
+    labels: mx.array,
+    image_shape: tuple = (28, 28, 1),
+    guidance_scale: float = 3.0,
+    num_snapshots: int = 8,
+) -> tuple:
+    """DDPM sampling that also records intermediate state for debugging.
+
+    At `num_snapshots` evenly spaced timesteps (including t=T-1 and t=0) this
+    records both the current noisy image `x_t` and the network's direct
+    estimate of the clean image at that step, `x0_pred = (x_t - sqrt(1 -
+    alpha_bar_t) * eps) / sqrt(alpha_bar_t)`. Watching `x0_pred` sharpen from
+    a formless blur into a recognizable digit as t -> 0 is the standard way
+    to confirm a diffusion model is actually denoising rather than emitting
+    noise unrelated to the target class.
+
+    Returns (final_samples, recorded_steps, x_t_snapshots, x0_pred_snapshots),
+    where the two snapshot lists are `num_snapshots`-long lists of numpy
+    arrays shaped like `(batch, *image_shape)`, ordered from most-noised
+    (t=T-1) to clean (t=0), each already clipped to [0, 1] for display.
+    """
+    batch_size = int(labels.shape[0])
+    x = mx.random.normal((batch_size,) + image_shape)
+    null_labels = mx.full((batch_size,), model.null_class_index, dtype=labels.dtype)
+    T = schedule.num_timesteps
+    snapshot_steps = sorted(
+        {int(round(i * (T - 1) / max(num_snapshots - 1, 1))) for i in range(num_snapshots)},
+        reverse=True,
+    )
+    snapshot_set = set(snapshot_steps)
+    recorded_steps = []
+    x_t_snapshots = []
+    x0_pred_snapshots = []
+    for step in range(T - 1, -1, -1):
+        t_batch = mx.full((batch_size,), step, dtype=mx.int32)
+        eps_cond = model(x, t_batch, labels)
+        eps_uncond = model(x, t_batch, null_labels)
+        eps = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        beta_t = schedule.betas[step]
+        sqrt_alpha_t = schedule.sqrt_alphas[step]
+        sqrt_ab_t = schedule.sqrt_alphas_cumprod[step]
+        sqrt_one_minus_ab_t = schedule.sqrt_one_minus_alphas_cumprod[step]
+        if step in snapshot_set:
+            x0_pred = mx.clip((x - sqrt_one_minus_ab_t * eps) / sqrt_ab_t, 0.0, 1.0)
+            x_t_clipped = mx.clip(x, 0.0, 1.0)
+            mx.eval(x0_pred, x_t_clipped)
+            recorded_steps.append(step)
+            x_t_snapshots.append(np.array(x_t_clipped))
+            x0_pred_snapshots.append(np.array(x0_pred))
+        mean = (x - (beta_t / sqrt_one_minus_ab_t) * eps) / sqrt_alpha_t
+        if step > 0:
+            noise = mx.random.normal(x.shape)
+            x = mean + schedule.sqrt_betas[step] * noise
+        else:
+            x = mean
+        mx.eval(x)
+    final = mx.clip(x, 0.0, 1.0)
+    mx.eval(final)
+    if recorded_steps[-1] != 0:
+        recorded_steps.append(0)
+        x_t_snapshots.append(np.array(final))
+        x0_pred_snapshots.append(np.array(final))
+    return np.array(final), recorded_steps, x_t_snapshots, x0_pred_snapshots
+
+
+@app.function
+def plot_denoising_progression(
+    x_t_snapshots: list,
+    x0_pred_snapshots: list,
+    recorded_steps: list,
+    digit: int,
+    sample_index: int = 0,
+):
+    n_cols = len(recorded_steps)
+    fig, axes = plt.subplots(2, n_cols, figsize=(1.8 * n_cols, 4.2))
+    for col, step in enumerate(recorded_steps):
+        axes[0, col].imshow(
+            x_t_snapshots[col][sample_index].squeeze(), cmap="gray", vmin=0.0, vmax=1.0
+        )
+        axes[0, col].set_title(f"t={step}", fontsize=9)
+        axes[0, col].axis("off")
+        axes[1, col].imshow(
+            x0_pred_snapshots[col][sample_index].squeeze(), cmap="gray", vmin=0.0, vmax=1.0
+        )
+        axes[1, col].axis("off")
+    fig.text(0.01, 0.72, "$x_t$", va="center", fontsize=11)
+    fig.text(0.01, 0.27, "pred $x_0$", va="center", fontsize=11, rotation=90)
+    fig.suptitle(
+        f"DDPM denoising progression — digit {digit} (top: noisy $x_t$, bottom: model's clean-image guess)",
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0.03, 0, 1, 1))
+    return fig
 
 
 @app.cell
@@ -806,17 +971,28 @@ def _(epochs_ui, lr_ui, mo, p_uncond_ui, train_btn, train_iter, wd_ui):
         run_schedule = DiffusionScheduleV1(num_timesteps=1000)
         run_model = UNetV1()
         mx.eval(run_model.parameters())
+        # bias_correction=True is required for standard Adam/AdamW behavior.
+        # mlx.optimizers defaults this to False, which under-corrects the
+        # early second-moment estimate and (verified empirically) leaves the
+        # network stuck predicting ~zero noise indefinitely, regardless of
+        # how many epochs are run -- this was the root cause of "nothing
+        # trained" / pure-noise samples.
         run_optimizer = optim.AdamW(
             learning_rate=float(lr_ui.value),
             weight_decay=float(wd_ui.value),
+            bias_correction=True,
         )
+        ema_params = mlx.utils.tree_map(lambda p: p, run_model.parameters())
+        global_step = 0
         n_epochs = int(epochs_ui.value)
         for epoch in range(n_epochs):
-            epoch_loss = run_ddpm_train_epoch(
+            epoch_loss, ema_params, global_step = run_ddpm_train_epoch(
                 run_model,
                 run_schedule,
                 run_optimizer,
                 train_iter,
+                ema_params,
+                global_step,
                 p_uncond=float(p_uncond_ui.value),
             )
             train_losses.append(epoch_loss)
@@ -826,12 +1002,18 @@ def _(epochs_ui, lr_ui, mo, p_uncond_ui, train_btn, train_iter, wd_ui):
                     f"train MSE loss: {epoch_loss:.4f}"
                 )
             )
+        # Fold the EMA-averaged weights into the model used downstream --
+        # EMA smooths out the noisy end-of-training weights and produces
+        # markedly better samples, especially with only a handful of epochs.
+        run_model.update(ema_params)
+        mx.eval(run_model.parameters())
         trained_model = run_model
         trained_schedule = run_schedule
         mo.output.replace(
             mo.md(
                 f"**Training complete!** Final train MSE loss: "
-                f"{train_losses[-1]:.4f} over {n_epochs} epoch(s)."
+                f"{train_losses[-1]:.4f} over {n_epochs} epoch(s). "
+                f"Sampling below uses EMA-averaged weights."
             )
         )
     return train_losses, trained_model, trained_schedule
@@ -864,7 +1046,86 @@ def _(mo, train_losses):
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 6 — Interactive Sampling Widget
+    ## Section 6 — Debug: Sampling & Denoising Progression
+
+    Before trusting the interactive sampler, inspect *how* the reverse
+    process gets from pure noise to a digit. For a chosen class, this runs
+    the same CFG-guided DDPM reverse process as Section 7, but snapshots
+    two things at evenly spaced timesteps:
+
+    - **top row `x_t`** — the actual noisy image at that timestep
+    - **bottom row pred `x0`** — the network's direct one-shot guess of the
+      *clean* image, computed as `(x_t - sqrt(1-ᾱ_t)·ε_θ) / sqrt(ᾱ_t)`
+
+    A working model shows the bottom row sharpening into a recognizable
+    digit well before `t=0`, even while the top row still looks noisy. If
+    both rows stay indistinguishable from static all the way to `t=0`, the
+    model has not learned to denoise (see the training-stability note in
+    Section 4) — training more epochs will not fix that on its own.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    debug_digit_ui = mo.ui.dropdown(
+        options=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        value=3,
+        label="Digit class",
+    )
+    debug_guidance_ui = mo.ui.slider(
+        1.0, 10.0, value=3.0, step=0.5, label="Guidance scale"
+    )
+    debug_snapshots_ui = mo.ui.slider(
+        4, 16, value=8, step=1, label="Number of snapshots"
+    )
+    debug_btn = mo.ui.run_button(label="Run Denoising Debug")
+    mo.vstack(
+        [
+            mo.md("### Denoising debug controls"),
+            mo.hstack([debug_digit_ui, debug_guidance_ui, debug_snapshots_ui]),
+            debug_btn,
+        ]
+    )
+    return debug_btn, debug_digit_ui, debug_guidance_ui, debug_snapshots_ui
+
+
+@app.cell
+def _(
+    debug_btn,
+    debug_digit_ui,
+    debug_guidance_ui,
+    debug_snapshots_ui,
+    mo,
+    trained_model,
+    trained_schedule,
+):
+    if trained_model is None or trained_schedule is None:
+        _out = mo.md("_Train the model first (Section 5) to enable the denoising debug view._")
+    elif not debug_btn.value:
+        _out = mo.md("Choose a digit and click **Run Denoising Debug** to visualize the reverse process.")
+    else:
+        _digit = int(debug_digit_ui.value)
+        _guidance = float(debug_guidance_ui.value)
+        _n_snap = int(debug_snapshots_ui.value)
+        _labels = mx.full((1,), _digit, dtype=mx.int32)
+        _final, _steps, _xt_hist, _x0_hist = ddpm_sample_with_history(
+            trained_model,
+            trained_schedule,
+            _labels,
+            image_shape=(28, 28, 1),
+            guidance_scale=_guidance,
+            num_snapshots=_n_snap,
+        )
+        _out = plot_denoising_progression(_xt_hist, _x0_hist, _steps, _digit)
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 7 — Interactive Sampling Widget
 
     Pick a digit class, a classifier-free-guidance scale, and how many samples
     to generate; then press **Generate**. Each click runs the **1000-step
@@ -998,7 +1259,7 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 7 — Results Summary
+    ## Section 8 — Results Summary
     """)
     return
 
@@ -1071,7 +1332,7 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 8 — Save Trained Model
+    ## Section 9 — Save Trained Model
 
     Persist the trained `UNetV1` weights to the project's `models/`
     directory. The file extension chosen determines the on-disk format:
