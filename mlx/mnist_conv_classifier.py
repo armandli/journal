@@ -11,6 +11,7 @@ with app.setup:
     import mlx.utils
     from mlx.data.datasets import load_mnist
 
+    import os
     import time
     from functools import partial
 
@@ -22,7 +23,7 @@ with app.setup:
 def _():
     import marimo as mo
 
-    return
+    return (mo,)
 
 
 @app.cell
@@ -177,6 +178,14 @@ def _(epochs, model, optimizer, test_iter, train_iter):
 
 
 @app.cell
+def _(mo, model, test_iter, train_iter):
+    _train_acc = compute_accuracy(model, train_iter)
+    _test_acc = compute_accuracy(model, test_iter)
+    mo.md(f"**Basic training — train accuracy:** {_train_acc:.4f} | **test accuracy:** {_test_acc:.4f}")
+    return
+
+
+@app.cell
 def _():
     ### use mx.compile for training
     return
@@ -189,7 +198,7 @@ def train_lng(model, x, y, optimizer):
     def train_loss(model, x, y):
         pred = model(x)
         return mx.mean(nn.losses.cross_entropy(pred, y))
-    lng = nn.value_and_trad(model, train_loss)
+    lng = nn.value_and_grad(model, train_loss)
     loss, grad = lng(model, x, y)
     optimizer.update(model, grad)
     return loss
@@ -236,13 +245,29 @@ def opt_validation_epoch(model, data_iter, epoch):
 
 
 @app.function
+def compute_accuracy(model, data_iter):
+    model.train(False)
+    data_iter.reset()
+    correct = 0
+    total = 0
+    for batch in data_iter:
+        x = mx.array(batch['image'])
+        y = mx.array(batch['label'])
+        pred = model(x)
+        predicted = mx.argmax(pred, axis=1)
+        correct += mx.sum(predicted == y).item()
+        total += y.shape[0]
+    return correct / total
+
+
+@app.function
 def opt_train(model, train_iter, test_iter, optimizer, epochs):
     total_time = 0.
     count = 0
     for epoch in range(epochs):
         tic = time.perf_counter()
-        avg_loss = train_epoch(model, train_iter, optimizer, epoch)
-        eval_loss = validation_epoch(model, test_iter, epoch)
+        avg_loss = opt_train_epoch(model, train_iter, optimizer, epoch)
+        eval_loss = opt_validation_epoch(model, test_iter, epoch)
         toc = time.perf_counter()
         total_time += (toc - tic)
         count += 1
@@ -257,13 +282,24 @@ def _(epochs, model, optimizer, test_iter, train_iter):
 
 
 @app.cell
-def _():
-    #### conclusion: it does not appear mx.compile helps to run training loop faster, this is probably because compile is enabled by default
+def _(mo, model, test_iter, train_iter):
+    _train_acc = compute_accuracy(model, train_iter)
+    _test_acc = compute_accuracy(model, test_iter)
+    mo.md(f"**Optimized training — train accuracy:** {_train_acc:.4f} | **test accuracy:** {_test_acc:.4f}")
+    return
+
+
+@app.cell
+def _(model):
+    os.makedirs("models", exist_ok=True)
+    model.save_weights("models/mnist_conv_classifier.npz")
+    print("Model saved to models/mnist_conv_classifier.npz")
     return
 
 
 @app.cell
 def _():
+    #### conclusion: it does not appear mx.compile helps to run training loop faster, this is probably because compile is enabled by default
     return
 
 
