@@ -86,6 +86,25 @@ class ClassifierV1(nn.Module):
         return x
 
 
+@app.class_definition
+class ClassifierV2(nn.Module):
+    # Fixes V1: ReLU activations between layers, no Softmax output (cross_entropy expects logits),
+    # strided convolutions for spatial downsampling: 28x28 -> 14x14 -> 7x7
+    def __init__(self, nclass):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1,  16, 3, 1, 1)
+        self.conv2 = nn.Conv2d(16, 32, 3, 2, 1)
+        self.conv3 = nn.Conv2d(32, 64, 3, 2, 1)
+        self.ffn   = nn.Linear(7 * 7 * 64, nclass)
+
+    def __call__(self, x):
+        x = nn.relu(self.conv1(x))
+        x = nn.relu(self.conv2(x))
+        x = nn.relu(self.conv3(x))
+        x = x.reshape(x.shape[0], -1)
+        return self.ffn(x)
+
+
 @app.cell
 def _():
     lr = 0.01
@@ -106,7 +125,7 @@ def _(batch_size, decay, lr, test_ds, train_ds):
 
 @app.cell
 def _():
-    model = ClassifierV1(28, 1, 10)
+    model = ClassifierV2(10)
     return (model,)
 
 
