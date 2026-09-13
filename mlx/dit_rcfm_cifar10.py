@@ -117,21 +117,19 @@ def _():
 
 @app.cell
 def _(mo, x_test_np, x_train_np):
-    mo.md(
-        f"""
-        ### Dataset overview
+    mo.md(f"""
+    ### Dataset overview
 
-        CIFAR-10 is loaded via `mlx.data.datasets.load_cifar10` from
-        `../data/cifar10/` (each split's Buffer is collapsed into a single
-        full batch, then materialised to NumPy). Each image is a `float32`
-        array shaped `(32, 32, 3)` in `[0, 1]`; labels are `int32` in `[0, 9]`.
+    CIFAR-10 is loaded via `mlx.data.datasets.load_cifar10` from
+    `../data/cifar10/` (each split's Buffer is collapsed into a single
+    full batch, then materialised to NumPy). Each image is a `float32`
+    array shaped `(32, 32, 3)` in `[0, 1]`; labels are `int32` in `[0, 9]`.
 
-        | Split | Size | Shape |
-        |-------|------|-------|
-        | Train (raw) | {x_train_np.shape[0]:,} | {tuple(x_train_np.shape[1:])} |
-        | Test | {x_test_np.shape[0]:,} | {tuple(x_test_np.shape[1:])} |
-        """
-    )
+    | Split | Size | Shape |
+    |-------|------|-------|
+    | Train (raw) | {x_train_np.shape[0]:,} | {tuple(x_train_np.shape[1:])} |
+    | Test | {x_test_np.shape[0]:,} | {tuple(x_test_np.shape[1:])} |
+    """)
     return
 
 
@@ -660,7 +658,9 @@ def _():
 
 @app.cell
 def _(default_param_count, mo):
-    mo.md(f"""**Default model parameter count**: `{default_param_count:,}`""")
+    mo.md(f"""
+    **Default model parameter count**: `{default_param_count:,}`
+    """)
     return
 
 
@@ -877,6 +877,19 @@ def _(mo):
     to synthesize `(x_0, x_1)` pairs by ODE integration, then trains a
     second model on those *fixed* pairs — that model's ODE map has
     straighter trajectories.
+
+    **Reflow dataset size matters far more than epoch count.** Stage 2
+    trains on a *fixed* synthetic set, unlike Stage 1/vanilla/OT-CFM
+    which see a fresh Gaussian `x_0` every step against the *full*
+    45k-image training set (~5,265 gradient steps at the default
+    15 epochs / batch 128). The default `DiffusionTransformerV1` has
+    ~4.9M parameters; a reflow dataset of only 2,048 pairs gives just
+    ~240 steps at 15 epochs (under 5% of the real-data step count) —
+    nowhere near enough for a model this size to do anything but
+    memorize those 2,048 fixed pairs, which reads as "very bad,
+    low-diversity, incoherent" samples. Grow **dataset size** first;
+    only add epochs once the dataset is large enough that more epochs
+    means more coverage rather than more repetition.
     """)
     return
 
@@ -985,7 +998,7 @@ def _(mo):
     epochs_reflow_ui = mo.ui.slider(1, 60, value=15, step=1, label="Epochs (reflow)")
     num_layers_reflow_ui = mo.ui.slider(1, 12, value=6, step=1, label="DiT layers (reflow)")
     num_samples_reflow_ui = mo.ui.slider(
-        512, 8192, value=2048, step=512, label="Reflow dataset size"
+        2048, 45056, value=16384, step=2048, label="Reflow dataset size"
     )
     gen_steps_reflow_ui = mo.ui.slider(
         10, 100, value=50, step=5, label="ODE steps to build reflow pairs"
@@ -994,6 +1007,14 @@ def _(mo):
     mo.vstack(
         [
             mo.md("#### Stage 2 — reflow (train a fresh model on gen1's ODE map pairs)"),
+            mo.md(
+                "`Reflow dataset size` trades build time for sample quality: "
+                "the ~4.9M-param default DiT needs a large, fixed pair set to "
+                "avoid memorizing it (see note above) — 16,384 is a tractable "
+                "middle ground; push toward the 45,056 max (matching the real "
+                "training-set size) for the closest match to vanilla/OT-CFM's "
+                "per-epoch step count."
+            ),
             mo.hstack([lr_reflow_ui, bs_reflow_ui, wd_reflow_ui]),
             mo.hstack([epochs_reflow_ui, num_layers_reflow_ui]),
             mo.hstack([num_samples_reflow_ui, gen_steps_reflow_ui]),
