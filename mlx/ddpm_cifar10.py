@@ -74,6 +74,7 @@ def _(mo):
     6. Optional hyperparameter search
     7. Held-out test evaluation + k-fold cross-validation
     8. Interactive conditional sampling + results
+    8b. Denoising trajectory visualization (noise -> image filmstrip)
     9. Save trained model weights
     """)
     return
@@ -361,6 +362,14 @@ class ResidualConvBlockV1(nn.Module):
             self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         else:
             self.skip = None
+        # Zero-init the second conv (the `zero_module` trick from OpenAI's
+        # guided-diffusion UNet) so the block computes exactly `residual` at
+        # init -- the convolutional analogue of DiT's adaLN-Zero per-block
+        # identity start. Without this every block injects unstructured
+        # random signal from step 0, which is unstable at higher learning
+        # rates.
+        self.conv2.weight = mx.zeros_like(self.conv2.weight)
+        self.conv2.bias = mx.zeros_like(self.conv2.bias)
 
     def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         h = self.conv1(x)
@@ -482,6 +491,11 @@ class ConvUNetDenoiserV1(nn.Module):
 
         self.out_norm = nn.GroupNorm(num_groups, ch[0], pytorch_compatible=True)
         self.out_conv = nn.Conv2d(ch[0], image_channels, kernel_size=1)
+        # Zero-init the final projection so the network predicts epsilon=0 at
+        # init (standard DDPM practice, e.g. Ho et al.'s reference
+        # implementation) -- mirrors DiT's zero-initialized final layer.
+        self.out_conv.weight = mx.zeros_like(self.out_conv.weight)
+        self.out_conv.bias = mx.zeros_like(self.out_conv.bias)
 
     def encode_condition(self, t: mx.array, labels: mx.array) -> mx.array:
         t_emb = sinusoidal_timestep_embedding(t, self.time_emb_dim)
@@ -830,11 +844,20 @@ def ddpm_sample(
 
     Signature matches `ddim_sample` so the two are interchangeable; both
     work with either `ConvUNetDenoiserV1` or `DiffusionTransformerV1`.
+
+    `progress_callback(step, total_steps, preview)` is invoked roughly every
+    100 steps (plus once before the loop at `step=total_steps` for the
+    initial pure-noise frame). `preview` is the current `x` rescaled to
+    `[0, 1]` — cheap to compute at this call frequency and lets a caller
+    (Section 8b) record a noise-to-image trajectory strip.
     """
     batch_size = int(labels.shape[0])
     x = mx.random.normal((batch_size,) + image_shape)
     null_labels = mx.full((batch_size,), model.null_class_index, dtype=labels.dtype)
     total_steps = schedule.num_timesteps
+    if progress_callback is not None:
+        mx.eval(x)
+        progress_callback(total_steps, total_steps, mx.clip((x + 1.0) / 2.0, 0.0, 1.0))
     for step in range(total_steps - 1, -1, -1):
         t_batch = mx.full((batch_size,), step, dtype=mx.int32)
         eps = batched_cfg_forward(
@@ -851,7 +874,7 @@ def ddpm_sample(
             x = mean
         mx.eval(x)
         if progress_callback is not None and (step % 100 == 0 or step == 0):
-            progress_callback(step, total_steps)
+            progress_callback(step, total_steps, mx.clip((x + 1.0) / 2.0, 0.0, 1.0))
     # Images live in [-1, 1] during diffusion; rescale to [0, 1] for display.
     return mx.clip((x + 1.0) / 2.0, 0.0, 1.0)
 
@@ -872,6 +895,11 @@ def ddim_sample(
     `eta=0.0` = fully deterministic; `eta=1.0` recovers DDPM-like stochasticity.
     Uses `num_steps` uniformly spaced timesteps. Same trained model as DDPM;
     only the reverse procedure differs.
+
+    `progress_callback(tau, num_steps, preview)` fires roughly every
+    `num_steps // 10` steps (plus once before the loop at `tau=num_steps` for
+    the initial pure-noise frame), matching `ddpm_sample`'s contract so both
+    samplers plug into the same trajectory-recording callback.
     """
     total_steps = schedule.num_timesteps
     batch_size = int(labels.shape[0])
@@ -901,6 +929,8 @@ def ddim_sample(
     null_labels = mx.full((batch_size,), model.null_class_index, dtype=labels.dtype)
     x = mx.random.normal((batch_size,) + image_shape)
     mx.eval(x)
+    if progress_callback is not None:
+        progress_callback(num_steps, num_steps, mx.clip((x + 1.0) / 2.0, 0.0, 1.0))
 
     log_interval = max(num_steps // 10, 1)
     for tau in range(num_steps - 1, -1, -1):
@@ -922,7 +952,7 @@ def ddim_sample(
         mx.eval(x)
 
         if progress_callback is not None and (tau % log_interval == 0 or tau == 0):
-            progress_callback(tau, num_steps)
+            progress_callback(tau, num_steps, mx.clip((x + 1.0) / 2.0, 0.0, 1.0))
     return mx.clip((x + 1.0) / 2.0, 0.0, 1.0)
 
 
@@ -942,7 +972,7 @@ def _(mo):
     | Conditioning | Additive (t+class) bias inside each residual block | adaLN-Zero: 6-param modulation per block from `SiLU(c) -> zero-init Linear` |
     | Class embedding | `Embedding(11, 256)` | `Embedding(11, 256)` |
     | Skip connections | Yes (per encoder level) | No (residual within transformer blocks) |
-    | Init trick | Standard | adaLN-Zero: last modulation Linear and final proj initialized to zero so each block/final projection starts as identity/zero |
+    | Init trick | Each `ResidualConvBlockV1`'s 2nd conv + `out_conv` zero-init'd so blocks start as identity and predicted epsilon starts at zero | adaLN-Zero: last modulation Linear and final proj initialized to zero so each block/final projection starts as identity/zero |
 
     Both backbones share:
 
@@ -1664,7 +1694,7 @@ def _(
             _sampler_name = "DDIM" if sampler_ui.value == "DDIM" else "DDPM"
             _labels = mx.full((_n,), _class_id, dtype=mx.int32)
 
-            def _progress(step, total):
+            def _progress(step, total, preview=None):
                 mo.output.replace(
                     mo.md(
                         f"**{_selected_backbone} ({_source_name}) / {_sampler_name}** — "
@@ -1685,6 +1715,131 @@ def _(
             mx.eval(_samples)
             _images_np = np.array(_samples)
             _out = plot_generated_grid(_images_np, _class_name, _guidance)
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 8b — Denoising Trajectory Visualization
+
+    Runs the sampler on a single image while recording the `preview`
+    argument that `ddpm_sample`/`ddim_sample` now pass to their
+    `progress_callback` at each logged step (an `[-1, 1] -> [0, 1]` rescale
+    of the current `x_t`), then lays the recorded frames out as a filmstrip
+    from pure noise (`t=T`) to the final image (`t=0`). Reuses the class,
+    backbone, sampler, guidance and DDIM settings configured in Section 8
+    above.
+    """)
+    return
+
+
+@app.function
+def plot_sampling_trajectory(
+    frames: list, step_labels: list, class_name: str, backbone_name: str
+) -> plt.Figure:
+    n = len(frames)
+    fig, axes = plt.subplots(1, n, figsize=(2.0 * n, 2.6))
+    axes = np.atleast_1d(axes)
+    for ax, frame, t_label in zip(axes, frames, step_labels):
+        ax.imshow(np.clip(frame, 0.0, 1.0))
+        ax.set_title(f"t={t_label}", fontsize=8)
+        ax.axis("off")
+    fig.suptitle(
+        f"{backbone_name} denoising trajectory — noise to '{class_name}'",
+        fontsize=13,
+    )
+    fig.tight_layout()
+    return fig
+
+
+@app.cell
+def _(mo):
+    trajectory_btn = mo.ui.run_button(label="Show Denoising Trajectory")
+    mo.vstack(
+        [
+            mo.md(
+                "Uses the class / backbone / sampler / guidance settings "
+                "configured in Section 8 above."
+            ),
+            trajectory_btn,
+        ]
+    )
+    return (trajectory_btn,)
+
+
+@app.cell
+def _(
+    backbone_choice_ui,
+    class_ui,
+    ddim_eta_ui,
+    ddim_steps_ui,
+    guidance_ui,
+    loaded_dit,
+    loaded_unet,
+    mo,
+    sampler_ui,
+    trained_dit,
+    trained_dit_ema,
+    trained_schedule,
+    trained_unet,
+    trained_unet_ema,
+    trajectory_btn,
+):
+    if not trajectory_btn.value:
+        _out = mo.md(
+            "Configure Section 8 options and click **Show Denoising Trajectory**."
+        )
+    else:
+        _selected_backbone = backbone_choice_ui.value
+        if _selected_backbone == "UNet":
+            _candidates = [("loaded checkpoint", loaded_unet), ("EMA", trained_unet_ema), ("raw trained", trained_unet)]
+        else:
+            _candidates = [("loaded checkpoint", loaded_dit), ("EMA", trained_dit_ema), ("raw trained", trained_dit)]
+        _source_name, _selected_model = next(
+            ((name, m) for name, m in _candidates if m is not None), (None, None)
+        )
+        if _selected_model is None:
+            _out = mo.md(
+                f"_No **{_selected_backbone}** weights available. Either train it "
+                f"in Section 5, or load a saved checkpoint above._"
+            )
+        else:
+            _class_id = int(class_ui.value)
+            _class_name = cifar10_class_names()[_class_id]
+            _guidance = float(guidance_ui.value)
+            _sampler_name = "DDIM" if sampler_ui.value == "DDIM" else "DDPM"
+            _labels = mx.full((1,), _class_id, dtype=mx.int32)
+
+            _frames = []
+            _step_labels = []
+
+            def _capture(step, total, preview):
+                mo.output.replace(
+                    mo.md(
+                        f"**{_selected_backbone} ({_source_name}) / {_sampler_name}** — "
+                        f"class '{_class_name}' — recording frame "
+                        f"{len(_frames) + 1} (step {total - step}/{total})"
+                    )
+                )
+                mx.eval(preview)
+                _frames.append(np.array(preview[0]))
+                _step_labels.append(step)
+
+            pick_sampler_and_run(
+                _sampler_name,
+                _selected_model,
+                trained_schedule,
+                _labels,
+                _guidance,
+                int(ddim_steps_ui.value),
+                float(ddim_eta_ui.value),
+                _capture,
+            )
+            _out = plot_sampling_trajectory(
+                _frames, _step_labels, _class_name, _selected_backbone
+            )
     _out
     return
 
@@ -1763,6 +1918,15 @@ def _(mo):
     - The DiT block's adaLN-Zero initialization is essential: without zeroing
       the modulation `Linear` and the final projection, DiT training on
       CIFAR-10 diverges in the first hundred steps.
+    - The UNet backbone mirrors this with its own zero-init: each
+      `ResidualConvBlockV1`'s second conv is zeroed (so every block starts as
+      an identity/skip-only map) and `out_conv` is zeroed (so the initial
+      epsilon prediction is exactly zero). Without this the UNet's ~14
+      randomly-initialized residual blocks inject unstructured signal from
+      step 0, which is prone to diverging into a bad basin (generating
+      nothing but noise regardless of epoch count) at higher learning rates
+      such as `1e-3`; the zero-init makes training well-behaved across the
+      whole learning-rate dropdown above.
     """)
     return
 
