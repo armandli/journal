@@ -35,7 +35,7 @@ def _(mo):
     ## Research Goal
 
     Train a **class-conditional generative model** on **CIFAR-10** with a
-    **Diffusion Transformer (DiT)** backbone and *compare three training
+    **Diffusion Transformer (DiT)** backbone and *compare four training
     regimes* under an identical model, loss family, and Euler ODE sampler:
 
     1. **Vanilla Conditional Flow Matching (CFM)** — the linear
@@ -54,10 +54,17 @@ def _(mo):
        train a **second** model on those already-coupled pairs with the
        x0 held fixed to its paired noise (the *reflow* step). This is
        expected to yield **straighter** trajectories at inference time.
+    4. **OT-CFM gen1 + Reflow (combined)** — train a first gen1 model
+       using OT-coupled pairs (minibatch optimal-transport), then apply
+       the reflow step: build a synthetic `(x_0, x_1)` dataset by
+       running the OT-gen1 ODE on fresh noise and train a second model
+       on those fixed pairs. This combines OT's benefit (reduced
+       trajectory crossing, more regular gen1 paths) with reflow's
+       explicit path straightening on the gen2 model.
 
     We then quantitatively and visually demonstrate that reflow's
     trajectories are indeed straighter than gen1's (via a curvature /
-    step-count MSE metric) and compare the three regimes side-by-side.
+    step-count MSE metric) and compare all four regimes side-by-side.
 
     ### Notebook Outline
 
@@ -65,13 +72,13 @@ def _(mo):
     2. Data exploration
     3. Dataset creation
     4. Model definition (shared DiT + flow-matching utilities)
-    5. Training — 5a Vanilla CFM, 5b OT-CFM, 5c Rectified Flow + Reflow
+    5. Training — 5a Vanilla CFM, 5b OT-CFM, 5c Rectified Flow + Reflow, 5d OT-CFM gen1 + Reflow
     6. Optional hyperparameter search (vanilla CFM only)
     7. Validation & 5-fold cross-validation (vanilla CFM only)
     8. Final verification & comparison
        - 8a. ODE generation progression
-       - 8b. Straightness proof for reflow
-       - 8c. Three-way comparison (loss curves, samples, table)
+       - 8b. Straightness proof — reflow and OT-reflow
+       - 8c. Four-way comparison (loss curves, samples, table)
     9. Save trained models
     10. Load an existing trained model
     """)
@@ -682,6 +689,10 @@ def _(mo):
       exactly like 5a; Stage 2 builds a synthetic pair dataset by
       running the gen1 Euler ODE on fresh noise, then trains a fresh
       model on those *fixed* pairs.
+    - **5d OT-CFM gen1 + Reflow** — Stage 1 trains a "gen1" model
+      using OT coupling (like 5b); Stage 2 applies the same reflow step
+      as 5c on those OT-coupled gen1 trajectories, combining both
+      techniques.
     """)
     return
 
@@ -1101,6 +1112,227 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
+    ### 5d — OT-CFM gen1 + Reflow (combined regime)
+
+    Stage 1 trains a "gen1" model with **OT-CFM** — every minibatch's
+    Gaussian noise `x_0` is optimally coupled to `x_1` via the exact
+    Hungarian assignment solver before computing the flow-matching loss.
+    Stage 2 then applies the standard reflow step on top: run the
+    OT-gen1 Euler ODE on fresh Gaussian noise to build a synthetic
+    `(x_0, x_1)` pair dataset, and train a fresh gen2 model on those
+    fixed pairs.
+
+    The hypothesis is that OT's reduced trajectory crossing at gen1
+    provides a higher-quality starting point for reflow, yielding a gen2
+    model with even straighter paths than vanilla gen1 + reflow.
+    The same reflow dataset-size caveat from 5c applies here.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    lr_ot_rf_gen1_ui = mo.ui.dropdown(
+        options={"1e-4": 1e-4, "3e-4": 3e-4, "1e-3": 1e-3},
+        value="3e-4",
+        label="LR (OT-RF gen1)",
+    )
+    bs_ot_rf_gen1_ui = mo.ui.dropdown(
+        options={"64": 64, "128": 128, "256": 256},
+        value="128",
+        label="Batch size (OT-RF gen1)",
+    )
+    wd_ot_rf_gen1_ui = mo.ui.dropdown(
+        options={"0.0": 0.0, "1e-4": 1e-4, "1e-3": 1e-3},
+        value="1e-4",
+        label="Weight decay (OT-RF gen1)",
+    )
+    epochs_ot_rf_gen1_ui = mo.ui.slider(1, 60, value=15, step=1, label="Epochs (OT-RF gen1)")
+    num_layers_ot_rf_gen1_ui = mo.ui.slider(1, 12, value=6, step=1, label="DiT layers (OT-RF gen1)")
+    train_btn_ot_rf_gen1 = mo.ui.run_button(label="Train Stage 1 (OT gen1)")
+    mo.vstack(
+        [
+            mo.md("#### Stage 1 — OT gen1 (OT-CFM coupling, will be reflowed)"),
+            mo.hstack([lr_ot_rf_gen1_ui, bs_ot_rf_gen1_ui, wd_ot_rf_gen1_ui]),
+            mo.hstack([epochs_ot_rf_gen1_ui, num_layers_ot_rf_gen1_ui]),
+            train_btn_ot_rf_gen1,
+        ]
+    )
+    return (
+        bs_ot_rf_gen1_ui,
+        epochs_ot_rf_gen1_ui,
+        lr_ot_rf_gen1_ui,
+        num_layers_ot_rf_gen1_ui,
+        train_btn_ot_rf_gen1,
+        wd_ot_rf_gen1_ui,
+    )
+
+
+@app.cell
+def _(
+    bs_ot_rf_gen1_ui,
+    epochs_ot_rf_gen1_ui,
+    lr_ot_rf_gen1_ui,
+    mo,
+    num_layers_ot_rf_gen1_ui,
+    train_btn_ot_rf_gen1,
+    wd_ot_rf_gen1_ui,
+    x_tr,
+    x_val,
+    y_tr,
+    y_val,
+):
+    train_losses_ot_rf_gen1 = []
+    val_losses_ot_rf_gen1 = []
+    trained_model_ot_rf_gen1 = None
+    if not train_btn_ot_rf_gen1.value:
+        mo.output.replace(mo.md("Click **Train Stage 1 (OT gen1)** to begin training the OT-coupled base model that will be reflowed."))
+    else:
+        def _cb_ot_rf_gen1(epoch, n_epochs, tl, vl):
+            mo.output.replace(
+                mo.md(f"**OT-RF gen1 Epoch {epoch + 1}/{n_epochs}** — train: {tl:.4f} | val: {vl:.4f}")
+            )
+        trained_model_ot_rf_gen1, train_losses_ot_rf_gen1, val_losses_ot_rf_gen1 = train_dit_regime(
+            x_tr,
+            y_tr,
+            x_val,
+            y_val,
+            num_layers=num_layers_ot_rf_gen1_ui.value,
+            lr=lr_ot_rf_gen1_ui.value,
+            wd=wd_ot_rf_gen1_ui.value,
+            batch_size=bs_ot_rf_gen1_ui.value,
+            epochs=epochs_ot_rf_gen1_ui.value,
+            epoch_fn=run_train_epoch_ot_cfm,
+            progress_cb=_cb_ot_rf_gen1,
+        )
+        mo.output.replace(
+            mo.md(
+                f"**OT-RF gen1 training complete!** Final train "
+                f"`{train_losses_ot_rf_gen1[-1]:.4f}` | val `{val_losses_ot_rf_gen1[-1]:.4f}`"
+            )
+        )
+    return (trained_model_ot_rf_gen1,)
+
+
+@app.cell
+def _(mo):
+    lr_ot_reflow_ui = mo.ui.dropdown(
+        options={"1e-4": 1e-4, "3e-4": 3e-4, "1e-3": 1e-3},
+        value="3e-4",
+        label="LR (OT-reflow)",
+    )
+    bs_ot_reflow_ui = mo.ui.dropdown(
+        options={"64": 64, "128": 128, "256": 256},
+        value="128",
+        label="Batch size (OT-reflow)",
+    )
+    wd_ot_reflow_ui = mo.ui.dropdown(
+        options={"0.0": 0.0, "1e-4": 1e-4, "1e-3": 1e-3},
+        value="1e-4",
+        label="Weight decay (OT-reflow)",
+    )
+    epochs_ot_reflow_ui = mo.ui.slider(1, 60, value=15, step=1, label="Epochs (OT-reflow)")
+    num_layers_ot_reflow_ui = mo.ui.slider(1, 12, value=6, step=1, label="DiT layers (OT-reflow)")
+    num_samples_ot_reflow_ui = mo.ui.slider(
+        2048, 45056, value=16384, step=2048, label="Reflow dataset size (OT-reflow)"
+    )
+    gen_steps_ot_reflow_ui = mo.ui.slider(
+        10, 100, value=50, step=5, label="ODE steps to build OT-reflow pairs"
+    )
+    train_btn_ot_reflow = mo.ui.run_button(label="Build OT-reflow dataset + Train Stage 2")
+    mo.vstack(
+        [
+            mo.md("#### Stage 2 — OT-reflow (train a fresh model on OT-gen1's ODE map pairs)"),
+            mo.hstack([lr_ot_reflow_ui, bs_ot_reflow_ui, wd_ot_reflow_ui]),
+            mo.hstack([epochs_ot_reflow_ui, num_layers_ot_reflow_ui]),
+            mo.hstack([num_samples_ot_reflow_ui, gen_steps_ot_reflow_ui]),
+            train_btn_ot_reflow,
+        ]
+    )
+    return (
+        bs_ot_reflow_ui,
+        epochs_ot_reflow_ui,
+        gen_steps_ot_reflow_ui,
+        lr_ot_reflow_ui,
+        num_layers_ot_reflow_ui,
+        num_samples_ot_reflow_ui,
+        train_btn_ot_reflow,
+        wd_ot_reflow_ui,
+    )
+
+
+@app.cell
+def _(
+    bs_ot_reflow_ui,
+    epochs_ot_reflow_ui,
+    gen_steps_ot_reflow_ui,
+    lr_ot_reflow_ui,
+    mo,
+    num_layers_ot_reflow_ui,
+    num_samples_ot_reflow_ui,
+    train_btn_ot_reflow,
+    trained_model_ot_rf_gen1,
+    wd_ot_reflow_ui,
+    x_val,
+    y_tr,
+    y_val,
+):
+    train_losses_ot_reflow = []
+    val_losses_ot_reflow = []
+    trained_model_ot_reflow = None
+    if trained_model_ot_rf_gen1 is None:
+        mo.output.replace(mo.md("_Train the Stage 1 (OT gen1) model above first._"))
+    elif not train_btn_ot_reflow.value:
+        mo.output.replace(
+            mo.md(
+                "Click **Build OT-reflow dataset + Train Stage 2** to generate "
+                "synthetic `(x_0, x_1)` pairs from OT-gen1 and train the "
+                "OT-reflow model."
+            )
+        )
+    else:
+        mo.output.replace(mo.md("Building reflow dataset from OT-gen1..."))
+        x0_ot_rf, x1_ot_rf, y_ot_rf = build_reflow_dataset(
+            trained_model_ot_rf_gen1,
+            num_samples=num_samples_ot_reflow_ui.value,
+            num_steps=gen_steps_ot_reflow_ui.value,
+            y_labels_pool=y_tr,
+            batch_size=bs_ot_reflow_ui.value,
+        )
+        def _cb_ot_reflow(epoch, n_epochs, tl, vl):
+            mo.output.replace(
+                mo.md(f"**OT-Reflow Epoch {epoch + 1}/{n_epochs}** — train: {tl:.4f} | val: {vl:.4f}")
+            )
+        trained_model_ot_reflow, train_losses_ot_reflow, val_losses_ot_reflow = train_reflow_stage(
+            x0_ot_rf,
+            x1_ot_rf,
+            y_ot_rf,
+            x_val,
+            y_val,
+            num_layers=num_layers_ot_reflow_ui.value,
+            lr=lr_ot_reflow_ui.value,
+            wd=wd_ot_reflow_ui.value,
+            batch_size=bs_ot_reflow_ui.value,
+            epochs=epochs_ot_reflow_ui.value,
+            progress_cb=_cb_ot_reflow,
+        )
+        mo.output.replace(
+            mo.md(
+                f"**OT-Reflow training complete!** Reflow dataset size "
+                f"`{num_samples_ot_reflow_ui.value}`. Final train "
+                f"`{train_losses_ot_reflow[-1]:.4f}` | val `{val_losses_ot_reflow[-1]:.4f}`"
+            )
+        )
+    return (
+        train_losses_ot_reflow,
+        trained_model_ot_reflow,
+        val_losses_ot_reflow,
+    )
+
+
+@app.cell
+def _(mo):
+    mo.md("""
     ## Section 6 — Hyperparameter Search (Optional, vanilla CFM only)
 
     Scope note: to bound compute, hyperparameter search only sweeps the
@@ -1379,6 +1611,26 @@ def plot_step_count_mse(
     return fig
 
 
+@app.function
+def plot_step_count_mse_multi(step_list: list, curves: dict):
+    markers = ["o", "s", "^", "D", "v", "p"]
+    colors  = ["steelblue", "seagreen", "darkorange", "orchid", "crimson", "gray"]
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for i, (label, mse) in enumerate(curves.items()):
+        if mse:
+            ax.plot(step_list, mse, f"-{markers[i % len(markers)]}", lw=2, ms=6,
+                    color=colors[i % len(colors)], label=label)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Euler steps")
+    ax.set_ylabel("MSE vs high-step reference")
+    ax.set_title("Step-count MSE across all regimes — lower and flatter is straighter")
+    ax.legend()
+    ax.grid(True, alpha=0.3, which="both")
+    fig.tight_layout()
+    return fig
+
+
 @app.cell
 def _(mo):
     mo.md("""
@@ -1393,7 +1645,7 @@ def _(mo):
 @app.cell
 def _(mo):
     progression_model_ui = mo.ui.dropdown(
-        options=["vanilla", "ot", "reflow"],
+        options=["vanilla", "ot", "reflow", "ot_reflow"],
         value="vanilla",
         label="Model to visualize",
     )
@@ -1404,13 +1656,15 @@ def _(mo):
 
 
 @app.function
-def pick_model(name: str, m_vanilla, m_ot, m_reflow):
+def pick_model(name: str, m_vanilla, m_ot, m_reflow, m_ot_reflow):
     if name == "vanilla":
         return m_vanilla
     if name == "ot":
         return m_ot
     if name == "reflow":
         return m_reflow
+    if name == "ot_reflow":
+        return m_ot_reflow
     return None
 
 
@@ -1422,10 +1676,11 @@ def _(
     progression_model_ui,
     progression_steps_ui,
     trained_model_ot,
+    trained_model_ot_reflow,
     trained_model_reflow,
     trained_model_vanilla,
 ):
-    _sel = pick_model(progression_model_ui.value, trained_model_vanilla, trained_model_ot, trained_model_reflow)
+    _sel = pick_model(progression_model_ui.value, trained_model_vanilla, trained_model_ot, trained_model_reflow, trained_model_ot_reflow)
     if _sel is None:
         _out = mo.md(f"_The selected model `{progression_model_ui.value}` has not been trained yet._")
     elif not progression_btn.value:
@@ -1439,9 +1694,9 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    ### 8b. Straightness proof — gen1 vs reflow
+    ### 8b. Straightness proof — reflow and OT-reflow
 
-    We compare the reflowed model against its own gen1 ancestor with
+    We compare each reflowed model against its own gen1 ancestor with
     two measurements:
 
     1. **Path-straightness metric `S`** (defined in Section 4): mean
@@ -1452,6 +1707,9 @@ def _(mo):
        (100 steps)? Straighter paths let the low-step Euler solution
        match the reference more closely, so the MSE curve for reflow
        should stay closer to zero for small `k`.
+
+    The final multi-model step-count MSE chart compares all four
+    regimes together to show the cumulative effect of OT + reflow.
     """)
     return
 
@@ -1497,19 +1755,87 @@ def _(mo, trained_model_reflow, trained_model_rf_gen1):
 
 
 @app.cell
+def _(mo, trained_model_ot_reflow, trained_model_ot_rf_gen1):
+    mo.md("#### OT-CFM gen1 vs OT-reflow — path-straightness metric")
+    if trained_model_ot_rf_gen1 is None or trained_model_ot_reflow is None:
+        _out = mo.md("_Train both OT-RF Stage 1 (gen1) and Stage 2 (OT-reflow) first (Section 5d)._")
+    else:
+        mx.random.seed(11)
+        _x0 = mx.random.normal(shape=(32, 32, 32, 3))
+        _y = mx.array(np.random.randint(0, 10, size=32).astype(np.int32))
+        _s_ot_gen1   = compute_path_straightness(trained_model_ot_rf_gen1, _x0, _y, num_steps=50)
+        _s_ot_reflow = compute_path_straightness(trained_model_ot_reflow,  _x0, _y, num_steps=50)
+        _improve = 100.0 * (_s_ot_gen1 - _s_ot_reflow) / max(_s_ot_gen1, 1e-12)
+        _out = mo.md(
+            f"""
+            | Model | Path-straightness `S` (lower is straighter) |
+            |-------|---------------------------------------------|
+            | OT-CFM gen1 (before reflow) | `{_s_ot_gen1:.6f}` |
+            | OT-reflow gen2 (after) | `{_s_ot_reflow:.6f}` |
+            | **Relative reduction** | **`{_improve:.1f}%`** |
+
+            A positive relative reduction confirms that reflow on an OT-gen1 base
+            further straightens the ODE trajectories beyond what OT alone achieves.
+            """
+        )
+    _out
+    return
+
+
+@app.cell
+def _(
+    mo,
+    trained_model_ot,
+    trained_model_ot_reflow,
+    trained_model_ot_rf_gen1,
+    trained_model_reflow,
+    trained_model_rf_gen1,
+    trained_model_vanilla,
+):
+    mo.md("#### Step-count MSE — all regimes (four-way comparison)")
+    _steps = [1, 2, 5, 10, 25, 50]
+    _curves_mse = {}
+    if trained_model_vanilla is not None:
+        _curves_mse["vanilla CFM"] = compute_step_count_mse(trained_model_vanilla, _steps, ref_steps=100)
+    if trained_model_ot is not None:
+        _curves_mse["OT-CFM"] = compute_step_count_mse(trained_model_ot, _steps, ref_steps=100)
+    if trained_model_rf_gen1 is not None:
+        _curves_mse["RF gen1"] = compute_step_count_mse(trained_model_rf_gen1, _steps, ref_steps=100)
+    if trained_model_reflow is not None:
+        _curves_mse["reflow (gen2)"] = compute_step_count_mse(trained_model_reflow, _steps, ref_steps=100)
+    if trained_model_ot_rf_gen1 is not None:
+        _curves_mse["OT-RF gen1"] = compute_step_count_mse(trained_model_ot_rf_gen1, _steps, ref_steps=100)
+    if trained_model_ot_reflow is not None:
+        _curves_mse["OT-reflow (gen2)"] = compute_step_count_mse(trained_model_ot_reflow, _steps, ref_steps=100)
+    if not _curves_mse:
+        _out = mo.md("_Train at least one model to see the step-count MSE comparison._")
+    else:
+        _out = plot_step_count_mse_multi(_steps, _curves_mse)
+    _out
+    return
+
+
+@app.cell
 def _(mo):
     mo.md("""
-    ### 8c. Three-way comparison — training curves, samples, table
+    ### 8c. Four-way comparison — training curves, samples, table
     """)
     return
 
 
 @app.cell
-def _(mo, train_losses_ot, train_losses_reflow, train_losses_vanilla):
+def _(
+    mo,
+    train_losses_ot,
+    train_losses_ot_reflow,
+    train_losses_reflow,
+    train_losses_vanilla,
+):
     _curves = {
         "vanilla CFM": train_losses_vanilla,
         "OT-CFM": train_losses_ot,
         "reflow (stage 2)": train_losses_reflow,
+        "OT-reflow (stage 2)": train_losses_ot_reflow,
     }
     if not any(_curves.values()):
         _out = mo.md("_Train at least one regime to see loss curves._")
@@ -1549,6 +1875,16 @@ def _(class_names, mo, trained_model_reflow):
     return
 
 
+@app.cell
+def _(class_names, mo, trained_model_ot_reflow):
+    if trained_model_ot_reflow is None:
+        _out = mo.md("_OT-reflow model not trained yet._")
+    else:
+        _out = plot_generated_grid(trained_model_ot_reflow, num_steps=50, class_names=class_names, title_prefix="OT-reflow samples")
+    _out
+    return
+
+
 @app.function
 def summarize_regime(name: str, model, train_losses: list, val_losses: list, x_te_arr: mx.array, y_te_arr: mx.array) -> dict:
     row = {"regime": name, "trained": model is not None}
@@ -1575,24 +1911,36 @@ def summarize_regime(name: str, model, train_losses: list, val_losses: list, x_t
 def _(
     mo,
     train_losses_ot,
+    train_losses_ot_reflow,
     train_losses_reflow,
     train_losses_vanilla,
     trained_model_ot,
+    trained_model_ot_reflow,
+    trained_model_ot_rf_gen1,
     trained_model_reflow,
     trained_model_vanilla,
     val_losses_ot,
+    val_losses_ot_reflow,
     val_losses_reflow,
     val_losses_vanilla,
     x_te,
     y_te,
 ):
-    if trained_model_vanilla is None and trained_model_ot is None and trained_model_reflow is None:
+    _all_none = (
+        trained_model_vanilla is None
+        and trained_model_ot is None
+        and trained_model_reflow is None
+        and trained_model_ot_reflow is None
+    )
+    if _all_none:
         _out = mo.md("_Train at least one regime to see the comparison table._")
     else:
         comparison_rows = [
             summarize_regime("vanilla CFM", trained_model_vanilla, train_losses_vanilla, val_losses_vanilla, x_te, y_te),
             summarize_regime("OT-CFM", trained_model_ot, train_losses_ot, val_losses_ot, x_te, y_te),
-            summarize_regime("reflow (stage 2)", trained_model_reflow, train_losses_reflow, val_losses_reflow, x_te, y_te),
+            summarize_regime("reflow (gen2)", trained_model_reflow, train_losses_reflow, val_losses_reflow, x_te, y_te),
+            summarize_regime("OT-RF gen1", trained_model_ot_rf_gen1, [], [], x_te, y_te),
+            summarize_regime("OT-reflow (gen2)", trained_model_ot_reflow, train_losses_ot_reflow, val_losses_ot_reflow, x_te, y_te),
         ]
         _out = mo.ui.table(comparison_rows)
     _out
@@ -1606,7 +1954,7 @@ def _(mo):
 
     - **Vanilla CFM** is the simplest and cheapest to train per step —
       no coupling, no ODE integration in the loop. Its ODE at inference
-      is typically the most curved of the three, so it needs many
+      is typically the most curved of the four, so it needs many
       Euler steps for good samples.
     - **OT-CFM** adds a per-minibatch balanced assignment
       (`O(B^3)`-ish for the exact Hungarian solver; runtime dominated
@@ -1618,7 +1966,14 @@ def _(mo):
       dataset build (`num_samples * num_steps` model evals). Its
       payoff is qualitatively different: it explicitly *straightens*
       the paths, so few-step Euler sampling degrades far less. This is
-      exactly what Section 8b measures.
+      measured in Section 8b.
+    - **OT-CFM gen1 + Reflow** combines both techniques. The OT
+      coupling at gen1 reduces trajectory crossing before reflow is
+      applied, giving the reflow stage higher-quality fixed pairs to
+      learn from. The total cost is OT-CFM gen1 training + ODE dataset
+      build + reflow gen2 training. Whether the OT gen1 base leads to
+      straighter gen2 paths than vanilla gen1 + reflow is exactly what
+      the OT-reflow straightness cells in Section 8b quantify.
     """)
     return
 
@@ -1711,6 +2066,39 @@ def _(mo, save_reflow_btn, save_reflow_filename_ui, trained_model_reflow):
         _save_path = _models_dir / save_reflow_filename_ui.value
         trained_model_reflow.save_weights(str(_save_path))
         _out = mo.md(f"**Saved!** Reflow weights written to `{_save_path}`.")
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    save_ot_reflow_filename_ui = mo.ui.text(
+        value="cifar10_dit_rcfm_ot_reflow_v1.safetensors",
+        label="OT-reflow filename (models/)",
+        full_width=True,
+    )
+    save_ot_reflow_btn = mo.ui.run_button(label="Save OT-Reflow Model")
+    mo.vstack([save_ot_reflow_filename_ui, save_ot_reflow_btn])
+    return save_ot_reflow_btn, save_ot_reflow_filename_ui
+
+
+@app.cell
+def _(
+    mo,
+    save_ot_reflow_btn,
+    save_ot_reflow_filename_ui,
+    trained_model_ot_reflow,
+):
+    if trained_model_ot_reflow is None:
+        _out = mo.md("_Train the OT-reflow model first (Section 5d) before saving._")
+    elif not save_ot_reflow_btn.value:
+        _out = mo.md("Click **Save OT-Reflow Model** to write weights to `models/`.")
+    else:
+        _models_dir = Path(__file__).resolve().parent.parent / "models"
+        _models_dir.mkdir(parents=True, exist_ok=True)
+        _save_path = _models_dir / save_ot_reflow_filename_ui.value
+        trained_model_ot_reflow.save_weights(str(_save_path))
+        _out = mo.md(f"**Saved!** OT-reflow weights written to `{_save_path}`.")
     _out
     return
 
