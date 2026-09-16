@@ -16,14 +16,16 @@ with app.setup:
     from mlx.data.datasets.libritts_r import load_libritts_r_tarfile
 
     import numpy as np
-    from scipy.optimize import linear_sum_assignment
-    from scipy.signal import resample_poly
     import soundfile as sf
     import librosa
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    # The flow decoder downsamples time twice (stride 2 each), so every
+    # mel length it sees must be a multiple of 4.
+    FRAME_MULTIPLE = 4
 
 
 @app.cell
@@ -36,36 +38,58 @@ def _():
 @app.cell
 def _(mo):
     mo.md("""
-    # Text-to-Speech with a Diffusion Transformer trained via OT-Rectified Conditional Flow Matching on LibriTTS-R (MLX)
+    # Text-to-Speech on LibriTTS-R with a Matcha-style OT-CFM Acoustic Model (MLX)
 
     ## Research Goal
 
-    Train a **text-conditioned Diffusion Transformer (DiT)** to synthesize
-    speech mel-spectrograms from character-level text prompts using
-    **rectified conditional flow matching with minibatch optimal-transport
-    (OT) coupling** on the **LibriTTS-R** corpus (loaded via `mlx.data`).
+    Train a **text-conditioned acoustic model** that synthesizes speech
+    mel-spectrograms from character-level transcripts on **LibriTTS-R**,
+    using **optimal-transport conditional flow matching (OT-CFM)** as the
+    generative objective — the same recipe as **Matcha-TTS** (Mehta et
+    al., 2024), which is itself the flow-matching successor of Grad-TTS.
 
-    **Scope note — no voice cloning / speaker conditioning.** The model
-    conditions on text only. Speaker identity is treated as an untargeted
-    latent (the model picks an averaged voice-like prior); we intentionally
-    do **not** embed speaker id or a reference-audio embedding into the
-    transformer.
+    ### Why the previous DiT design was replaced
 
-    Griffin-Lim (via `librosa.feature.inverse.mel_to_audio`) is used as a
-    classical, non-neural vocoder to turn generated log-mels back into
-    audible waveforms — this bounds the achievable audio quality of the
-    demonstration and is by design.
+    The first version of this notebook used an image-style Diffusion
+    Transformer: mel frames grouped into 4-frame patches, text prepended
+    as a prefix, and a naive *uniform* stretch of the text across the
+    frame axis. That design has three structural defects that no amount
+    of training fixes:
+
+    1. **Patch-seam discontinuities.** Each 4-frame patch was produced
+       by an independent linear "unpatchify" projection, so adjacent
+       patches shared no output computation — the generated mels were
+       visibly discontinuous at every patch boundary. The new decoder is
+       a **frame-level 1-D convolutional U-Net** (with transformer
+       blocks at the bottleneck); overlapping convolution kernels make
+       the output continuous by construction.
+    2. **Wrong alignment prior.** Uniformly stretching characters over
+       frames assumes every character is spoken for the same duration.
+       Real durations vary several-fold ("a" vs. a pause vs. "sh").
+       The new model learns alignment during training with **Monotonic
+       Alignment Search (MAS)** — the Viterbi-style dynamic program from
+       Glow-TTS/Grad-TTS — and trains a **duration predictor** so that
+       inference can size each character's segment correctly.
+    3. **Unconditioned speaker averaging.** LibriTTS-R is multi-speaker;
+       without a speaker signal the model must average over every voice,
+       which blurs formants into noise. The new model conditions the
+       encoder, duration predictor, and decoder on a **learned speaker
+       embedding**, and inference lets you pick any training speaker.
+
+    Griffin-Lim (`librosa.feature.inverse.mel_to_audio`) remains the
+    vocoder — classical and artefact-prone, but sufficient to judge
+    intelligibility once the mels themselves are sharp.
 
     ### Notebook Outline
 
     1. Title & research goal (this cell)
     2. Data exploration
-    3. Dataset creation / preprocessing (how to prep a voice dataset for TTS)
-    4. Model definition
-    5. Training (OT-CFM with padding masks + text-prefix conditioning)
+    3. Dataset creation / preprocessing
+    4. Model definition (encoder + MAS + duration predictor + flow decoder)
+    5. Training (OT-CFM + prior loss + duration loss)
     6. Hyperparameter search (optional, checkbox-gated)
     7. Validation
-    8. Results — loss curves, Euler ODE progression, step-count MSE
+    8. Results — losses, learned durations, ODE progression, step-count MSE
     9. Save trained model
     10. Text-to-Speech inference (interactive)
     """)
@@ -174,7 +198,7 @@ def _(mo):
         label="LibriTTS-R split",
     )
     max_samples_ui = mo.ui.number(
-        value=200, label="Max utterances to load"
+        value=4000, label="Max utterances to load"
     )
     target_sr_ui = mo.ui.dropdown(
         options={"16000": 16000, "22050": 22050, "24000": 24000},
@@ -186,8 +210,11 @@ def _(mo):
         [
             mo.md(
                 "Loading `dev-clean` triggers a one-time ~1.4 GB download to "
-                "`../data/libritts_r/`. `max_samples` caps how many "
-                "utterances are decoded and mel-spectrogrammed for this run."
+                "`../data/libritts_r/`. Data volume is the binding constraint "
+                "for intelligibility, so the default now loads **4000** "
+                "utterances (~6 h of audio before length filtering). Decoding "
+                "and mel extraction for that many clips takes a few minutes "
+                "and ~3 GB of RAM."
             ),
             mo.hstack([split_ui, max_samples_ui, target_sr_ui]),
             load_data_btn,
@@ -251,8 +278,18 @@ def compute_log_mel(
     hop_length: int = 256,
     win_length: int = 1024,
     fmin: float = 0.0,
-    fmax: float | None = None,
+    fmax: float = 8000.0,
 ) -> np.ndarray:
+    """Magnitude (power=1) mel spectrogram compressed with a natural log.
+
+    The previous version used ``power_to_db(ref=np.max)``, which
+    normalizes every clip by its own peak — the same phoneme then had a
+    different training target depending on the loudness of its clip, a
+    hidden supervision inconsistency. ``log(mel)`` with a fixed floor is
+    absolute, so targets are consistent across the whole corpus, and it
+    inverts exactly with ``exp`` before Griffin-Lim. ``fmax=8000`` is the
+    standard TTS band (Tacotron/Matcha) at 22.05 kHz.
+    """
     mel = librosa.feature.melspectrogram(
         y=waveform.astype(np.float32),
         sr=sample_rate,
@@ -261,10 +298,10 @@ def compute_log_mel(
         hop_length=hop_length,
         win_length=win_length,
         fmin=fmin,
-        fmax=fmax if fmax is not None else sample_rate / 2.0,
-        power=2.0,
+        fmax=fmax,
+        power=1.0,
     )
-    return librosa.power_to_db(mel, ref=np.max).astype(np.float32)
+    return np.log(np.clip(mel, 1e-5, None)).astype(np.float32)
 
 
 @app.function
@@ -280,7 +317,7 @@ def plot_log_mel(log_mel: np.ndarray, sample_rate: int, hop_length: int, title: 
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Mel bin")
     ax.set_title(title)
-    fig.colorbar(im, ax=ax, format="%+2.0f dB")
+    fig.colorbar(im, ax=ax, label="ln magnitude")
     fig.tight_layout()
     return fig
 
@@ -318,7 +355,7 @@ def plot_speaker_histogram(speakers: list, top_k: int = 20):
     ax.set_xticks(range(len(order)))
     ax.set_xticklabels(unique[order], rotation=60, ha="right", fontsize=7)
     ax.set_ylabel("Utterance count")
-    ax.set_title(f"Top {top_k} speakers by utterance count (illustration only — NOT used for conditioning)")
+    ax.set_title(f"Top {top_k} speakers by utterance count (speaker id IS a conditioning input)")
     ax.grid(True, alpha=0.3, axis="y")
     fig.tight_layout()
     return fig
@@ -409,38 +446,34 @@ def _(mo, raw_samples):
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 3 — Dataset Creation / Preprocessing (a general voice-dataset TTS pipeline)
+    ## Section 3 — Dataset Creation / Preprocessing
 
-    A typical text-to-speech preprocessing pipeline — not specific to
-    LibriTTS-R — has these stages, all of which we implement here:
+    The TTS preprocessing pipeline, stage by stage:
 
-    1. **Resampling** to a single fixed sample rate (`22050 Hz` here).
-       Model expects consistent time resolution; the source corpus may
-       mix rates. We use `mlx.data`'s built-in `load_audio(sample_rate=...)`
-       resampler.
-    2. **Mel-spectrogram extraction (log-mel)**, not raw waveform, because
-       (a) it is a compact perceptually-motivated representation
-       (`n_mels=80` bins vs. thousands of samples per second), (b) it
-       decouples the *content* model (this DiT) from the *waveform*
-       generation problem (handled by a vocoder — Griffin-Lim here),
-       (c) log-compressing the mel power (`power_to_db`) matches the
-       roughly-Gaussian statistics that a diffusion/flow-matching model
-       expects.
-    3. **Text normalization & tokenization** — LibriTTS-R already ships
-       *normalized* transcripts (digits spelled out, common
-       abbreviations expanded, most punctuation removed). We tokenize
-       character-by-character with a small self-contained vocabulary
-       (a-z, space, apostrophe, a few punctuation marks, `PAD`, `EOS`).
-    4. **Length handling — padding + masking**. Utterances have variable
-       duration. We fix a `max_mel_frames` and `max_text_len` for
-       batching; shorter samples are right-padded with zeros and a
-       boolean valid-mask is carried alongside. The attention layers
-       and the flow-matching loss both consume this mask so that padded
-       positions are ignored.
-    5. **Global mean/std normalization of log-mel** so the training
-       target has roughly zero mean and unit variance, matching the
-       Gaussian prior `x_0 ~ N(0, I)`. The inverse transform is applied
-       before Griffin-Lim vocoding at inference.
+    1. **Resampling** to a single fixed sample rate (`22050 Hz`) via
+       `mlx.data`'s built-in `load_audio(sample_rate=...)`.
+    2. **Log-mel extraction** — magnitude (power=1) mel with a natural-log
+       compression and a fixed `1e-5` floor. Absolute (no per-clip peak
+       reference), so the same sound always maps to the same target, and
+       exactly invertible with `exp` before Griffin-Lim vocoding.
+       `fmax=8000 Hz` matches standard TTS practice.
+    3. **Text tokenization** — LibriTTS-R ships normalized transcripts;
+       we tokenize per character with a small vocabulary (`PAD`=0,
+       `EOS`=1, then the observed characters). `EOS` conveniently absorbs
+       trailing silence during alignment.
+    4. **Speaker ids** — each utterance carries its LibriTTS speaker,
+       mapped to an integer index for the learned speaker embedding.
+    5. **Length handling** — utterances longer than `max_mel_frames` (or
+       with transcripts longer than `max_text_len`) are **skipped, not
+       truncated**. Truncation with a proportionally cropped transcript
+       poisons the alignment search with mismatched (text, audio) pairs;
+       dropping a minority of long clips is strictly safer supervision.
+       Kept utterances are right-padded with zeros plus a validity mask
+       consumed by attention, the losses, and MAS.
+    6. **Global mean/std normalization** of the log-mel so the flow
+       target is roughly zero-mean unit-variance, matching the Gaussian
+       prior `x_0 ~ N(0, I)`. The corpus min/max are also stored so
+       inference can clamp generated mels back into the trained domain.
     """)
     return
 
@@ -461,7 +494,8 @@ def build_char_vocab(transcripts: list) -> dict:
 @app.function
 def text_to_ids(text: str, vocab: dict, max_len: int) -> tuple:
     lowered = text.lower()
-    ids = [vocab.get(c, 0) for c in lowered]
+    space_id = vocab.get(" ", 0)
+    ids = [vocab.get(c, space_id) for c in lowered]
     ids = ids[: max_len - 1] + [vocab["<eos>"]]
     length = len(ids)
     if length < max_len:
@@ -470,25 +504,21 @@ def text_to_ids(text: str, vocab: dict, max_len: int) -> tuple:
 
 
 @app.function
-def compute_mel_bank(
-    samples: list,
-    n_mels: int = 80,
-    n_fft: int = 1024,
-    hop_length: int = 256,
-    win_length: int = 1024,
-) -> list:
-    mels: list = []
-    for s in samples:
-        m = compute_log_mel(
-            s["waveform"],
-            sample_rate=s["sample_rate"],
-            n_mels=n_mels,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-        )
-        mels.append(m)
-    return mels
+def ids_to_chars(ids: np.ndarray, vocab: dict) -> list:
+    """Decode a row of token ids back to display characters (stops at PAD)."""
+    inv = {v: k for k, v in vocab.items()}
+    out: list = []
+    for i in ids:
+        ch = inv.get(int(i), "?")
+        if ch == "<pad>":
+            break
+        if ch == "<eos>":
+            out.append("$")
+        elif ch == " ":
+            out.append("␣")
+        else:
+            out.append(ch)
+    return out
 
 
 @app.function
@@ -516,50 +546,76 @@ def build_tensor_dataset(
     win_length: int,
     max_mel_frames: int,
     max_text_len: int,
-    patch_size: int,
 ) -> dict:
-    """Return dict with keys: ``mel`` (B, T, M), ``mel_mask`` (B, T),
-    ``text_ids`` (B, L), ``text_mask`` (B, L), plus normalization
-    stats and helpers. ``max_mel_frames`` is rounded up to a multiple
-    of ``patch_size`` so patchify is exact."""
-    max_frames_pad = round_up_to_multiple(max_mel_frames, patch_size)
-    raw_mels = compute_mel_bank(
-        samples,
-        n_mels=n_mels,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        win_length=win_length,
-    )
-    mel_mean, mel_std = compute_mel_stats(raw_mels)
-    n = len(samples)
+    """Return dict with keys ``mel`` (B, T, M), ``mel_mask`` (B, T),
+    ``text_ids`` (B, L), ``text_mask`` (B, L), ``spk_ids`` (B,), plus
+    normalization stats and the speaker-name table. Utterances longer
+    than the frame or text budget (or shorter than a sane minimum) are
+    skipped rather than truncated."""
+    max_frames_pad = round_up_to_multiple(max_mel_frames, FRAME_MULTIPLE)
+    speakers = sorted(set(s["speaker"] for s in samples))
+    spk_to_idx = {name: i for i, name in enumerate(speakers)}
+    kept_mels: list = []
+    kept_meta: list = []
+    n_skipped = 0
+    for s in samples:
+        m = compute_log_mel(
+            s["waveform"],
+            sample_rate=s["sample_rate"],
+            n_mels=n_mels,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            win_length=win_length,
+        )
+        num_frames = m.shape[1]
+        text_len = len(s["transcript"]) + 1  # +1 for EOS
+        if (
+            num_frames > max_frames_pad
+            or num_frames < 32
+            or text_len > max_text_len
+            or text_len > num_frames
+        ):
+            n_skipped += 1
+            continue
+        kept_mels.append(m)
+        kept_meta.append(s)
+    mel_mean, mel_std = compute_mel_stats(kept_mels)
+    mel_min = float(min(m.min() for m in kept_mels))
+    mel_max = float(max(m.max() for m in kept_mels))
+    n = len(kept_mels)
     mel_arr = np.zeros((n, max_frames_pad, n_mels), dtype=np.float32)
     mel_mask = np.zeros((n, max_frames_pad), dtype=np.float32)
     text_ids = np.zeros((n, max_text_len), dtype=np.int32)
     text_mask = np.zeros((n, max_text_len), dtype=np.float32)
-    kept = 0
-    for i, s in enumerate(samples):
-        m = raw_mels[i]
-        num_frames = min(m.shape[1], max_frames_pad)
-        m_use = ((m[:, :num_frames] - mel_mean) / mel_std).T
-        mel_arr[i, :num_frames, :] = m_use
+    spk_ids = np.zeros((n,), dtype=np.int32)
+    for i, (m, s) in enumerate(zip(kept_mels, kept_meta)):
+        num_frames = m.shape[1]
+        mel_arr[i, :num_frames, :] = ((m - mel_mean) / mel_std).T
         mel_mask[i, :num_frames] = 1.0
         ids, length = text_to_ids(s["transcript"], vocab, max_text_len)
         text_ids[i] = ids
         text_mask[i, :length] = 1.0
-        kept += 1
+        spk_ids[i] = spk_to_idx[s["speaker"]]
     return {
-        "mel": mel_arr[:kept],
-        "mel_mask": mel_mask[:kept],
-        "text_ids": text_ids[:kept],
-        "text_mask": text_mask[:kept],
+        "mel": mel_arr,
+        "mel_mask": mel_mask,
+        "text_ids": text_ids,
+        "text_mask": text_mask,
+        "spk_ids": spk_ids,
+        "speakers": speakers,
+        "n_skipped": n_skipped,
         "mel_mean": mel_mean,
         "mel_std": mel_std,
+        "mel_min": mel_min,
+        "mel_max": mel_max,
         "max_mel_frames": max_frames_pad,
         "max_text_len": max_text_len,
         "hop_length": hop_length,
         "n_mels": n_mels,
         "n_fft": n_fft,
         "win_length": win_length,
+        "fmin": 0.0,
+        "fmax": 8000.0,
     }
 
 
@@ -578,13 +634,14 @@ def split_tensor_dataset(dataset: dict, val_fraction: float = 0.1, seed: int = 4
             "mel_mask": mx.array(dataset["mel_mask"][idx]),
             "text_ids": mx.array(dataset["text_ids"][idx]),
             "text_mask": mx.array(dataset["text_mask"][idx]),
+            "spk_ids": mx.array(dataset["spk_ids"][idx]),
         }
 
     return _slice(tr_idx), _slice(val_idx)
 
 
 @app.function
-def iter_batches(split: dict, batch_size: int = 8, shuffle: bool = True) -> list:
+def iter_batches(split: dict, batch_size: int = 16, shuffle: bool = True) -> list:
     n = split["mel"].shape[0]
     if shuffle:
         idx_np = np.random.permutation(n).astype(np.int32)
@@ -600,6 +657,7 @@ def iter_batches(split: dict, batch_size: int = 8, shuffle: bool = True) -> list
                 "mel_mask": split["mel_mask"][b_idx],
                 "text_ids": split["text_ids"][b_idx],
                 "text_mask": split["text_mask"][b_idx],
+                "spk_ids": split["spk_ids"][b_idx],
             }
         )
     return batches
@@ -623,22 +681,21 @@ def _(mo):
         label="n_fft / win_length",
     )
     max_mel_frames_ui = mo.ui.slider(
-        64, 1024, value=384, step=32, label="max_mel_frames"
+        256, 1024, value=768, step=32, label="max_mel_frames"
     )
     max_text_len_ui = mo.ui.slider(
-        32, 512, value=192, step=16, label="max_text_len"
-    )
-    patch_size_ui = mo.ui.dropdown(
-        options={"1": 1, "2": 2, "4": 4, "8": 8},
-        value="4",
-        label="patch_size (mel frames per token)",
+        64, 512, value=256, step=16, label="max_text_len"
     )
     build_ds_btn = mo.ui.run_button(label="Build tensor dataset")
     mo.vstack(
         [
-            mo.md("### Preprocessing hyperparameters"),
+            mo.md(
+                "### Preprocessing hyperparameters\n"
+                "`max_mel_frames=768` keeps utterances up to ~8.9 s at "
+                "hop 256 / 22.05 kHz; longer clips are skipped."
+            ),
             mo.hstack([n_mels_ui, hop_length_ui, n_fft_ui]),
-            mo.hstack([max_mel_frames_ui, max_text_len_ui, patch_size_ui]),
+            mo.hstack([max_mel_frames_ui, max_text_len_ui]),
             build_ds_btn,
         ]
     )
@@ -649,7 +706,6 @@ def _(mo):
         max_text_len_ui,
         n_fft_ui,
         n_mels_ui,
-        patch_size_ui,
     )
 
 
@@ -662,7 +718,6 @@ def _(
     mo,
     n_fft_ui,
     n_mels_ui,
-    patch_size_ui,
     raw_samples,
 ):
     tensor_dataset = None
@@ -684,18 +739,18 @@ def _(
             win_length=int(n_fft_ui.value),
             max_mel_frames=int(max_mel_frames_ui.value),
             max_text_len=int(max_text_len_ui.value),
-            patch_size=int(patch_size_ui.value),
         )
         mo.output.replace(
             mo.md(
                 f"""
                 Built tensor dataset:
                 - `mel` shape: `{tensor_dataset["mel"].shape}` (dtype `float32`)
-                - `mel_mask` shape: `{tensor_dataset["mel_mask"].shape}`
                 - `text_ids` shape: `{tensor_dataset["text_ids"].shape}` (dtype `int32`)
-                - `text_mask` shape: `{tensor_dataset["text_mask"].shape}`
+                - Kept `{tensor_dataset["mel"].shape[0]}` utterances, skipped `{tensor_dataset["n_skipped"]}` (too long/short)
+                - Speakers: `{len(tensor_dataset["speakers"])}` (conditioning input)
                 - Vocab size: `{len(char_vocab)}` (PAD=0, EOS=1)
-                - Global log-mel mean/std: `{tensor_dataset["mel_mean"]:.3f}` / `{tensor_dataset["mel_std"]:.3f}`
+                - Log-mel mean/std: `{tensor_dataset["mel_mean"]:.3f}` / `{tensor_dataset["mel_std"]:.3f}`; range `[{tensor_dataset["mel_min"]:.2f}, {tensor_dataset["mel_max"]:.2f}]`
+                - Mean valid frames: `{tensor_dataset["mel_mask"].sum(axis=1).mean():.0f}` of `{tensor_dataset["mel"].shape[1]}` budget
                 """
             )
         )
@@ -707,7 +762,7 @@ def _(mo, tensor_dataset):
     if tensor_dataset is None:
         _out = mo.md("_Build the tensor dataset above first to see a batch check._")
     else:
-        _tr, _va = split_tensor_dataset(tensor_dataset, val_fraction=0.15)
+        _tr, _va = split_tensor_dataset(tensor_dataset, val_fraction=0.1)
         _sample_batches = iter_batches(_tr, batch_size=4, shuffle=True)
         _b = _sample_batches[0]
         _out = mo.md(
@@ -720,6 +775,7 @@ def _(mo, tensor_dataset):
             | `mel_mask` | `{tuple(_b["mel_mask"].shape)}` | `{_b["mel_mask"].dtype}` |
             | `text_ids` | `{tuple(_b["text_ids"].shape)}` | `{_b["text_ids"].dtype}` |
             | `text_mask` | `{tuple(_b["text_mask"].shape)}` | `{_b["text_mask"].dtype}` |
+            | `spk_ids` | `{tuple(_b["spk_ids"].shape)}` | `{_b["spk_ids"].dtype}` |
 
             Total training utterances: `{_tr["mel"].shape[0]}`, validation: `{_va["mel"].shape[0]}`.
             """
@@ -733,17 +789,51 @@ def _(mo):
     mo.md("""
     ## Section 4 — Model Definition
 
-    A **text-conditioned Diffusion Transformer**. Text tokens (character
-    embeddings + learned positional embedding) are prepended as a
-    context prefix to the noised mel-frame patch tokens; the whole
-    concatenated sequence is processed by a stack of `DiTBlockV1`s with
-    AdaLN gating on the diffusion timestep. This "in-context
-    conditioning" avoids adding a separate cross-attention module and
-    lets the same self-attention layer learn text-audio alignment. The
-    attention layer receives an additive key-padding mask so padded
-    text and padded mel positions cannot leak into other positions.
+    The model follows the **Grad-TTS / Matcha-TTS** template, with three
+    trainable components sharing one width `dim`:
+
+    1. **Character encoder** — embedding + sinusoidal positions, a 3-layer
+       convolutional prenet (local phonetic context), then transformer
+       blocks whose AdaLN is conditioned on the **speaker embedding**.
+       A linear head projects each character state to a mel-space mean
+       vector `μ_j ∈ R^{n_mels}` — a rough per-character spectral target.
+    2. **Duration predictor** — two masked convolutions + linear head
+       predicting `log(duration)` per character. Its input is
+       `stop_gradient`-ed so duration errors cannot corrupt the encoder
+       (standard practice from FastSpeech/Glow-TTS).
+    3. **Flow-matching decoder** — a frame-level **1-D convolutional
+       U-Net**: two stride-2 downsampling stages of FiLM-conditioned
+       residual conv blocks, transformer (DiT) blocks at the T/4
+       bottleneck, then two upsampling stages with skip connections and
+       a smoothing output conv. Input is `concat(x_t, μ_aligned)`;
+       conditioning (timestep + speaker) enters every block. Because the
+       receptive field overlaps everywhere and upsampling is
+       nearest-neighbor + conv, the output has **no patch seams** — the
+       defect that motivated this redesign. It is also fully
+       **length-flexible**: no learned absolute positions, so inference
+       can run at the exact predicted utterance length.
+
+    **Alignment** is not a module but a training-time algorithm:
+    **Monotonic Alignment Search** finds, for each (text, mel) pair, the
+    monotonic frame→character assignment maximizing the likelihood of the
+    mel under `N(μ_j, I)` — a Viterbi pass that is exact and fast. The
+    resulting durations supervise the duration predictor, and the aligned
+    `μ` sequence conditions the decoder. At inference the duration
+    predictor replaces MAS.
     """)
     return
+
+
+@app.function
+def sinusoidal_positions(length: int, dim: int) -> mx.array:
+    """Fixed sin/cos positional encodings, computed for any length so the
+    model stays length-flexible at inference."""
+    half = dim // 2
+    freqs = mx.exp(
+        -math.log(10000.0) * mx.arange(half, dtype=mx.float32) / max(half, 1)
+    )
+    pos = mx.arange(length, dtype=mx.float32)[:, None] * freqs[None, :]
+    return mx.concatenate([mx.sin(pos), mx.cos(pos)], axis=-1)
 
 
 @app.class_definition
@@ -773,9 +863,7 @@ class SinusoidalTimestepEmbeddingV1(nn.Module):
 class AdaptiveLayerNormV1(nn.Module):
     """adaLN-Zero (Peebles & Xie, DiT). Predicts scale/shift for the
     norm plus a residual-branch gate, with the projection zero-initialized
-    so every block starts as an identity function. This is what lets a
-    deep DiT stack train stably instead of the residual variance
-    compounding layer over layer from random modulation at step zero."""
+    so every block starts as an identity function."""
 
     def __init__(self, dim: int = 256, cond_dim: int = 256):
         super().__init__()
@@ -787,35 +875,6 @@ class AdaptiveLayerNormV1(nn.Module):
     def __call__(self, x: mx.array, cond: mx.array) -> tuple:
         scale, shift, gate = mx.split(self.proj(nn.silu(cond))[:, None, :], 3, axis=-1)
         return self.norm(x) * (1.0 + scale) + shift, gate
-
-
-@app.class_definition
-class MelPatchifyV1(nn.Module):
-    def __init__(self, patch_size: int = 4, n_mels: int = 80, embed_dim: int = 256):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_mels = n_mels
-        self.proj = nn.Linear(patch_size * n_mels, embed_dim)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        b, t, m = x.shape
-        n_tokens = t // self.patch_size
-        grouped = x.reshape(b, n_tokens, self.patch_size * m)
-        return self.proj(grouped)
-
-
-@app.class_definition
-class MelUnpatchifyV1(nn.Module):
-    def __init__(self, patch_size: int = 4, n_mels: int = 80, embed_dim: int = 256):
-        super().__init__()
-        self.patch_size = patch_size
-        self.n_mels = n_mels
-        self.proj = nn.Linear(embed_dim, patch_size * n_mels)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        b, n_tokens, _ = x.shape
-        raw = self.proj(x)
-        return raw.reshape(b, n_tokens * self.patch_size, self.n_mels)
 
 
 @app.class_definition
@@ -837,92 +896,205 @@ class DiTBlockV1(nn.Module):
 
 
 @app.class_definition
-class TextEncoderV1(nn.Module):
+class CharacterEncoderV1(nn.Module):
+    """Character embedding + conv prenet + speaker-conditioned transformer."""
+
     def __init__(
         self,
         vocab_size: int = 40,
-        embed_dim: int = 256,
-        max_text_len: int = 192,
+        dim: int = 256,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        conv_kernel: int = 5,
     ):
         super().__init__()
-        self.token_embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_embed = mx.zeros((1, max_text_len, embed_dim))
+        self.dim = dim
+        self.token_embed = nn.Embedding(vocab_size, dim)
+        pad = conv_kernel // 2
+        self.prenet_convs = [
+            nn.Conv1d(dim, dim, conv_kernel, padding=pad) for _ in range(3)
+        ]
+        self.prenet_norms = [nn.LayerNorm(dim) for _ in range(3)]
+        self.blocks = [
+            DiTBlockV1(dim, num_heads, 4 * dim, dim) for _ in range(num_layers)
+        ]
+        self.final_norm = nn.LayerNorm(dim)
 
-    def __call__(self, text_ids: mx.array) -> mx.array:
-        return self.token_embed(text_ids) + self.pos_embed[:, : text_ids.shape[1], :]
+    def __call__(self, text_ids: mx.array, text_mask: mx.array, spk_emb: mx.array) -> mx.array:
+        m3 = text_mask[:, :, None]
+        x = self.token_embed(text_ids) + sinusoidal_positions(text_ids.shape[1], self.dim)[None]
+        x = x * m3
+        for conv, norm in zip(self.prenet_convs, self.prenet_norms):
+            x = (x + nn.gelu(conv(norm(x) * m3))) * m3
+        x = x + spk_emb[:, None, :]
+        attn_mask = (1.0 - text_mask)[:, None, None, :] * -1.0e9
+        for block in self.blocks:
+            x = block(x, spk_emb, attn_mask=attn_mask)
+        return self.final_norm(x) * m3
 
 
 @app.class_definition
-class TextToSpeechDiTV1(nn.Module):
+class DurationPredictorV1(nn.Module):
+    """Two masked convolutions + linear head predicting log-duration per
+    character. Callers pass a stop-gradient'ed encoder state so duration
+    error never backpropagates into the encoder."""
+
+    def __init__(self, dim: int = 256, kernel: int = 3):
+        super().__init__()
+        pad = kernel // 2
+        self.conv1 = nn.Conv1d(dim, dim, kernel, padding=pad)
+        self.norm1 = nn.LayerNorm(dim)
+        self.conv2 = nn.Conv1d(dim, dim, kernel, padding=pad)
+        self.norm2 = nn.LayerNorm(dim)
+        self.out = nn.Linear(dim, 1)
+
+    def __call__(self, h: mx.array, text_mask: mx.array) -> mx.array:
+        m3 = text_mask[:, :, None]
+        x = nn.gelu(self.norm1(self.conv1(h * m3))) * m3
+        x = nn.gelu(self.norm2(self.conv2(x))) * m3
+        return self.out(x)[:, :, 0]
+
+
+@app.class_definition
+class ResConvBlockV1(nn.Module):
+    """FiLM-conditioned residual 1-D conv block (channels-last)."""
+
+    def __init__(self, dim: int = 256, cond_dim: int = 256, kernel: int = 5):
+        super().__init__()
+        pad = kernel // 2
+        self.norm1 = nn.LayerNorm(dim)
+        self.conv1 = nn.Conv1d(dim, dim, kernel, padding=pad)
+        self.norm2 = nn.LayerNorm(dim)
+        self.conv2 = nn.Conv1d(dim, dim, kernel, padding=pad)
+        self.film = nn.Linear(cond_dim, 2 * dim)
+
+    def __call__(self, x: mx.array, cond: mx.array, mask3: mx.array) -> mx.array:
+        scale, shift = mx.split(self.film(nn.silu(cond))[:, None, :], 2, axis=-1)
+        h = nn.gelu(self.conv1(self.norm1(x) * mask3))
+        h = self.norm2(h) * (1.0 + scale) + shift
+        h = nn.gelu(self.conv2(h * mask3))
+        return (x + h) * mask3
+
+
+@app.class_definition
+class FlowDecoderV1(nn.Module):
+    """Frame-level 1-D U-Net velocity field for OT-CFM.
+
+    concat(x_t, mu_aligned) -> down x2 (stride-2) -> DiT blocks at T/4
+    -> up x2 with skip connections -> smoothing conv head. FiLM/AdaLN
+    conditioning on (timestep + speaker) in every block. No learned
+    absolute positions, so any length divisible by FRAME_MULTIPLE works.
+    """
+
     def __init__(
         self,
-        vocab_size: int = 40,
         n_mels: int = 80,
-        patch_size: int = 4,
-        max_mel_frames: int = 384,
-        max_text_len: int = 192,
-        embed_dim: int = 256,
-        num_heads: int = 8,
-        mlp_dim: int = 512,
-        num_layers: int = 6,
+        dim: int = 256,
+        num_heads: int = 4,
+        mid_layers: int = 2,
+        blocks_per_stage: int = 2,
+        kernel: int = 5,
     ):
         super().__init__()
-        assert max_mel_frames % patch_size == 0, "max_mel_frames must be divisible by patch_size"
         self.n_mels = n_mels
-        self.patch_size = patch_size
-        self.max_mel_frames = max_mel_frames
-        self.max_text_len = max_text_len
-        self.num_mel_tokens = max_mel_frames // patch_size
-        self.embed_dim = embed_dim
-        self.text_encoder = TextEncoderV1(vocab_size, embed_dim, max_text_len)
-        self.patchify = MelPatchifyV1(patch_size, n_mels, embed_dim)
-        self.mel_pos_embed = mx.zeros((1, self.num_mel_tokens, embed_dim))
+        self.dim = dim
+        self.in_proj = nn.Linear(2 * n_mels, dim)
         self.time_embed = nn.Sequential(
-            SinusoidalTimestepEmbeddingV1(embed_dim),
-            nn.Linear(embed_dim, embed_dim),
+            SinusoidalTimestepEmbeddingV1(dim),
+            nn.Linear(dim, dim),
             nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(dim, dim),
         )
-        self.blocks = [
-            DiTBlockV1(embed_dim, num_heads, mlp_dim, embed_dim)
-            for _ in range(num_layers)
+        self.spk_proj = nn.Linear(dim, dim)
+        self.down1_blocks = [ResConvBlockV1(dim, dim, kernel) for _ in range(blocks_per_stage)]
+        self.down1_pool = nn.Conv1d(dim, dim, 4, stride=2, padding=1)
+        self.down2_blocks = [ResConvBlockV1(dim, dim, kernel) for _ in range(blocks_per_stage)]
+        self.down2_pool = nn.Conv1d(dim, dim, 4, stride=2, padding=1)
+        self.mid_blocks = [
+            DiTBlockV1(dim, num_heads, 4 * dim, dim) for _ in range(mid_layers)
         ]
-        self.final_norm = nn.LayerNorm(embed_dim)
-        self.unpatchify = MelUnpatchifyV1(patch_size, n_mels, embed_dim)
+        self.up2_conv = nn.Conv1d(dim, dim, 3, padding=1)
+        self.up2_fuse = nn.Linear(2 * dim, dim)
+        self.up2_blocks = [ResConvBlockV1(dim, dim, kernel) for _ in range(blocks_per_stage)]
+        self.up1_conv = nn.Conv1d(dim, dim, 3, padding=1)
+        self.up1_fuse = nn.Linear(2 * dim, dim)
+        self.up1_blocks = [ResConvBlockV1(dim, dim, kernel) for _ in range(blocks_per_stage)]
+        self.out_norm = nn.LayerNorm(dim)
+        self.out_conv = nn.Conv1d(dim, dim, 3, padding=1)
+        self.out_proj = nn.Linear(dim, n_mels)
 
     def __call__(
         self,
         x_t: mx.array,
         t: mx.array,
-        text_ids: mx.array,
-        text_mask: mx.array,
+        mu_frame: mx.array,
+        spk_emb: mx.array,
         mel_mask: mx.array,
     ) -> mx.array:
-        text_emb = self.text_encoder(text_ids)
-        mel_tokens = self.patchify(x_t) + self.mel_pos_embed
-        h = mx.concatenate([text_emb, mel_tokens], axis=1)
-        cond = self.time_embed(t)
-        attn_mask = build_attention_mask(text_mask, mel_mask, self.patch_size)
-        for block in self.blocks:
-            h = block(h, cond, attn_mask=attn_mask)
-        h = self.final_norm(h)
-        audio_h = h[:, text_emb.shape[1]:, :]
-        return self.unpatchify(audio_h)
+        b, t_frames, _ = x_t.shape
+        cond = self.time_embed(t) + self.spk_proj(spk_emb)
+        mask1_tok = mel_mask.reshape(b, t_frames // 2, 2).max(axis=-1)
+        mask2_tok = mask1_tok.reshape(b, t_frames // 4, 2).max(axis=-1)
+        m0 = mel_mask[:, :, None]
+        m1 = mask1_tok[:, :, None]
+        m2 = mask2_tok[:, :, None]
+        h = self.in_proj(mx.concatenate([x_t, mu_frame], axis=-1)) * m0
+        for blk in self.down1_blocks:
+            h = blk(h, cond, m0)
+        skip1 = h
+        h = self.down1_pool(h) * m1
+        for blk in self.down2_blocks:
+            h = blk(h, cond, m1)
+        skip2 = h
+        h = self.down2_pool(h) * m2
+        h = h + sinusoidal_positions(h.shape[1], self.dim)[None]
+        attn_mask = (1.0 - mask2_tok)[:, None, None, :] * -1.0e9
+        for blk in self.mid_blocks:
+            h = blk(h, cond, attn_mask=attn_mask)
+        h = self.up2_conv(mx.repeat(h, 2, axis=1)) * m1
+        h = self.up2_fuse(mx.concatenate([h, skip2], axis=-1))
+        for blk in self.up2_blocks:
+            h = blk(h, cond, m1)
+        h = self.up1_conv(mx.repeat(h, 2, axis=1)) * m0
+        h = self.up1_fuse(mx.concatenate([h, skip1], axis=-1))
+        for blk in self.up1_blocks:
+            h = blk(h, cond, m0)
+        return self.out_proj(nn.gelu(self.out_conv(self.out_norm(h)))) * m0
 
 
-@app.function
-def build_attention_mask(text_mask: mx.array, mel_mask: mx.array, patch_size: int) -> mx.array:
-    """Build an additive attention mask (0 for keep, large-negative for
-    ignore) with shape ``(B, 1, 1, L_total)`` where
-    ``L_total = L_text + L_mel_tokens``. Broadcasts over heads and
-    query positions.
-    """
-    b, t_frames = mel_mask.shape
-    n_tokens = t_frames // patch_size
-    mel_token_mask = mel_mask.reshape(b, n_tokens, patch_size).max(axis=-1)
-    full = mx.concatenate([text_mask, mel_token_mask], axis=1)
-    additive = (1.0 - full) * -1.0e9
-    return additive[:, None, None, :]
+@app.class_definition
+class MatchaTTSV1(nn.Module):
+    """Speaker-conditioned Matcha-style acoustic model: character encoder
+    with mel-mean head, duration predictor, and OT-CFM flow decoder."""
+
+    def __init__(
+        self,
+        vocab_size: int = 40,
+        n_speakers: int = 40,
+        n_mels: int = 80,
+        dim: int = 256,
+        enc_layers: int = 4,
+        enc_heads: int = 4,
+        dec_heads: int = 4,
+        dec_mid_layers: int = 2,
+    ):
+        super().__init__()
+        self.n_mels = n_mels
+        self.dim = dim
+        self.spk_embed = nn.Embedding(n_speakers, dim)
+        self.encoder = CharacterEncoderV1(vocab_size, dim, enc_layers, enc_heads)
+        self.mu_proj = nn.Linear(dim, n_mels)
+        self.duration_predictor = DurationPredictorV1(dim)
+        self.decoder = FlowDecoderV1(n_mels, dim, dec_heads, dec_mid_layers)
+
+    def encode_text(
+        self, text_ids: mx.array, text_mask: mx.array, spk_ids: mx.array
+    ) -> tuple:
+        spk_emb = self.spk_embed(spk_ids)
+        h = self.encoder(text_ids, text_mask, spk_emb)
+        mu_tok = self.mu_proj(h)
+        log_dur = self.duration_predictor(mx.stop_gradient(h), text_mask)
+        return h, mu_tok, log_dur, spk_emb
 
 
 @app.function
@@ -931,27 +1103,25 @@ def count_parameters(model: nn.Module) -> int:
 
 
 @app.function
-def build_tts_dit_model(
+def build_matcha_tts_model(
     vocab_size: int,
+    n_speakers: int,
     n_mels: int,
-    patch_size: int,
-    max_mel_frames: int,
-    max_text_len: int,
-    embed_dim: int = 256,
-    num_heads: int = 8,
-    mlp_dim: int = 512,
-    num_layers: int = 6,
-) -> TextToSpeechDiTV1:
-    model = TextToSpeechDiTV1(
+    dim: int = 256,
+    enc_layers: int = 4,
+    enc_heads: int = 4,
+    dec_heads: int = 4,
+    dec_mid_layers: int = 2,
+) -> MatchaTTSV1:
+    model = MatchaTTSV1(
         vocab_size=vocab_size,
+        n_speakers=n_speakers,
         n_mels=n_mels,
-        patch_size=patch_size,
-        max_mel_frames=max_mel_frames,
-        max_text_len=max_text_len,
-        embed_dim=embed_dim,
-        num_heads=num_heads,
-        mlp_dim=mlp_dim,
-        num_layers=num_layers,
+        dim=dim,
+        enc_layers=enc_layers,
+        enc_heads=enc_heads,
+        dec_heads=dec_heads,
+        dec_mid_layers=dec_mid_layers,
     )
     mx.eval(model.parameters())
     return model
@@ -964,38 +1134,37 @@ def _(mo):
 
     | Component | Module | Shape / role |
     |-----------|--------|---------------|
-    | Text token embedding | `TextEncoderV1` (`nn.Embedding` + learned pos) | `(B, L_text, D)` |
-    | Mel patch embedding | `MelPatchifyV1` (`Linear(patch*M, D)`) + learned pos | `(B, T/patch, D)` |
-    | Timestep embedding | `SinusoidalTimestepEmbeddingV1` + 2-layer MLP | `(B, D)` (used for AdaLN only) |
-    | Backbone | `DiTBlockV1` × `num_layers` (AdaLN + masked self-attn + AdaLN + MLP) | `(B, L_text + T/patch, D)` |
-    | Head | `LayerNorm` + `MelUnpatchifyV1` (`Linear(D, patch*M)`) | `(B, T, M)` |
+    | Speaker embedding | `nn.Embedding(n_speakers, D)` | `(B, D)`; conditions everything |
+    | Character encoder | `CharacterEncoderV1` (conv prenet + DiT blocks, AdaLN on speaker) | `(B, L, D)` |
+    | Mel-mean head | `Linear(D, M)` | `μ_j` per character, drives MAS + prior loss |
+    | Duration predictor | `DurationPredictorV1` (masked convs, stop-grad input) | `log d_j` per character |
+    | Alignment | **MAS** (training) / duration predictor (inference) | frame→character map |
+    | Flow decoder | `FlowDecoderV1` U-Net: `concat(x_t, μ_frame)` → down×2 → DiT×k → up×2 | velocity `(B, T, M)` |
+    | Conditioning | timestep sinusoid MLP + speaker, via FiLM/AdaLN in every block | `(B, D)` |
 
-    **Key differences vs. the CIFAR-10 DiT** (`mlx/dit_rcfm_cifar10.py`):
+    **Key properties vs. the previous patchified DiT:**
 
-    - 1-D **audio** patchify (`MelPatchifyV1`) grouping `patch_size`
-      consecutive mel frames into one token, instead of 2-D image patches.
-    - **Text prefix conditioning** via `TextEncoderV1` concatenation +
-      full self-attention (no cross-attention module).
-    - AdaLN conditions on **timestep only** — the class-label conditioning
-      from the CIFAR notebook is removed.
-    - **Additive attention mask** built from combined text-validity and
-      mel-frame-validity masks and applied inside every DiT block, so
-      padded positions never affect valid positions.
+    - No unpatchify seams — overlapping convolutions at full frame rate.
+    - Alignment is *learned* (MAS), not assumed uniform.
+    - Speaker identity is explicit, so the model no longer averages voices.
+    - Decoder is length-flexible: inference runs at the exact predicted
+      utterance length instead of a fixed padded canvas.
+    - Classifier-free guidance is dropped: the decoder is conditioned
+      per-frame on `μ`, a far stronger signal than a global text prefix,
+      so guidance is unnecessary (matching Matcha-TTS).
     """)
     return
 
 
 @app.cell
-def _(char_vocab, mo, patch_size_ui, tensor_dataset):
+def _(char_vocab, mo, tensor_dataset):
     if tensor_dataset is None or char_vocab is None:
         _out = mo.md("_Build the tensor dataset above to instantiate the default model._")
     else:
-        _m = build_tts_dit_model(
+        _m = build_matcha_tts_model(
             vocab_size=len(char_vocab),
+            n_speakers=len(tensor_dataset["speakers"]),
             n_mels=tensor_dataset["n_mels"],
-            patch_size=int(patch_size_ui.value),
-            max_mel_frames=tensor_dataset["mel"].shape[1],
-            max_text_len=tensor_dataset["text_ids"].shape[1],
         )
         _out = mo.md(f"**Default model parameter count**: `{count_parameters(_m):,}`.")
     _out
@@ -1005,123 +1174,210 @@ def _(char_vocab, mo, patch_size_ui, tensor_dataset):
 @app.cell
 def _(mo):
     mo.md("""
-    ## Section 5 — Training (OT-CFM with padding masks)
+    ## Section 5 — Training (OT-CFM + prior + duration losses)
+
+    Each step:
+
+    1. **Align (no gradient).** Run the encoder, compute the frame-vs-
+       character log-likelihood matrix `logp[t, j] = -½‖mel_t − μ_j‖²`,
+       and run **MAS** (a numpy Viterbi pass, vectorized over the batch)
+       to get the best monotonic frame→character map and per-character
+       durations.
+    2. **Losses (with gradient), alignment held fixed:**
+       - **CFM loss** — rectified-flow objective: `x_t = (1−t)x₀ + t·mel`
+         with `x₀ ~ N(0, I)`, target velocity `mel − x₀`, masked MSE
+         against the decoder's prediction. (The Hungarian minibatch-OT
+         pairing from the CIFAR notebooks is dropped: with strong
+         per-frame conditioning the coupling gain is negligible, and the
+         conditional paths are already the straight OT-CFM paths.)
+       - **Prior loss** — masked MSE between the aligned `μ` sequence and
+         the target mel. This is what makes MAS meaningful: it pulls each
+         character's `μ` toward the frames MAS assigned to it, and MAS in
+         turn re-assigns frames to the closest `μ` — an EM-like loop.
+       - **Duration loss** — masked MSE between predicted and MAS
+         log-durations.
+
+    Optimizer: AdamW with linear warmup → cosine decay, gradient-norm
+    clipping at 1.0. **Runtime expectation:** at the defaults (~3–4 k
+    utterances after filtering, batch 16, ~17 M parameters) one epoch is
+    roughly 1–3 minutes on an M-series GPU, so **80 epochs ≈ 2–4 hours**.
     """)
     return
 
 
 @app.function
-def sample_noise_like_mel(mel: mx.array) -> mx.array:
-    return mx.random.normal(shape=mel.shape)
+def alignment_log_likelihood(mel: mx.array, mu_tok: mx.array, text_mask: mx.array) -> mx.array:
+    """(B, T, L) isotropic-Gaussian log-likelihood (up to a constant) of
+    each mel frame under each character's mu. Padded text positions get
+    -1e9 so MAS never assigns frames to them."""
+    mel2 = mx.sum(mel * mel, axis=-1)
+    mu2 = mx.sum(mu_tok * mu_tok, axis=-1)
+    cross = mel @ mu_tok.transpose(0, 2, 1)
+    logp = -0.5 * (mel2[:, :, None] + mu2[:, None, :] - 2.0 * cross)
+    return logp + (1.0 - text_mask)[:, None, :] * -1.0e9
 
 
 @app.function
-def minibatch_ot_pairing(x0: mx.array, x1: mx.array, weight_mask: mx.array) -> mx.array:
-    """Solve exact minibatch OT between ``x0`` and ``x1`` under a
-    squared-L2 cost on the **masked** flattened representation, and
-    return ``x0`` reordered to be optimally coupled with ``x1``. The
-    ``weight_mask`` is broadcast (B, T, 1) so padded frames contribute
-    zero to the cost.
-    """
-    x0_np = np.array(x0)
-    x1_np = np.array(x1)
-    w = np.array(weight_mask)[:, :, None]
-    x0_flat = (x0_np * w).reshape(x0_np.shape[0], -1).astype(np.float64)
-    x1_flat = (x1_np * w).reshape(x1_np.shape[0], -1).astype(np.float64)
-    diffs = x0_flat[:, None, :] - x1_flat[None, :, :]
-    cost = np.sum(diffs * diffs, axis=-1)
-    row_ind, col_ind = linear_sum_assignment(cost)
-    perm = np.argsort(col_ind).astype(np.int32)
-    return x0[mx.array(perm)]
+def monotonic_alignment_search(
+    logp: np.ndarray, text_lens: np.ndarray, mel_lens: np.ndarray
+) -> tuple:
+    """Batched MAS (Glow-TTS): monotonic, no-skip Viterbi over the
+    (frames x characters) log-likelihood grid. The forward pass is
+    vectorized over batch and characters; backtracking is a cheap
+    per-sample scalar loop. Returns ``align_idx`` (B, T) int32 mapping
+    each frame to a character index, and ``durations`` (B, L) int32."""
+    b, t_max, l_max = logp.shape
+    neg = -1.0e9
+    lp = logp.astype(np.float64)
+    dp = np.full((b, t_max, l_max), neg, dtype=np.float64)
+    back = np.zeros((b, t_max, l_max), dtype=np.int8)
+    dp[:, 0, 0] = lp[:, 0, 0]
+    for t in range(1, t_max):
+        stay = dp[:, t - 1, :]
+        move = np.concatenate([np.full((b, 1), neg), dp[:, t - 1, :-1]], axis=1)
+        take = move > stay
+        dp[:, t, :] = lp[:, t, :] + np.where(take, move, stay)
+        back[:, t, :] = take
+    align_idx = np.zeros((b, t_max), dtype=np.int32)
+    durations = np.zeros((b, l_max), dtype=np.int32)
+    for i in range(b):
+        t_len = int(mel_lens[i])
+        l_len = int(min(text_lens[i], t_len))
+        j = l_len - 1
+        for t in range(t_len - 1, -1, -1):
+            align_idx[i, t] = j
+            if t > 0 and back[i, t, j] and j > 0:
+                j -= 1
+        align_idx[i, t_len:] = max(l_len - 1, 0)
+        counts = np.bincount(align_idx[i, :t_len], minlength=l_max)
+        durations[i] = counts[:l_max]
+    return align_idx, durations
 
 
 @app.function
-def compute_flow_loss_masked(
+def compute_batch_alignment(model: nn.Module, batch: dict) -> tuple:
+    """Encoder forward (no grad taken) + MAS. Returns mx arrays
+    ``align_idx`` (B, T) and ``durations`` (B, L)."""
+    _, mu_tok, _, _ = model.encode_text(
+        batch["text_ids"], batch["text_mask"], batch["spk_ids"]
+    )
+    logp = alignment_log_likelihood(batch["mel"], mu_tok, batch["text_mask"])
+    mx.eval(logp)
+    text_lens = np.asarray(mx.sum(batch["text_mask"], axis=1)).astype(np.int64)
+    mel_lens = np.asarray(mx.sum(batch["mel_mask"], axis=1)).astype(np.int64)
+    align_np, dur_np = monotonic_alignment_search(np.asarray(logp), text_lens, mel_lens)
+    return mx.array(align_np), mx.array(dur_np)
+
+
+@app.function
+def gather_mu_frames(mu_tok: mx.array, align_idx: mx.array, n_mels: int) -> mx.array:
+    b, t_frames = align_idx.shape
+    idx = mx.broadcast_to(align_idx[:, :, None], (b, t_frames, n_mels))
+    return mx.take_along_axis(mu_tok, idx, axis=1)
+
+
+@app.function
+def compute_tts_losses(
     model: nn.Module,
-    x1: mx.array,
-    x0: mx.array,
-    text_ids: mx.array,
-    text_mask: mx.array,
+    mel: mx.array,
     mel_mask: mx.array,
-) -> mx.array:
-    t = mx.random.uniform(shape=(x1.shape[0],))
-    t_view = t.reshape(-1, 1, 1)
-    x_t = (1.0 - t_view) * x0 + t_view * x1
-    v_target = x1 - x0
-    v_pred = model(x_t, t, text_ids, text_mask, mel_mask)
-    mask3 = mel_mask[:, :, None]
-    sq = ((v_pred - v_target) ** 2) * mask3
-    denom = mx.maximum(mx.sum(mask3) * float(v_pred.shape[-1]), mx.array(1.0))
-    return mx.sum(sq) / denom
-
-
-@app.function
-def run_train_epoch_ot_cfm_tts(model: nn.Module, optimizer, batches: list) -> float:
-    loss_and_grad_fn = nn.value_and_grad(model, compute_flow_loss_masked)
-    epoch_loss = 0.0
-    n = 0
-    for b in batches:
-        x0 = sample_noise_like_mel(b["mel"])
-        x0_paired = minibatch_ot_pairing(x0, b["mel"], b["mel_mask"])
-        loss, grads = loss_and_grad_fn(
-            model,
-            b["mel"],
-            x0_paired,
-            b["text_ids"],
-            b["text_mask"],
-            b["mel_mask"],
-        )
-        optimizer.update(model, grads)
-        mx.eval(loss, model.parameters())
-        epoch_loss += float(loss.item())
-        n += 1
-    return epoch_loss / max(n, 1)
-
-
-@app.function
-def run_train_epoch_cfm_tts(model: nn.Module, optimizer, batches: list) -> float:
-    """No-OT variant (used only for hyperparameter search speed)."""
-    loss_and_grad_fn = nn.value_and_grad(model, compute_flow_loss_masked)
-    epoch_loss = 0.0
-    n = 0
-    for b in batches:
-        x0 = sample_noise_like_mel(b["mel"])
-        loss, grads = loss_and_grad_fn(
-            model,
-            b["mel"],
-            x0,
-            b["text_ids"],
-            b["text_mask"],
-            b["mel_mask"],
-        )
-        optimizer.update(model, grads)
-        mx.eval(loss, model.parameters())
-        epoch_loss += float(loss.item())
-        n += 1
-    return epoch_loss / max(n, 1)
-
-
-@app.function
-def evaluate_tts_model(model: nn.Module, batches: list) -> float:
-    total = 0.0
-    n = 0
-    for b in batches:
-        x0 = sample_noise_like_mel(b["mel"])
-        loss = compute_flow_loss_masked(
-            model, b["mel"], x0, b["text_ids"], b["text_mask"], b["mel_mask"]
-        )
-        mx.eval(loss)
-        total += float(loss.item())
-        n += 1
-    return total / max(n, 1)
-
-
-@app.function
-def euler_solve_tts(
-    model: nn.Module,
-    x0: mx.array,
     text_ids: mx.array,
     text_mask: mx.array,
+    spk_ids: mx.array,
+    x0: mx.array,
+    t: mx.array,
+    align_idx: mx.array,
+    durations: mx.array,
+) -> tuple:
+    _, mu_tok, log_dur_pred, spk_emb = model.encode_text(text_ids, text_mask, spk_ids)
+    mu_frame = gather_mu_frames(mu_tok, align_idx, model.n_mels)
+    m3 = mel_mask[:, :, None]
+    feat_denom = mx.maximum(mx.sum(m3) * float(mel.shape[-1]), mx.array(1.0))
+    prior_loss = mx.sum(((mu_frame - mel) ** 2) * m3) / feat_denom
+    t3 = t.reshape(-1, 1, 1)
+    x_t = (1.0 - t3) * x0 + t3 * mel
+    v_target = mel - x0
+    v_pred = model.decoder(x_t, t, mu_frame, spk_emb, mel_mask)
+    cfm_loss = mx.sum(((v_pred - v_target) ** 2) * m3) / feat_denom
+    dur_target = mx.log(mx.maximum(durations.astype(mx.float32), mx.array(1.0)))
+    dur_denom = mx.maximum(mx.sum(text_mask), mx.array(1.0))
+    dur_loss = mx.sum(((log_dur_pred - dur_target) ** 2) * text_mask) / dur_denom
+    total = cfm_loss + prior_loss + dur_loss
+    return total, cfm_loss, prior_loss, dur_loss
+
+
+@app.function
+def compute_tts_total_loss(model: nn.Module, *args) -> mx.array:
+    return compute_tts_losses(model, *args)[0]
+
+
+@app.function
+def run_train_epoch_matcha(model: nn.Module, optimizer, batches: list) -> float:
+    loss_and_grad_fn = nn.value_and_grad(model, compute_tts_total_loss)
+    epoch_loss = 0.0
+    n = 0
+    for b in batches:
+        align_idx, durations = compute_batch_alignment(model, b)
+        x0 = mx.random.normal(shape=b["mel"].shape)
+        t = mx.random.uniform(shape=(b["mel"].shape[0],))
+        loss, grads = loss_and_grad_fn(
+            model,
+            b["mel"],
+            b["mel_mask"],
+            b["text_ids"],
+            b["text_mask"],
+            b["spk_ids"],
+            x0,
+            t,
+            align_idx,
+            durations,
+        )
+        grads, _ = optim.clip_grad_norm(grads, max_norm=1.0)
+        optimizer.update(model, grads)
+        mx.eval(loss, model.parameters())
+        epoch_loss += float(loss.item())
+        n += 1
+    return epoch_loss / max(n, 1)
+
+
+@app.function
+def evaluate_tts_model(model: nn.Module, batches: list) -> dict:
+    """Component-wise validation losses with fixed noise/timestep keys so
+    the numbers are comparable across epochs (the global RNG stream is
+    left untouched)."""
+    sums = {"total": 0.0, "cfm": 0.0, "prior": 0.0, "dur": 0.0}
+    n = 0
+    for i, b in enumerate(batches):
+        align_idx, durations = compute_batch_alignment(model, b)
+        x0 = mx.random.normal(shape=b["mel"].shape, key=mx.random.key(1000 + i))
+        t = mx.random.uniform(shape=(b["mel"].shape[0],), key=mx.random.key(5000 + i))
+        total, cfm, prior, dur = compute_tts_losses(
+            model,
+            b["mel"],
+            b["mel_mask"],
+            b["text_ids"],
+            b["text_mask"],
+            b["spk_ids"],
+            x0,
+            t,
+            align_idx,
+            durations,
+        )
+        mx.eval(total, cfm, prior, dur)
+        sums["total"] += float(total.item())
+        sums["cfm"] += float(cfm.item())
+        sums["prior"] += float(prior.item())
+        sums["dur"] += float(dur.item())
+        n += 1
+    return {k: v / max(n, 1) for k, v in sums.items()}
+
+
+@app.function
+def euler_solve_decoder(
+    decoder: nn.Module,
+    x0: mx.array,
+    mu_frame: mx.array,
+    spk_emb: mx.array,
     mel_mask: mx.array,
     num_steps: int = 40,
 ) -> mx.array:
@@ -1129,18 +1385,18 @@ def euler_solve_tts(
     x = x0
     for i in range(num_steps):
         t = mx.full((x.shape[0],), i * dt, dtype=mx.float32)
-        v = model(x, t, text_ids, text_mask, mel_mask)
+        v = decoder(x, t, mu_frame, spk_emb, mel_mask)
         x = x + dt * v
         mx.eval(x)
     return x
 
 
 @app.function
-def euler_solve_trajectory_tts(
-    model: nn.Module,
+def euler_solve_decoder_trajectory(
+    decoder: nn.Module,
     x0: mx.array,
-    text_ids: mx.array,
-    text_mask: mx.array,
+    mu_frame: mx.array,
+    spk_emb: mx.array,
     mel_mask: mx.array,
     num_steps: int = 40,
 ) -> list:
@@ -1149,67 +1405,11 @@ def euler_solve_trajectory_tts(
     trajectory = [x]
     for i in range(num_steps):
         t = mx.full((x.shape[0],), i * dt, dtype=mx.float32)
-        v = model(x, t, text_ids, text_mask, mel_mask)
+        v = decoder(x, t, mu_frame, spk_emb, mel_mask)
         x = x + dt * v
         mx.eval(x)
         trajectory.append(x)
     return trajectory
-
-
-@app.cell
-def _(mo):
-    lr_ui = mo.ui.dropdown(
-        options={"1e-4": 1e-4, "3e-4": 3e-4, "1e-3": 1e-3},
-        value="3e-4",
-        label="Learning rate",
-    )
-    bs_ui = mo.ui.dropdown(
-        options={"4": 4, "8": 8, "16": 16, "32": 32},
-        value="8",
-        label="Batch size",
-    )
-    wd_ui = mo.ui.dropdown(
-        options={"0.0": 0.0, "1e-4": 1e-4, "1e-3": 1e-3},
-        value="1e-4",
-        label="Weight decay",
-    )
-    epochs_ui = mo.ui.slider(1, 200, value=15, step=1, label="Epochs")
-    embed_dim_ui = mo.ui.dropdown(
-        options={"128": 128, "192": 192, "256": 256, "384": 384},
-        value="192",
-        label="embed_dim",
-    )
-    num_heads_ui = mo.ui.dropdown(
-        options={"4": 4, "6": 6, "8": 8},
-        value="6",
-        label="num_heads",
-    )
-    mlp_dim_ui = mo.ui.dropdown(
-        options={"256": 256, "384": 384, "512": 512, "768": 768},
-        value="384",
-        label="mlp_dim",
-    )
-    num_layers_ui = mo.ui.slider(1, 12, value=4, step=1, label="num_layers")
-    train_btn = mo.ui.run_button(label="Train")
-    mo.vstack(
-        [
-            mo.md("### Training hyperparameters"),
-            mo.hstack([lr_ui, bs_ui, wd_ui, epochs_ui]),
-            mo.hstack([embed_dim_ui, num_heads_ui, mlp_dim_ui, num_layers_ui]),
-            train_btn,
-        ]
-    )
-    return (
-        bs_ui,
-        embed_dim_ui,
-        epochs_ui,
-        lr_ui,
-        mlp_dim_ui,
-        num_heads_ui,
-        num_layers_ui,
-        train_btn,
-        wd_ui,
-    )
 
 
 @app.function
@@ -1217,112 +1417,180 @@ def train_tts_model(
     train_split: dict,
     val_split: dict,
     vocab_size: int,
+    n_speakers: int,
     n_mels: int,
-    patch_size: int,
-    max_mel_frames: int,
-    max_text_len: int,
-    embed_dim: int,
-    num_heads: int,
-    mlp_dim: int,
-    num_layers: int,
+    dim: int,
+    enc_layers: int,
+    enc_heads: int,
+    dec_heads: int,
+    dec_mid_layers: int,
     lr: float,
     wd: float,
     batch_size: int,
     epochs: int,
-    epoch_fn=None,
+    seed: int = 0,
     progress_cb=None,
 ) -> tuple:
-    if epoch_fn is None:
-        epoch_fn = run_train_epoch_ot_cfm_tts
-    model = build_tts_dit_model(
+    mx.random.seed(seed)
+    np.random.seed(seed)
+    model = build_matcha_tts_model(
         vocab_size=vocab_size,
+        n_speakers=n_speakers,
         n_mels=n_mels,
-        patch_size=patch_size,
-        max_mel_frames=max_mel_frames,
-        max_text_len=max_text_len,
-        embed_dim=embed_dim,
-        num_heads=num_heads,
-        mlp_dim=mlp_dim,
-        num_layers=num_layers,
+        dim=dim,
+        enc_layers=enc_layers,
+        enc_heads=enc_heads,
+        dec_heads=dec_heads,
+        dec_mid_layers=dec_mid_layers,
     )
-    optimizer = optim.AdamW(learning_rate=lr, weight_decay=wd)
+    steps_per_epoch = max(math.ceil(train_split["mel"].shape[0] / batch_size), 1)
+    total_steps = steps_per_epoch * epochs
+    warmup = min(500, max(total_steps // 20, 1))
+    schedule = optim.join_schedules(
+        [
+            optim.linear_schedule(0.0, lr, warmup),
+            optim.cosine_decay(lr, max(total_steps - warmup, 1)),
+        ],
+        [warmup],
+    )
+    optimizer = optim.AdamW(learning_rate=schedule, weight_decay=wd)
     val_batches = iter_batches(val_split, batch_size=batch_size, shuffle=False)
-    train_losses: list = []
-    val_losses: list = []
+    history = {
+        "train_total": [],
+        "val_total": [],
+        "val_cfm": [],
+        "val_prior": [],
+        "val_dur": [],
+    }
     for epoch in range(epochs):
         train_batches = iter_batches(train_split, batch_size=batch_size, shuffle=True)
-        tl = epoch_fn(model, optimizer, train_batches)
-        vl = evaluate_tts_model(model, val_batches)
-        train_losses.append(tl)
-        val_losses.append(vl)
+        tl = run_train_epoch_matcha(model, optimizer, train_batches)
+        vm = evaluate_tts_model(model, val_batches)
+        history["train_total"].append(tl)
+        history["val_total"].append(vm["total"])
+        history["val_cfm"].append(vm["cfm"])
+        history["val_prior"].append(vm["prior"])
+        history["val_dur"].append(vm["dur"])
         if progress_cb is not None:
-            progress_cb(epoch, epochs, tl, vl)
-    return model, train_losses, val_losses
+            progress_cb(epoch, epochs, tl, vm["total"])
+    return model, history
+
+
+@app.cell
+def _(mo):
+    lr_ui = mo.ui.dropdown(
+        options={"1e-4": 1e-4, "2e-4": 2e-4, "3e-4": 3e-4},
+        value="2e-4",
+        label="Learning rate",
+    )
+    bs_ui = mo.ui.dropdown(
+        options={"8": 8, "16": 16, "32": 32},
+        value="16",
+        label="Batch size",
+    )
+    wd_ui = mo.ui.dropdown(
+        options={"0.0": 0.0, "1e-6": 1e-6, "1e-4": 1e-4},
+        value="0.0",
+        label="Weight decay",
+    )
+    epochs_ui = mo.ui.slider(1, 200, value=80, step=1, label="Epochs")
+    dim_ui = mo.ui.dropdown(
+        options={"192": 192, "256": 256, "384": 384},
+        value="256",
+        label="model dim",
+    )
+    heads_ui = mo.ui.dropdown(
+        options={"4": 4, "8": 8},
+        value="4",
+        label="attention heads",
+    )
+    enc_layers_ui = mo.ui.slider(2, 6, value=4, step=1, label="encoder layers")
+    mid_layers_ui = mo.ui.slider(1, 4, value=2, step=1, label="decoder mid layers")
+    train_btn = mo.ui.run_button(label="Train")
+    mo.vstack(
+        [
+            mo.md(
+                "### Training hyperparameters\n"
+                "Defaults follow the Matcha-TTS recipe scaled to this data "
+                "budget: Adam-style optimizer without weight decay, lr "
+                "`2e-4` with warmup + cosine decay, 80 epochs."
+            ),
+            mo.hstack([lr_ui, bs_ui, wd_ui, epochs_ui]),
+            mo.hstack([dim_ui, heads_ui, enc_layers_ui, mid_layers_ui]),
+            train_btn,
+        ]
+    )
+    return (
+        bs_ui,
+        dim_ui,
+        enc_layers_ui,
+        epochs_ui,
+        heads_ui,
+        lr_ui,
+        mid_layers_ui,
+        train_btn,
+        wd_ui,
+    )
 
 
 @app.cell
 def _(
     bs_ui,
     char_vocab,
-    embed_dim_ui,
+    dim_ui,
+    enc_layers_ui,
     epochs_ui,
+    heads_ui,
     lr_ui,
-    mlp_dim_ui,
+    mid_layers_ui,
     mo,
-    num_heads_ui,
-    num_layers_ui,
-    patch_size_ui,
     tensor_dataset,
     train_btn,
     wd_ui,
 ):
-    train_losses = []
-    val_losses = []
+    loss_history = None
     trained_model = None
     train_split_gl = None
     val_split_gl = None
     if tensor_dataset is None or char_vocab is None:
         mo.output.replace(mo.md("_Build the tensor dataset first (Section 3)._"))
     elif not train_btn.value:
-        mo.output.replace(mo.md("Click **Train** to start OT-CFM training."))
+        mo.output.replace(mo.md("Click **Train** to start MAS + OT-CFM training."))
     else:
-        train_split_gl, val_split_gl = split_tensor_dataset(tensor_dataset, val_fraction=0.15)
+        train_split_gl, val_split_gl = split_tensor_dataset(tensor_dataset, val_fraction=0.1)
+
         def _cb(epoch, n_epochs, tl, vl):
             mo.output.replace(
                 mo.md(f"**Epoch {epoch + 1}/{n_epochs}** — train: {tl:.4f} | val: {vl:.4f}")
             )
-        trained_model, train_losses, val_losses = train_tts_model(
+
+        trained_model, loss_history = train_tts_model(
             train_split=train_split_gl,
             val_split=val_split_gl,
             vocab_size=len(char_vocab),
+            n_speakers=len(tensor_dataset["speakers"]),
             n_mels=tensor_dataset["n_mels"],
-            patch_size=int(patch_size_ui.value),
-            max_mel_frames=tensor_dataset["mel"].shape[1],
-            max_text_len=tensor_dataset["text_ids"].shape[1],
-            embed_dim=int(embed_dim_ui.value),
-            num_heads=int(num_heads_ui.value),
-            mlp_dim=int(mlp_dim_ui.value),
-            num_layers=int(num_layers_ui.value),
+            dim=int(dim_ui.value),
+            enc_layers=int(enc_layers_ui.value),
+            enc_heads=int(heads_ui.value),
+            dec_heads=int(heads_ui.value),
+            dec_mid_layers=int(mid_layers_ui.value),
             lr=float(lr_ui.value),
             wd=float(wd_ui.value),
             batch_size=int(bs_ui.value),
             epochs=int(epochs_ui.value),
-            epoch_fn=run_train_epoch_ot_cfm_tts,
             progress_cb=_cb,
         )
         mo.output.replace(
             mo.md(
-                f"**Training complete!** Final train `{train_losses[-1]:.4f}` | "
-                f"val `{val_losses[-1]:.4f}`. Params: `{count_parameters(trained_model):,}`."
+                f"**Training complete!** Final train `{loss_history['train_total'][-1]:.4f}` | "
+                f"val `{loss_history['val_total'][-1]:.4f}` "
+                f"(cfm `{loss_history['val_cfm'][-1]:.4f}`, prior `{loss_history['val_prior'][-1]:.4f}`, "
+                f"dur `{loss_history['val_dur'][-1]:.4f}`). "
+                f"Params: `{count_parameters(trained_model):,}`."
             )
         )
-    return (
-        train_losses,
-        train_split_gl,
-        trained_model,
-        val_losses,
-        val_split_gl,
-    )
+    return loss_history, train_split_gl, trained_model, val_split_gl
 
 
 @app.cell
@@ -1330,8 +1598,10 @@ def _(mo):
     mo.md("""
     ## Section 6 — Hyperparameter Search (optional)
 
-    Small grid over learning rate and patch size, using **vanilla CFM
-    without OT coupling** (faster per step). Only a few epochs each.
+    Small grid over learning rate and model width, a few epochs each.
+    The final validation total loss ranks configurations. Left off by
+    default: a full 80-epoch run should use the defaults above unless
+    this table clearly disagrees.
     """)
     return
 
@@ -1348,35 +1618,32 @@ def run_hp_config_tts(
     train_split: dict,
     val_split: dict,
     vocab_size: int,
+    n_speakers: int,
     n_mels: int,
-    patch_size: int,
-    max_mel_frames: int,
-    max_text_len: int,
+    dim: int,
     lr: float,
     n_epochs: int,
     batch_size: int,
 ) -> float:
-    model, _, val_losses = train_tts_model(
+    model, history = train_tts_model(
         train_split=train_split,
         val_split=val_split,
         vocab_size=vocab_size,
+        n_speakers=n_speakers,
         n_mels=n_mels,
-        patch_size=patch_size,
-        max_mel_frames=max_mel_frames,
-        max_text_len=max_text_len,
-        embed_dim=192,
-        num_heads=6,
-        mlp_dim=384,
-        num_layers=3,
+        dim=dim,
+        enc_layers=3,
+        enc_heads=4,
+        dec_heads=4,
+        dec_mid_layers=1,
         lr=lr,
-        wd=1e-4,
+        wd=0.0,
         batch_size=batch_size,
         epochs=n_epochs,
-        epoch_fn=run_train_epoch_cfm_tts,
         progress_cb=None,
     )
     _ = model
-    return val_losses[-1] if val_losses else float("inf")
+    return history["val_total"][-1] if history["val_total"] else float("inf")
 
 
 @app.cell
@@ -1390,27 +1657,25 @@ def _(char_vocab, hp_search_cb, mo, tensor_dataset):
         mo.md("_Build the tensor dataset first before searching._"),
     )
     _tr, _va = split_tensor_dataset(tensor_dataset, val_fraction=0.2)
-    _search_space = {"lr": [1e-4, 3e-4], "patch_size": [2, 4]}
+    _search_space = {"lr": [1e-4, 2e-4], "dim": [192, 256]}
     _hp_epochs = 3
-    _hp_bs = 8
+    _hp_bs = 16
     hp_results = []
     for _lr in _search_space["lr"]:
-        for _ps in _search_space["patch_size"]:
-            _T = round_up_to_multiple(tensor_dataset["mel"].shape[1], _ps)
+        for _dim in _search_space["dim"]:
             _vl = run_hp_config_tts(
                 _tr,
                 _va,
                 vocab_size=len(char_vocab),
+                n_speakers=len(tensor_dataset["speakers"]),
                 n_mels=tensor_dataset["n_mels"],
-                patch_size=_ps,
-                max_mel_frames=_T,
-                max_text_len=tensor_dataset["text_ids"].shape[1],
+                dim=_dim,
                 lr=_lr,
                 n_epochs=_hp_epochs,
                 batch_size=_hp_bs,
             )
-            hp_results.append({"lr": _lr, "patch_size": _ps, "val_loss": round(_vl, 4)})
-            mo.output.replace(mo.md(f"lr={_lr}, patch_size={_ps} -> val={_vl:.4f}"))
+            hp_results.append({"lr": _lr, "dim": _dim, "val_loss": round(_vl, 4)})
+            mo.output.replace(mo.md(f"lr={_lr}, dim={_dim} -> val={_vl:.4f}"))
     hp_results.sort(key=lambda r: r["val_loss"])
     mo.output.replace(mo.ui.table(hp_results))
     return
@@ -1421,14 +1686,19 @@ def _(mo):
     mo.md("""
     ## Section 7 — Validation
 
-    We evaluate the trained model on the held-out validation split. **k-fold
-    cross-validation is intentionally omitted** here: the entire loaded
-    utterance pool is intentionally small (default ~200 utterances, capped
-    by `max_samples`) to keep the demo tractable on Apple Silicon, and
-    running 5 folds × N epochs of DiT training on audio would dominate the
-    wall-clock budget of this notebook. Instead, we report the single
-    held-out flow-matching loss as the primary generalization signal and
-    complement it with the qualitative results in Section 8.
+    Component-wise held-out losses. **k-fold cross-validation is
+    intentionally omitted**: k full DiT+U-Net training runs on hours of
+    audio would dominate the notebook's wall-clock budget, so the single
+    held-out split is the generalization signal, complemented by the
+    qualitative results in Section 8.
+
+    Reading the components: `cfm` is the decoder's velocity-field error
+    (the generative fidelity signal), `prior` measures how well the
+    per-character μ vectors summarize their aligned frames (alignment
+    quality), and `dur` is log-duration MSE (rhythm quality). A model
+    that speaks intelligibly needs *all three* low — a low `cfm` with a
+    high `prior` means the decoder paints fine texture on a wrong
+    phonetic skeleton.
     """)
     return
 
@@ -1439,8 +1709,17 @@ def _(bs_ui, mo, trained_model, val_split_gl):
         _out = mo.md("_Train the model first (Section 5)._")
     else:
         _val_batches = iter_batches(val_split_gl, batch_size=int(bs_ui.value), shuffle=False)
-        val_flow_loss = evaluate_tts_model(trained_model, _val_batches)
-        _out = mo.md(f"**Validation flow-matching loss (masked)**: `{val_flow_loss:.4f}`")
+        _vm = evaluate_tts_model(trained_model, _val_batches)
+        _out = mo.md(
+            f"""
+            | Validation loss | Value |
+            |------|-------|
+            | Total | `{_vm["total"]:.4f}` |
+            | Flow matching (cfm) | `{_vm["cfm"]:.4f}` |
+            | Prior (μ vs mel) | `{_vm["prior"]:.4f}` |
+            | Duration (log-MSE) | `{_vm["dur"]:.4f}` |
+            """
+        )
     _out
     return
 
@@ -1454,15 +1733,17 @@ def _(mo):
 
 
 @app.function
-def plot_loss_curves(train_losses: list, val_losses: list):
+def plot_loss_curves(history: dict):
     fig, ax = plt.subplots(figsize=(8, 4.2))
-    if train_losses:
-        ax.plot(range(1, len(train_losses) + 1), train_losses, "b-o", lw=2, ms=4, label="Train")
-    if val_losses:
-        ax.plot(range(1, len(val_losses) + 1), val_losses, "r-s", lw=2, ms=4, label="Val")
+    xs = range(1, len(history["train_total"]) + 1)
+    ax.plot(xs, history["train_total"], "b-o", lw=2, ms=3, label="Train total")
+    ax.plot(xs, history["val_total"], "r-s", lw=2, ms=3, label="Val total")
+    ax.plot(xs, history["val_cfm"], "r--", lw=1.2, alpha=0.7, label="Val cfm")
+    ax.plot(xs, history["val_prior"], "g--", lw=1.2, alpha=0.7, label="Val prior")
+    ax.plot(xs, history["val_dur"], "m--", lw=1.2, alpha=0.7, label="Val duration")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Masked flow-matching MSE")
-    ax.set_title("Training and validation loss")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training and validation losses (MAS + OT-CFM)")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -1470,13 +1751,64 @@ def plot_loss_curves(train_losses: list, val_losses: list):
 
 
 @app.cell
-def _(mo, train_losses, val_losses):
-    if not train_losses:
+def _(loss_history, mo):
+    if not loss_history:
         _out = mo.md("_Train the model first (Section 5)._")
     else:
-        _out = plot_loss_curves(train_losses, val_losses)
+        _out = plot_loss_curves(loss_history)
     _out
     return
+
+
+@app.function
+def plot_char_durations(chars: list, durations: np.ndarray, title: str = "MAS character durations"):
+    k = min(len(chars), 80)
+    fig, ax = plt.subplots(figsize=(10, 2.8))
+    ax.bar(range(k), durations[:k], color="steelblue", edgecolor="black", lw=0.3)
+    ax.set_xticks(range(k))
+    ax.set_xticklabels(chars[:k], fontsize=7)
+    ax.set_ylabel("Frames")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3, axis="y")
+    fig.tight_layout()
+    return fig
+
+
+@app.cell
+def _(char_vocab, mo, train_split_gl, trained_model):
+    if trained_model is None or train_split_gl is None or char_vocab is None:
+        _out = mo.md("_Train the model first to inspect learned alignments._")
+    else:
+        _b = iter_batches(train_split_gl, batch_size=1, shuffle=False)[0]
+        _, _durs = compute_batch_alignment(trained_model, _b)
+        _ids = np.asarray(_b["text_ids"][0])
+        _chars = ids_to_chars(_ids, char_vocab)
+        _out = mo.vstack(
+            [
+                mo.md(
+                    "**MAS-discovered durations** for one training utterance — "
+                    "if alignment is healthy these vary per character "
+                    "(vowels long, stops short, `␣` marks pauses) instead "
+                    "of being flat."
+                ),
+                plot_char_durations(_chars, np.asarray(_durs[0])[: len(_chars)]),
+            ]
+        )
+    _out
+    return
+
+
+@app.function
+def teacher_forced_condition(model: nn.Module, batch: dict) -> tuple:
+    """MAS-aligned mu sequence for a batch — the decoder condition with
+    ground-truth durations, isolating decoder quality from duration
+    prediction."""
+    align_idx, durations = compute_batch_alignment(model, batch)
+    _, mu_tok, _, spk_emb = model.encode_text(
+        batch["text_ids"], batch["text_mask"], batch["spk_ids"]
+    )
+    mu_frame = gather_mu_frames(mu_tok, align_idx, model.n_mels)
+    return mu_frame, spk_emb, durations
 
 
 @app.function
@@ -1504,47 +1836,42 @@ def plot_euler_progression_tts(
 
 
 @app.cell
-def _(mo, tensor_dataset, train_split_gl, trained_model):
-    if trained_model is None or train_split_gl is None or tensor_dataset is None:
+def _(mo, train_split_gl, trained_model):
+    if trained_model is None or train_split_gl is None:
         _out = mo.md("_Train the model first to visualize its ODE process._")
     else:
         _b = iter_batches(train_split_gl, batch_size=1, shuffle=False)[0]
-        mx.random.seed(11)
-        _x0 = mx.random.normal(shape=_b["mel"].shape)
-        _traj = euler_solve_trajectory_tts(
-            trained_model,
-            _x0,
-            _b["text_ids"],
-            _b["text_mask"],
-            _b["mel_mask"],
-            num_steps=40,
+        _mu_frame, _spk, _ = teacher_forced_condition(trained_model, _b)
+        _x0 = mx.random.normal(shape=_b["mel"].shape, key=mx.random.key(11)) * 0.667
+        _traj = euler_solve_decoder_trajectory(
+            trained_model.decoder, _x0, _mu_frame, _spk, _b["mel_mask"], num_steps=40
         )
         _valid = int(np.array(_b["mel_mask"][0]).sum())
-        _out = plot_euler_progression_tts(_traj, valid_frames=_valid, title="Flow-matching ODE process (noise -> mel)")
+        _out = plot_euler_progression_tts(
+            _traj, valid_frames=_valid, title="Flow-matching ODE process (noise -> mel)"
+        )
     _out
     return
 
 
 @app.function
 def compute_step_count_mse_tts(
-    model: nn.Module,
-    text_ids: mx.array,
-    text_mask: mx.array,
+    decoder: nn.Module,
+    mu_frame: mx.array,
+    spk_emb: mx.array,
     mel_mask: mx.array,
+    n_mels: int,
     step_list: list,
     ref_steps: int = 100,
     seed: int = 7,
 ) -> list:
-    mx.random.seed(seed)
     b, t_frames = mel_mask.shape
-    # Infer n_mels from model
-    n_mels = model.n_mels
-    x0 = mx.random.normal(shape=(b, t_frames, n_mels))
-    x_ref = euler_solve_tts(model, x0, text_ids, text_mask, mel_mask, ref_steps)
+    x0 = mx.random.normal(shape=(b, t_frames, n_mels), key=mx.random.key(seed))
+    x_ref = euler_solve_decoder(decoder, x0, mu_frame, spk_emb, mel_mask, ref_steps)
     mx.eval(x_ref)
     mses: list = []
     for ns in step_list:
-        x_ns = euler_solve_tts(model, x0, text_ids, text_mask, mel_mask, ns)
+        x_ns = euler_solve_decoder(decoder, x0, mu_frame, spk_emb, mel_mask, ns)
         mx.eval(x_ns)
         m3 = mel_mask[:, :, None]
         diff = (x_ns - x_ref) * m3
@@ -1557,7 +1884,7 @@ def compute_step_count_mse_tts(
 @app.function
 def plot_step_count_mse(step_list: list, mses: list):
     fig, ax = plt.subplots(figsize=(8, 4.2))
-    ax.plot(step_list, mses, "b-o", lw=2, ms=6, label="OT-CFM DiT")
+    ax.plot(step_list, mses, "b-o", lw=2, ms=6, label="OT-CFM decoder")
     ax.set_xscale("log")
     ax.set_yscale("log")
     ax.set_xlabel("Euler steps")
@@ -1575,9 +1902,16 @@ def _(mo, train_split_gl, trained_model):
         _out = mo.md("_Train the model first to run the step-count MSE experiment._")
     else:
         _b = iter_batches(train_split_gl, batch_size=2, shuffle=False)[0]
+        _mu_frame, _spk, _ = teacher_forced_condition(trained_model, _b)
         _steps = [1, 2, 5, 10, 25, 50]
         _mses = compute_step_count_mse_tts(
-            trained_model, _b["text_ids"], _b["text_mask"], _b["mel_mask"], _steps, ref_steps=100
+            trained_model.decoder,
+            _mu_frame,
+            _spk,
+            _b["mel_mask"],
+            trained_model.n_mels,
+            _steps,
+            ref_steps=100,
         )
         _out = plot_step_count_mse(_steps, _mses)
     _out
@@ -1589,7 +1923,7 @@ def plot_reconstruction_comparison(
     mel_gt: np.ndarray,
     mel_pred: np.ndarray,
     valid_frames: int,
-    title: str = "Ground truth vs. generated mel",
+    title: str = "Ground truth vs. generated mel (teacher-forced durations)",
 ):
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
     axes[0].imshow(mel_gt[:valid_frames, :].T, origin="lower", aspect="auto", cmap="magma")
@@ -1611,10 +1945,10 @@ def _(mo, train_split_gl, trained_model):
         _out = mo.md("_Train the model first to see a reconstruction comparison._")
     else:
         _b = iter_batches(train_split_gl, batch_size=1, shuffle=False)[0]
-        mx.random.seed(42)
-        _x0 = mx.random.normal(shape=_b["mel"].shape)
-        _x_gen = euler_solve_tts(
-            trained_model, _x0, _b["text_ids"], _b["text_mask"], _b["mel_mask"], num_steps=40
+        _mu_frame, _spk, _ = teacher_forced_condition(trained_model, _b)
+        _x0 = mx.random.normal(shape=_b["mel"].shape, key=mx.random.key(42)) * 0.667
+        _x_gen = euler_solve_decoder(
+            trained_model.decoder, _x0, _mu_frame, _spk, _b["mel_mask"], num_steps=40
         )
         mx.eval(_x_gen)
         _valid = int(np.array(_b["mel_mask"][0]).sum())
@@ -1632,22 +1966,32 @@ def _(mo):
     mo.md("""
     ### Results summary
 
-    - **Training curve**: shows the masked flow-matching MSE decreasing
-      on train/val across epochs.
-    - **ODE progression**: strip of intermediate mel-spectrograms as the
-      Euler ODE integrates the learned velocity field from Gaussian
-      noise (`t=0`) to a generated mel (`t=1`) conditioned on a real
-      transcript.
-    - **Step-count MSE**: how close the Euler solution at `k` steps
-      gets to a 100-step reference for the same `(x_0, text)`. Because
-      this DiT was trained with OT coupling, its trajectories should be
-      relatively straight, i.e. small-`k` solutions should be close to
-      the reference.
-    - **Reconstruction comparison**: ground-truth mel next to a mel
-      generated from the same transcript. At the tiny default training
-      budget the generated mel captures coarse energy/time structure
-      but not fine-grained voicing — expected for a demonstration-scale
-      run on a small subset of the corpus.
+    - **Loss curves**: all three components should fall together. The
+      `prior` curve is the alignment health signal — if it plateaus high,
+      MAS never found a stable text↔audio correspondence and nothing
+      downstream can be intelligible.
+    - **MAS durations**: per-character durations should be visibly
+      non-uniform. Flat bars would mean alignment collapsed to the old
+      uniform-stretch behaviour.
+    - **ODE progression**: intermediate states of the Euler integration
+      from noise to mel. Note the absence of 4-frame blocking artefacts —
+      the convolutional decoder output is continuous in time.
+    - **Step-count MSE**: OT-CFM paths are near-straight, so few-step
+      solutions should stay close to the 100-step reference.
+    - **Reconstruction (teacher-forced)**: generated with MAS durations
+      from the ground-truth pair, so both mels have identical timing and
+      differences are purely spectral fidelity.
+
+    ### What to scale next, in order of expected payoff
+
+    1. **More audio.** Move `split` to `train-clean-100` and raise
+       `max_samples`. Character-level TTS sharpens dramatically between
+       ~5 h and ~25 h.
+    2. **Phoneme input.** Replacing characters with phonemes (e.g. via
+       `g2p-en`) removes English spelling irregularity — the largest
+       remaining modeling burden at this scale.
+    3. **A neural vocoder.** Griffin-Lim is now the perceptual floor;
+       HiFi-GAN on top of these 80-bin mels is the standard next step.
     """)
     return
 
@@ -1663,7 +2007,7 @@ def _(mo):
 @app.cell
 def _(mo):
     save_filename_ui = mo.ui.text(
-        value="libritts_dit_rcfm_v1.safetensors",
+        value="libritts_matcha_cfm_v1.safetensors",
         label="Filename (saved into models/)",
         full_width=True,
     )
@@ -1696,22 +2040,57 @@ def _(mo):
     mo.md("""
     ## Section 10 — Text-to-Speech Inference
 
-    Type a transcript, click **Synthesize**, and the trained model will:
+    Type a transcript, pick a **speaker**, and click **Synthesize**:
 
-    1. Tokenize your input to character ids using the vocab from Section 3.
-    2. Sample Gaussian noise of shape `(1, max_mel_frames, n_mels)`.
-    3. Run `euler_solve_tts` for `num_steps` Euler steps, conditioned on
-       the text prefix.
-    4. De-normalize the generated log-mel using the dataset stats.
-    5. Invert to a waveform via **Griffin-Lim** (`librosa.feature.inverse.mel_to_audio`) —
-       this is a classical vocoder; expect audible artefacts.
-
-    Given the small default training budget, generations mostly reveal
-    coarse prosody/energy contour rather than intelligible speech — this
-    is a scaffold that scales; enlarge the dataset and increase the
-    epochs to improve quality.
+    1. Characters are tokenized with the Section 3 vocabulary.
+    2. The encoder produces per-character `μ` vectors and the duration
+       predictor produces per-character frame counts (scaled by the
+       **Speaking rate** slider), which are expanded into a
+       frame-aligned `μ` sequence of the exact predicted length — no
+       fixed padded canvas.
+    3. Gaussian noise scaled by **temperature** (Matcha's default 0.667
+       trades a little diversity for cleaner output) is integrated with
+       `num_steps` Euler steps through the flow decoder.
+    4. The mel is de-normalized, clamped to the trained log-mel range,
+      exponentiated, and inverted with **Griffin-Lim** — a classical
+      vocoder, so some metallic phasiness is expected even from good
+      mels.
     """)
     return
+
+
+@app.function
+def infer_condition(
+    model: nn.Module,
+    text: str,
+    vocab: dict,
+    max_text_len: int,
+    spk_id: int,
+    speed: float = 1.0,
+    max_total_frames: int = 2048,
+) -> tuple:
+    """Encoder + duration-predictor forward for one prompt. Returns the
+    frame-aligned mu condition, speaker embedding, an all-valid mel mask
+    at the exact predicted length (rounded to FRAME_MULTIPLE), and the
+    per-character durations."""
+    ids, length = text_to_ids(text, vocab, max_text_len)
+    text_ids = mx.array(ids[None, :])
+    tmask = np.zeros((1, max_text_len), dtype=np.float32)
+    tmask[0, :length] = 1.0
+    text_mask = mx.array(tmask)
+    spk_ids = mx.array(np.asarray([spk_id], dtype=np.int32))
+    _, mu_tok, log_dur, spk_emb = model.encode_text(text_ids, text_mask, spk_ids)
+    mx.eval(mu_tok, log_dur)
+    d = np.exp(np.asarray(log_dur[0, :length])) / max(speed, 1e-3)
+    d = np.clip(np.round(d), 1, 60).astype(np.int64)
+    frame_tok = np.repeat(np.arange(length), d)[:max_total_frames]
+    pad = (-len(frame_tok)) % FRAME_MULTIPLE
+    if pad:
+        frame_tok = np.concatenate([frame_tok, np.full(pad, frame_tok[-1])])
+    total = len(frame_tok)
+    mu_frame = mx.take(mu_tok[0], mx.array(frame_tok.astype(np.int32)), axis=0)[None]
+    mel_mask = mx.ones((1, total))
+    return mu_frame, spk_emb, mel_mask, total, d
 
 
 @app.function
@@ -1719,40 +2098,70 @@ def synthesize_speech(
     model: nn.Module,
     text: str,
     vocab: dict,
+    spk_id: int,
     mel_mean: float,
     mel_std: float,
+    mel_min: float,
+    mel_max: float,
     n_mels: int,
     sample_rate: int,
     hop_length: int,
     n_fft: int,
     win_length: int,
-    max_mel_frames: int,
+    fmin: float,
+    fmax: float,
     max_text_len: int,
     num_ode_steps: int = 40,
-    griffin_lim_iters: int = 32,
+    griffin_lim_iters: int = 60,
+    temperature: float = 0.667,
+    speed: float = 1.0,
     seed: int = 0,
 ) -> tuple:
-    ids, length = text_to_ids(text, vocab, max_text_len)
-    text_ids = mx.array(ids[None, :])
-    tmask = np.zeros((1, max_text_len), dtype=np.float32)
-    tmask[0, :length] = 1.0
-    text_mask = mx.array(tmask)
-    mel_mask = mx.ones((1, max_mel_frames))
-    mx.random.seed(seed)
-    x0 = mx.random.normal(shape=(1, max_mel_frames, n_mels))
-    mel_norm = euler_solve_tts(model, x0, text_ids, text_mask, mel_mask, num_ode_steps)
+    mu_frame, spk_emb, mel_mask, total, _ = infer_condition(
+        model, text, vocab, max_text_len, spk_id, speed
+    )
+    x0 = mx.random.normal(shape=(1, total, n_mels), key=mx.random.key(seed)) * temperature
+    mel_norm = euler_solve_decoder(
+        model.decoder, x0, mu_frame, spk_emb, mel_mask, num_ode_steps
+    )
     mx.eval(mel_norm)
-    log_mel_db = (np.array(mel_norm[0]).T * mel_std + mel_mean).astype(np.float32)
-    power = librosa.db_to_power(log_mel_db)
+    # De-normalize into ln-magnitude mel and clamp to the trained domain
+    # so Griffin-Lim never sees energies the corpus could not produce.
+    log_mel = np.asarray(mel_norm[0]).T * mel_std + mel_mean
+    log_mel = np.clip(log_mel, mel_min, mel_max).astype(np.float32)
+    mel_mag = np.exp(log_mel)
     waveform = librosa.feature.inverse.mel_to_audio(
-        power,
+        mel_mag,
         sr=sample_rate,
         n_fft=n_fft,
         hop_length=hop_length,
         win_length=win_length,
+        power=1.0,
         n_iter=griffin_lim_iters,
+        fmin=fmin,
+        fmax=fmax,
     )
-    return waveform.astype(np.float32), log_mel_db
+    peak = float(np.abs(waveform).max())
+    if peak > 1e-6:
+        waveform = waveform / peak * 0.95
+    return waveform.astype(np.float32), log_mel
+
+
+@app.cell
+def _(mo, tensor_dataset):
+    if tensor_dataset is None:
+        tts_speaker_ui = None
+        _out = mo.md("_Build the tensor dataset to populate the speaker list._")
+    else:
+        _names = tensor_dataset["speakers"]
+        tts_speaker_ui = mo.ui.dropdown(
+            options={name: idx for idx, name in enumerate(_names)},
+            value=_names[0],
+            label="Speaker (LibriTTS id)",
+        )
+        _out = tts_speaker_ui
+    _out
+    return (tts_speaker_ui,)
 
 
 @app.cell
@@ -1762,13 +2171,18 @@ def _(mo):
         label="Input text",
     )
     tts_num_steps_ui = mo.ui.slider(5, 200, value=40, step=5, label="Euler ODE steps")
-    tts_gl_iters_ui = mo.ui.slider(4, 128, value=32, step=4, label="Griffin-Lim iterations")
+    tts_gl_iters_ui = mo.ui.slider(8, 128, value=60, step=4, label="Griffin-Lim iterations")
     tts_seed_ui = mo.ui.number(value=0, label="Sampling seed")
+    tts_temperature_ui = mo.ui.slider(
+        0.1, 1.5, value=0.667, step=0.05, label="Noise temperature"
+    )
+    tts_speed_ui = mo.ui.slider(0.5, 2.0, value=1.0, step=0.05, label="Speaking rate")
     tts_synth_btn = mo.ui.run_button(label="Synthesize")
     mo.vstack(
         [
             tts_text_ui,
             mo.hstack([tts_num_steps_ui, tts_gl_iters_ui, tts_seed_ui]),
+            mo.hstack([tts_temperature_ui, tts_speed_ui]),
             tts_synth_btn,
         ]
     )
@@ -1776,7 +2190,9 @@ def _(mo):
         tts_gl_iters_ui,
         tts_num_steps_ui,
         tts_seed_ui,
+        tts_speed_ui,
         tts_synth_btn,
+        tts_temperature_ui,
         tts_text_ui,
     )
 
@@ -1791,29 +2207,38 @@ def _(
     tts_gl_iters_ui,
     tts_num_steps_ui,
     tts_seed_ui,
+    tts_speaker_ui,
+    tts_speed_ui,
     tts_synth_btn,
+    tts_temperature_ui,
     tts_text_ui,
 ):
-    if trained_model is None or tensor_dataset is None or char_vocab is None:
+    if trained_model is None or tensor_dataset is None or char_vocab is None or tts_speaker_ui is None:
         _out = mo.md("_Train the model first (Section 5) before synthesizing._")
     elif not tts_synth_btn.value:
-        _out = mo.md("Type a transcript above and click **Synthesize** to generate speech.")
+        _out = mo.md("Type a transcript, pick a speaker, and click **Synthesize**.")
     else:
         _wav, _log_mel = synthesize_speech(
             model=trained_model,
             text=tts_text_ui.value,
             vocab=char_vocab,
+            spk_id=int(tts_speaker_ui.value),
             mel_mean=tensor_dataset["mel_mean"],
             mel_std=tensor_dataset["mel_std"],
+            mel_min=tensor_dataset["mel_min"],
+            mel_max=tensor_dataset["mel_max"],
             n_mels=tensor_dataset["n_mels"],
             sample_rate=int(target_sr_ui.value),
             hop_length=tensor_dataset["hop_length"],
             n_fft=tensor_dataset["n_fft"],
             win_length=tensor_dataset["win_length"],
-            max_mel_frames=tensor_dataset["mel"].shape[1],
+            fmin=tensor_dataset["fmin"],
+            fmax=tensor_dataset["fmax"],
             max_text_len=tensor_dataset["text_ids"].shape[1],
             num_ode_steps=int(tts_num_steps_ui.value),
             griffin_lim_iters=int(tts_gl_iters_ui.value),
+            temperature=float(tts_temperature_ui.value),
+            speed=float(tts_speed_ui.value),
             seed=int(tts_seed_ui.value),
         )
         _items = [
