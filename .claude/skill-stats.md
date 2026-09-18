@@ -3,7 +3,7 @@
 | Skill Name | Uses | Issues |
 |---|---|---|
 | commit-push | 12 | 0 |
-| create-research-book | 10 | 0 |
+| create-research-book | 14 | 0 |
 | create-skill | 10 | 0 |
 | marimo-notebook | 3 | 0 |
 | marimo-session | 1 | 0 |
