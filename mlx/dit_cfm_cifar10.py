@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.21.1"
+__generated_with = "0.24.0"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -467,6 +467,245 @@ def _(default_param_count, mo):
 
 @app.cell
 def _(mo):
+    mo.md(r"""
+    ### Section 4b — Positional Encoding V2: 2D Rotary Position Embedding
+
+    #### 1-D RoPE — Foundations
+
+    RoPE (Su et al., 2021) encodes token position $m$ by **rotating** consecutive
+    head-dimension pairs $(x_{2i},\; x_{2i+1})$ of the Q and K vectors by angle
+    $m\theta_i$, where the base frequencies decay geometrically:
+
+    $$\theta_i = 10000^{-2i/d}, \quad i \in \left[0,\; \tfrac{d}{2}\right)$$
+
+    The 2×2 rotation applied to pair $i$ at position $m$:
+
+    $$\begin{pmatrix}\tilde{x}_{2i}\\\tilde{x}_{2i+1}\end{pmatrix}
+    = \begin{pmatrix}\cos m\theta_i & -\sin m\theta_i \\ \sin m\theta_i & \cos m\theta_i\end{pmatrix}
+    \begin{pmatrix}x_{2i}\\x_{2i+1}\end{pmatrix}$$
+
+    **Relative-position property.** Since $\mathbf{R}(m)^{\top}\mathbf{R}(n) = \mathbf{R}(m-n)$,
+    the rotated inner product $\langle\mathbf{R}(m)\mathbf{q},\;\mathbf{R}(n)\mathbf{k}\rangle$
+    depends only on the relative offset $m - n$, giving translation-equivariance for free.
+
+    ---
+
+    #### 2-D Extension — VisionLLaMA (arxiv:2403.13298)
+
+    For image patches at 2-D grid position $(r, c)$ we must encode **two** coordinates
+    while preserving the relative-position property in both directions.
+
+    **Key idea**: split the head dimension $d$ into two halves and apply independent 1-D
+    RoPE to each, using a different position argument:
+
+    | Head-dim slice | Position used | Encodes |
+    |---|---|---|
+    | $[0,\; d/2)$ — *row half* | row index $r$ | vertical relative offset $r - r'$ |
+    | $[d/2,\; d)$ — *col half* | column index $c$ | horizontal relative offset $c - c'$ |
+
+    The attention score between patches $(r, c)$ and $(r', c')$ factorises:
+
+    $$\langle\mathbf{q},\mathbf{k}\rangle
+    = \underbrace{\langle\mathbf{q}_r^{(r)},\;\mathbf{k}_r^{(r')}\rangle}_{\text{depends on }r-r'}
+    + \underbrace{\langle\mathbf{q}_c^{(c)},\;\mathbf{k}_c^{(c')}\rangle}_{\text{depends on }c-c'}$$
+
+    Both terms individually satisfy the 1-D relative-position property, so the full 2-D
+    attention score depends only on the relative displacement $(r - r',\; c - c')$.
+
+    ---
+
+    #### Frequency Formula for 2-D RoPE
+
+    Each half has size $d/2$.  Substituting $d/2$ as the effective dimension into the
+    base-frequency formula:
+
+    $$\theta_i = 10000^{-2i/(d/2)} = 10000^{-4i/d}, \quad i \in \left[0,\; \tfrac{d}{4}\right)$$
+
+    Both halves share the same frequency bank $\{\theta_i\}$ — only the position argument
+    differs ($r$ vs $c$).  With `embed_dim=256, num_heads=8` → `head_dim=32` → `quarter=8`
+    unique frequencies per head.
+
+    ---
+
+    #### Implementation: `rotate_pairs`
+
+    ```python
+    quarter   = head_dim // 4
+    freqs[i]  = 10000 ** (-4*i / head_dim)         # (quarter,)
+
+    # for position vector p ∈ {row_pos, col_pos}, shape (N,):
+    angles    = p[:, None] * freqs[None, :]         # (N, quarter)
+    cos_full  = repeat(cos(angles), 2, axis=-1)     # (N, half)  — each value duplicated
+    sin_full  = repeat(sin(angles), 2, axis=-1)     # (N, half)
+
+    # rotate_pairs(x, cos_full, sin_full),  x: (B, N, H, half):
+    x0 = x[..., 0::2]                              # even-indexed pairs  (B,N,H,quarter)
+    x1 = x[..., 1::2]                              # odd-indexed pairs   (B,N,H,quarter)
+    c, s = cos_full[..., ::2], sin_full[..., ::2]  # unique values       (N,quarter)
+    rot_0 = x0 * c - x1 * s
+    rot_1 = x0 * s + x1 * c
+    return interleave(rot_0, rot_1)                 # (B,N,H,half)
+    ```
+
+    `DiffusionTransformerV2` drops the learnable `pos_embed` table
+    (≈ `num_patches × embed_dim` = `64 × 256 = 16 384` scalars) and injects
+    position via fixed RoPE rotations directly into every Q and K projection.
+    """)
+    return
+
+
+@app.class_definition
+class RoPE2DAttentionV2(nn.Module):
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
+        quarter = self.head_dim // 4
+        # θ_i = 10000^(-4i/head_dim), shared by row-half and col-half
+        self.freqs = 1.0 / (10000.0 ** (mx.arange(0, quarter, dtype=mx.float32) * 4.0 / self.head_dim))
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+
+    def _make_cos_sin(self, positions: mx.array):
+        # positions: (N,) — row or col grid indices cast to float
+        # angles:   (N, quarter) → cos/sin: (N, half) with each value pair-duplicated
+        angles = positions[:, None] * self.freqs[None, :]
+        cos = mx.repeat(mx.cos(angles), 2, axis=-1)
+        sin = mx.repeat(mx.sin(angles), 2, axis=-1)
+        return cos, sin
+
+    def _apply_rotary(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
+        # x:   (B, N, H, half)   where half = head_dim // 2
+        # cos/sin: (N, half) from _make_cos_sin (pair-duplicated)
+        B, N, H, half = x.shape
+        pairs = x.reshape(B, N, H, half // 2, 2)
+        x0, x1 = pairs[..., 0], pairs[..., 1]          # (B, N, H, half//2) each
+        c = cos[:, ::2][None, :, None, :]               # (1, N, 1, half//2) unique cos
+        s = sin[:, ::2][None, :, None, :]               # (1, N, 1, half//2) unique sin
+        rot0 = x0 * c - x1 * s
+        rot1 = x0 * s + x1 * c
+        return mx.stack([rot0, rot1], axis=-1).reshape(B, N, H, half)
+
+    def __call__(self, x: mx.array, row_pos: mx.array, col_pos: mx.array) -> mx.array:
+        B, N, D = x.shape
+        H, hd = self.num_heads, self.head_dim
+        half = hd // 2
+
+        q = self.q_proj(x).reshape(B, N, H, hd)
+        k = self.k_proj(x).reshape(B, N, H, hd)
+        v = self.v_proj(x).reshape(B, N, H, hd)
+
+        # split each head into row-half [0, half) and col-half [half, hd)
+        q_r, q_c = q[..., :half], q[..., half:]
+        k_r, k_c = k[..., :half], k[..., half:]
+
+        # apply 1-D RoPE independently on each half with the matching position vector
+        r_cos, r_sin = self._make_cos_sin(row_pos)
+        c_cos, c_sin = self._make_cos_sin(col_pos)
+        q_r = self._apply_rotary(q_r, r_cos, r_sin)
+        k_r = self._apply_rotary(k_r, r_cos, r_sin)
+        q_c = self._apply_rotary(q_c, c_cos, c_sin)
+        k_c = self._apply_rotary(k_c, c_cos, c_sin)
+
+        q = mx.concatenate([q_r, q_c], axis=-1).transpose(0, 2, 1, 3)  # (B, H, N, hd)
+        k = mx.concatenate([k_r, k_c], axis=-1).transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(0, 1, 3, 2)) * (hd ** -0.5)
+        attn = mx.softmax(attn, axis=-1)
+        out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, N, D)
+        return self.out_proj(out)
+
+
+@app.class_definition
+class DiTBlockV2(nn.Module):
+    def __init__(self, dim: int = 256, num_heads: int = 8, mlp_dim: int = 512, cond_dim: int = 256):
+        super().__init__()
+        self.attn_norm = AdaptiveLayerNormV1(dim, cond_dim)
+        self.attn = RoPE2DAttentionV2(dim, num_heads)
+        self.mlp_norm = AdaptiveLayerNormV1(dim, cond_dim)
+        self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim))
+
+    def __call__(self, x: mx.array, cond: mx.array, row_pos: mx.array, col_pos: mx.array) -> mx.array:
+        h = self.attn_norm(x, cond)
+        x = x + self.attn(h, row_pos, col_pos)
+        return x + self.mlp(self.mlp_norm(x, cond))
+
+
+@app.class_definition
+class DiffusionTransformerV2(nn.Module):
+    def __init__(
+        self,
+        image_size: int = 32,
+        patch_size: int = 4,
+        in_channels: int = 3,
+        num_classes: int = 10,
+        embed_dim: int = 256,
+        num_heads: int = 8,
+        mlp_dim: int = 512,
+        num_layers: int = 6,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.embed_dim = embed_dim
+        self.grid_size = image_size // patch_size
+        self.patchify = PatchifyV1(patch_size, embed_dim, in_channels)
+        # no pos_embed table — position injected via 2D RoPE into every Q/K projection
+        self.time_embed = nn.Sequential(
+            SinusoidalTimestepEmbeddingV1(embed_dim),
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.class_embed = nn.Embedding(num_classes + 1, embed_dim)
+        self.blocks = [DiTBlockV2(embed_dim, num_heads, mlp_dim, embed_dim) for _ in range(num_layers)]
+        self.final_norm = nn.LayerNorm(embed_dim)
+        self.unpatchify = UnpatchifyV1(patch_size, embed_dim, in_channels, image_size)
+
+    def __call__(self, x: mx.array, t: mx.array, y: mx.array) -> mx.array:
+        g = self.grid_size
+        # row-major patch order: patch (r, c) → index r*g + c
+        row_pos = mx.array([r for r in range(g) for _ in range(g)], dtype=mx.float32)
+        col_pos = mx.array([c for _ in range(g) for c in range(g)], dtype=mx.float32)
+        h = self.patchify(x)
+        cond = self.time_embed(t) + self.class_embed(y)
+        for block in self.blocks:
+            h = block(h, cond, row_pos, col_pos)
+        return self.unpatchify(self.final_norm(h))
+
+
+@app.cell
+def _(mo):
+    _v1 = DiffusionTransformerV1(
+        image_size=32, patch_size=4, in_channels=3, num_classes=10,
+        embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6,
+    )
+    _v2 = DiffusionTransformerV2(
+        image_size=32, patch_size=4, in_channels=3, num_classes=10,
+        embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6,
+    )
+    mx.eval(_v1.parameters())
+    mx.eval(_v2.parameters())
+    _n1 = count_parameters(_v1)
+    _n2 = count_parameters(_v2)
+    mo.md(f"""
+    ### V1 vs V2 Parameter Counts
+
+    | Model | Parameters | Notes |
+    |-------|-----------|-------|
+    | `DiffusionTransformerV1` | `{_n1:,}` | includes learnable `pos_embed` table |
+    | `DiffusionTransformerV2` | `{_n2:,}` | 2-D RoPE — no `pos_embed` |
+    | Difference | `{_n1 - _n2:+,}` | ≈ `num_patches × embed_dim` = `{64 * 256:,}` removed |
+    """)
+    return
+
+
+@app.cell
+def _(mo):
     mo.md("""
     ## Section 5 — Training
     """)
@@ -582,6 +821,107 @@ def _(
             )
         )
     return train_losses, trained_model, val_losses
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 5b — Training V2 (2D RoPE)
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    lr_ui_v2 = mo.ui.dropdown(
+        options={"1e-4": 1e-4, "3e-4": 3e-4, "1e-3": 1e-3},
+        value="3e-4",
+        label="Learning Rate",
+    )
+    bs_ui_v2 = mo.ui.dropdown(
+        options={"64": 64, "128": 128, "256": 256},
+        value="128",
+        label="Batch Size",
+    )
+    wd_ui_v2 = mo.ui.dropdown(
+        options={"0.0": 0.0, "1e-4": 1e-4, "1e-3": 1e-3},
+        value="1e-4",
+        label="Weight Decay",
+    )
+    epochs_ui_v2 = mo.ui.slider(1, 100, value=30, step=1, label="Epochs")
+    num_layers_ui_v2 = mo.ui.slider(1, 12, value=6, step=1, label="DiT num_layers")
+    train_btn_v2 = mo.ui.run_button(label="Train V2")
+    mo.vstack(
+        [
+            mo.md("### Hyperparameters (V2 — 2D RoPE)"),
+            mo.hstack([lr_ui_v2, bs_ui_v2, wd_ui_v2]),
+            mo.hstack([epochs_ui_v2, num_layers_ui_v2]),
+            train_btn_v2,
+        ]
+    )
+    return (
+        bs_ui_v2,
+        epochs_ui_v2,
+        lr_ui_v2,
+        num_layers_ui_v2,
+        train_btn_v2,
+        wd_ui_v2,
+    )
+
+
+@app.cell
+def _(
+    bs_ui_v2,
+    epochs_ui_v2,
+    lr_ui_v2,
+    mo,
+    num_layers_ui_v2,
+    train_btn_v2,
+    wd_ui_v2,
+    x_tr,
+    x_val,
+    y_tr,
+    y_val,
+):
+    train_losses_v2 = []
+    val_losses_v2 = []
+    trained_model_v2 = None
+
+    if not train_btn_v2.value:
+        mo.output.replace(mo.md("Click **Train V2** to begin training the 2D RoPE model."))
+    else:
+        _model_v2 = DiffusionTransformerV2(
+            image_size=32,
+            patch_size=4,
+            in_channels=3,
+            num_classes=10,
+            embed_dim=256,
+            num_heads=8,
+            mlp_dim=512,
+            num_layers=num_layers_ui_v2.value,
+            dropout=0.0,
+        )
+        mx.eval(_model_v2.parameters())
+        _optimizer_v2 = optim.AdamW(learning_rate=lr_ui_v2.value, weight_decay=wd_ui_v2.value)
+        _loss_and_grad_fn_v2 = nn.value_and_grad(_model_v2, compute_flow_loss)
+        _n_epochs_v2 = epochs_ui_v2.value
+        _val_batches_v2 = make_batches(x_val, y_val, batch_size=bs_ui_v2.value, shuffle=False)
+        for _epoch_v2 in range(_n_epochs_v2):
+            _train_batches_v2 = make_batches(x_tr, y_tr, batch_size=bs_ui_v2.value, shuffle=True)
+            _tl_v2 = run_train_epoch(_model_v2, _loss_and_grad_fn_v2, _optimizer_v2, _train_batches_v2)
+            _vl_v2 = run_evaluate(_model_v2, _val_batches_v2)
+            train_losses_v2.append(_tl_v2)
+            val_losses_v2.append(_vl_v2)
+            mo.output.replace(
+                mo.md(f"**Epoch {_epoch_v2 + 1}/{_n_epochs_v2}** — train: {_tl_v2:.4f} | val: {_vl_v2:.4f}")
+            )
+        trained_model_v2 = _model_v2
+        mo.output.replace(
+            mo.md(
+                f"**V2 training complete!** Final train: {train_losses_v2[-1]:.4f} | val: {val_losses_v2[-1]:.4f}"
+            )
+        )
+    return train_losses_v2, trained_model_v2, val_losses_v2
 
 
 @app.cell
@@ -1021,6 +1361,151 @@ def _(mo, num_layers_ui, train_losses, trained_model, val_losses):
 @app.cell
 def _(mo):
     mo.md("""
+    ## Section 8b — V2 (2D RoPE) Results
+    """)
+    return
+
+
+@app.function
+def plot_loss_curves_v1_v2(
+    train_losses_v1: list,
+    val_losses_v1: list,
+    train_losses_v2: list,
+    val_losses_v2: list,
+):
+    fig, ax = plt.subplots(figsize=(9, 4))
+    e1 = range(1, len(train_losses_v1) + 1)
+    e2 = range(1, len(train_losses_v2) + 1)
+    ax.plot(e1, train_losses_v1, "b-o", lw=2, ms=4, label="V1 Train (learned pos)")
+    ax.plot(e1, val_losses_v1,   "b--s", lw=2, ms=4, label="V1 Val")
+    ax.plot(e2, train_losses_v2, "r-o", lw=2, ms=4, label="V2 Train (2D RoPE)")
+    ax.plot(e2, val_losses_v2,   "r--s", lw=2, ms=4, label="V2 Val")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Flow-matching loss (MSE)")
+    ax.set_title("V1 (learned positional embedding) vs V2 (2D RoPE) training curves")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+@app.cell
+def _(
+    mo,
+    train_losses,
+    train_losses_v2,
+    trained_model,
+    trained_model_v2,
+    val_losses,
+    val_losses_v2,
+):
+    if trained_model is None and trained_model_v2 is None:
+        _out = mo.md("_Train both V1 (Section 5) and V2 (Section 5b) to compare loss curves._")
+    elif trained_model is None:
+        _out = plot_loss_curve(train_losses_v2, val_losses_v2)
+    elif trained_model_v2 is None:
+        _out = plot_loss_curve(train_losses, val_losses)
+    else:
+        _out = plot_loss_curves_v1_v2(train_losses, val_losses, train_losses_v2, val_losses_v2)
+    _out
+    return
+
+
+@app.cell
+def _(class_names, mo):
+    solver_ui_v2 = mo.ui.dropdown(
+        options={"Euler": "euler", "Midpoint": "midpoint", "RK4": "rk4"},
+        value="Euler",
+        label="ODE Solver",
+    )
+    steps_ui_v2 = mo.ui.slider(5, 200, value=50, step=1, label="Solver Steps")
+    class_ui_v2 = mo.ui.dropdown(
+        options={name: i for i, name in enumerate(class_names)},
+        value=class_names[0],
+        label="Class to generate",
+    )
+    sample_btn_v2 = mo.ui.run_button(label="Sample V2")
+    compare_btn_v2 = mo.ui.run_button(label="Compare Solvers V2")
+    mo.vstack(
+        [
+            mo.md("### V2 Sampling Controls"),
+            mo.hstack([solver_ui_v2, steps_ui_v2, class_ui_v2]),
+            mo.hstack([sample_btn_v2, compare_btn_v2]),
+        ]
+    )
+    return (
+        class_ui_v2,
+        compare_btn_v2,
+        sample_btn_v2,
+        solver_ui_v2,
+        steps_ui_v2,
+    )
+
+
+@app.cell
+def _(
+    class_names,
+    mo,
+    sample_btn_v2,
+    solver_ui_v2,
+    steps_ui_v2,
+    trained_model_v2,
+):
+    if trained_model_v2 is None:
+        _out = mo.md("_Train V2 (Section 5b) first to generate samples._")
+    elif not sample_btn_v2.value:
+        _out = mo.md("Click **Sample V2** to generate a grid of images for every class.")
+    else:
+        _out = plot_generated_grid(
+            trained_model_v2,
+            resolve_solver(solver_ui_v2.value),
+            steps_ui_v2.value,
+            class_names,
+            num_per_class=4,
+        )
+    _out
+    return
+
+
+@app.cell
+def _(class_names, class_ui_v2, compare_btn_v2, mo, trained_model_v2):
+    if trained_model_v2 is None:
+        _out = mo.md("_Train V2 (Section 5b) first to compare solvers._")
+    elif not compare_btn_v2.value:
+        _out = mo.md("Click **Compare Solvers V2** to run Euler / Midpoint / RK4 at several step counts.")
+    else:
+        _out = plot_solver_comparison(
+            trained_model_v2, int(class_ui_v2.value), class_names, [10, 25, 50, 100]
+        )
+    _out
+    return
+
+
+@app.cell
+def _(mo, num_layers_ui_v2, train_losses_v2, trained_model_v2, val_losses_v2):
+    if trained_model_v2 is None:
+        _out = mo.md("_Train the V2 model to see a results summary._")
+    else:
+        _out = mo.md(
+            f"""
+            ### V2 Summary
+
+            - Backbone: **DiffusionTransformerV2** (2D RoPE) with `num_layers = {num_layers_ui_v2.value}`,
+              `embed_dim=256`, `num_heads=8`, `mlp_dim=512`, patch size `4`.
+            - Trained for `{len(train_losses_v2)}` epochs; final train loss
+              `{train_losses_v2[-1]:.4f}`, final val loss `{val_losses_v2[-1]:.4f}`.
+            - Positional encoding: **2-D RoPE** — row and column grid positions are
+              injected into every Q/K projection via rotation; no learnable position
+              table is present in the model.
+            """
+        )
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
     ## Section 9 — Save Trained Model
     """)
     return
@@ -1053,6 +1538,45 @@ def _(mo, save_filename_ui, save_model_btn, trained_model):
         _save_path = _models_dir / save_filename_ui.value
         trained_model.save_weights(str(_save_path))
         _out = mo.md(f"**Saved!** Model weights written to `{_save_path}`.")
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## Section 9b — Save V2 Trained Model
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    save_filename_ui_v2 = mo.ui.text(
+        value="cifar10_dit_flow_rope2d_v2.safetensors",
+        label="Filename (saved into models/)",
+        full_width=True,
+    )
+    save_model_btn_v2 = mo.ui.run_button(label="Save V2 Model")
+    mo.vstack([save_filename_ui_v2, save_model_btn_v2])
+    return save_filename_ui_v2, save_model_btn_v2
+
+
+@app.cell
+def _(mo, save_filename_ui_v2, save_model_btn_v2, trained_model_v2):
+    if trained_model_v2 is None:
+        _out = mo.md("_Train the V2 model first (Section 5b) before saving._")
+    elif not save_model_btn_v2.value:
+        _out = mo.md(
+            "Enter a filename and click **Save V2 Model** to write the trained "
+            "weights to `models/`."
+        )
+    else:
+        _models_dir_v2 = Path(__file__).resolve().parent.parent / "models"
+        _models_dir_v2.mkdir(parents=True, exist_ok=True)
+        _save_path_v2 = _models_dir_v2 / save_filename_ui_v2.value
+        trained_model_v2.save_weights(str(_save_path_v2))
+        _out = mo.md(f"**Saved!** V2 model weights written to `{_save_path_v2}`.")
     _out
     return
 
