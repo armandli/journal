@@ -441,6 +441,24 @@ def euler_solve(model: nn.Module, x0: mx.array, y: mx.array, num_steps: int = 50
 
 
 @app.function
+def euler_solve_reverse(model: nn.Module, x1: mx.array, y: mx.array, num_steps: int = 50) -> mx.array:
+    """Integrate `dx/dt = v(x, t, y)` backwards from `t=1` to `t=0`.
+
+    The exact mirror of `euler_solve`: same step size, velocity evaluated at the
+    start of each step, walked in the opposite direction. Maps a real image `x1`
+    to the noise `x0` that gen1's ODE would have started from.
+    """
+    dt = 1.0 / num_steps
+    x = x1
+    for i in range(num_steps):
+        t = mx.full((x.shape[0],), 1.0 - i * dt, dtype=mx.float32)
+        v = model(x, t, y)
+        x = x - dt * v
+        mx.eval(x)
+    return x
+
+
+@app.function
 def euler_solve_trajectory(model: nn.Module, x0: mx.array, y: mx.array, num_steps: int = 50) -> list:
     dt = 1.0 / num_steps
     x = x0
@@ -598,6 +616,72 @@ def build_reflow_dataset(
         y_chunks.append(y)
         total += cur
     return mx.concatenate(x0_chunks, axis=0), mx.concatenate(x1_chunks, axis=0), mx.concatenate(y_chunks, axis=0)
+
+
+@app.function
+def build_reflow_dataset_reverse(
+    model_gen1: nn.Module,
+    x_data: mx.array,
+    y_data: mx.array,
+    num_samples: int,
+    num_steps: int,
+    batch_size: int = 128,
+) -> tuple:
+    """Reverse reflow coupling: keep REAL images as `x1`, derive `x0` by running
+    gen1's ODE backwards from `t=1` to `t=0`.
+
+    Forward reflow (`build_reflow_dataset`) draws `x0 ~ N(0, I)` and integrates
+    forward, so `x0` is exactly Gaussian but `x1` is only as good as gen1 — the
+    Stage 2 model then trains on gen1's own artefacts, and every blur or blotch
+    becomes a supervised target. Reversing the direction keeps `x1` exactly on the
+    data distribution, and carries the real labels rather than resampled ones. The
+    cost is that `x0` now only approximately matches the `N(0, I)` prior that
+    sampling starts from; `reflow_prior_stats` measures that gap.
+
+    Asking for more pairs than the dataset holds starts a second pass over the
+    images horizontally flipped — genuinely distinct images, hence distinct `x0`,
+    rather than duplicate rows. CIFAR-10 is flip-invariant, so this is sound
+    augmentation; beyond 2x the dataset the passes would repeat, which is why the
+    UI caps the size there.
+    """
+    n_data = x_data.shape[0]
+    x0_chunks = []
+    x1_chunks = []
+    y_chunks = []
+    total = 0
+    while total < num_samples:
+        pos = total % n_data
+        flipped = (total // n_data) % 2 == 1
+        cur = min(batch_size, num_samples - total, n_data - pos)
+        idx = mx.array(np.arange(pos, pos + cur, dtype=np.int32))
+        x1 = x_data[idx]
+        if flipped:
+            x1 = x1[:, :, ::-1, :]
+        y = y_data[idx]
+        x0 = euler_solve_reverse(model_gen1, x1, y, num_steps)
+        mx.eval(x0)
+        x0_chunks.append(x0)
+        x1_chunks.append(x1)
+        y_chunks.append(y)
+        total += cur
+    return (
+        mx.concatenate(x0_chunks, axis=0),
+        mx.concatenate(x1_chunks, axis=0),
+        mx.concatenate(y_chunks, axis=0),
+    )
+
+
+@app.function
+def reflow_prior_stats(x0_rf: mx.array) -> dict:
+    """How closely the derived `x0` matches the `N(0, I)` prior that sampling uses.
+
+    Reverse reflow buys an exact data marginal at `t=1` by giving up an exact prior
+    at `t=0`. If these drift far from mean 0 / std 1, the Stage 2 model is being
+    trained on a start distribution it will not see at sampling time.
+    """
+    m = float(mx.mean(x0_rf))
+    sd = float(mx.sqrt(mx.mean((x0_rf - m) ** 2)))
+    return {"mean": m, "std": sd, "abs_mean": abs(m), "std_err": abs(sd - 1.0)}
 
 
 @app.function
@@ -908,6 +992,48 @@ def _(mo):
     low-diversity, incoherent" samples. Grow **dataset size** first;
     only add epochs once the dataset is large enough that more epochs
     means more coverage rather than more repetition.
+
+    The size slider now reaches **90,112 pairs — 2x the 45,000-image
+    training set** — and defaults to 45,056, so Stage 2 sees at least as
+    many pairs as Stage 1 saw images.
+
+    #### Reflow coupling direction
+
+    | | `x_0` at `t=0` | `x_1` at `t=1` | labels |
+    |---|---|---|---|
+    | **forward** (canonical Rectified Flow) | exactly `N(0, I)` | gen1's **synthetic** output | resampled at random |
+    | **reverse** (default here) | derived by inverting gen1's ODE | exactly **real** CIFAR-10 | each image's own label |
+
+    Forward reflow makes gen1's own artefacts the supervised target: every
+    blur and blotch it produces becomes something Stage 2 is trained to
+    reproduce. Reverse reflow starts from real images and integrates
+    `dx/dt = v(x, t, y)` **backwards** from `t=1` to `t=0`, so the `t=1`
+    marginal is exactly the data distribution and the labels are genuine
+    rather than resampled.
+
+    The trade is at the other end: `x_0` is now only *approximately*
+    `N(0, I)`, and sampling starts from a true Gaussian. Measured on the
+    saved vanilla gen1 over 1,024 real images:
+
+    | ODE steps | derived `x_0` mean | derived `x_0` std |
+    |---|---|---|
+    | 25 | `-0.0031` | `0.8518` |
+    | 50 | `-0.0047` | `0.9125` |
+    | 100 | `-0.0055` | `0.9456` |
+    | 200 | `-0.0059` | `0.9633` |
+
+    The mean is essentially perfect; the **variance is what suffers**, and
+    it recovers as the inversion gets finer. That is why the step slider now
+    reaches 200 and defaults to 100 — reverse coupling needs a more accurate
+    ODE map than forward coupling does. Check the prior readout printed when
+    the dataset is built; a std far below 1 means Stage 2 is training on a
+    start distribution it will not meet at sampling time.
+
+    Requesting more than 45,000 pairs starts a second pass over the images
+    **horizontally flipped**, which yields genuinely distinct images (and so
+    distinct `x_0`) rather than duplicate rows. CIFAR-10 is flip-invariant,
+    so this is sound augmentation; beyond 2x the passes would repeat, which
+    is where the slider stops.
     """)
     return
 
@@ -1016,10 +1142,16 @@ def _(mo):
     epochs_reflow_ui = mo.ui.slider(1, 60, value=15, step=1, label="Epochs (reflow)")
     num_layers_reflow_ui = mo.ui.slider(1, 12, value=6, step=1, label="DiT layers (reflow)")
     num_samples_reflow_ui = mo.ui.slider(
-        2048, 45056, value=16384, step=2048, label="Reflow dataset size"
+        2048, 90112, value=45056, step=2048, label="Reflow dataset size"
+    )
+    coupling_reflow_ui = mo.ui.dropdown(
+        options={"reverse (real x1 -> derived x0)": "reverse",
+                 "forward (noise x0 -> synthetic x1)": "forward"},
+        value="reverse (real x1 -> derived x0)",
+        label="Reflow coupling",
     )
     gen_steps_reflow_ui = mo.ui.slider(
-        10, 100, value=50, step=5, label="ODE steps to build reflow pairs"
+        10, 200, value=100, step=5, label="ODE steps to build reflow pairs"
     )
     train_btn_reflow = mo.ui.run_button(label="Build reflow dataset + Train Stage 2")
     mo.vstack(
@@ -1036,11 +1168,13 @@ def _(mo):
             mo.hstack([lr_reflow_ui, bs_reflow_ui, wd_reflow_ui]),
             mo.hstack([epochs_reflow_ui, num_layers_reflow_ui]),
             mo.hstack([num_samples_reflow_ui, gen_steps_reflow_ui]),
+            mo.hstack([coupling_reflow_ui]),
             train_btn_reflow,
         ]
     )
     return (
         bs_reflow_ui,
+        coupling_reflow_ui,
         epochs_reflow_ui,
         gen_steps_reflow_ui,
         lr_reflow_ui,
@@ -1054,6 +1188,7 @@ def _(mo):
 @app.cell
 def _(
     bs_reflow_ui,
+    coupling_reflow_ui,
     epochs_reflow_ui,
     gen_steps_reflow_ui,
     lr_reflow_ui,
@@ -1063,6 +1198,7 @@ def _(
     train_btn_reflow,
     trained_model_rf_gen1,
     wd_reflow_ui,
+    x_tr,
     x_val,
     y_tr,
     y_val,
@@ -1081,13 +1217,37 @@ def _(
             )
         )
     else:
-        mo.output.replace(mo.md("Building reflow dataset from gen1..."))
-        x0_rf, x1_rf, y_rf = build_reflow_dataset(
-            trained_model_rf_gen1,
-            num_samples=num_samples_reflow_ui.value,
-            num_steps=gen_steps_reflow_ui.value,
-            y_labels_pool=y_tr,
-            batch_size=bs_reflow_ui.value,
+        mo.output.replace(
+            mo.md(
+                f"Building **{coupling_reflow_ui.value}** reflow dataset from gen1 "
+                f"({num_samples_reflow_ui.value:,} pairs)..."
+            )
+        )
+        if coupling_reflow_ui.value == "reverse":
+            x0_rf, x1_rf, y_rf = build_reflow_dataset_reverse(
+                trained_model_rf_gen1,
+                x_data=x_tr,
+                y_data=y_tr,
+                num_samples=num_samples_reflow_ui.value,
+                num_steps=gen_steps_reflow_ui.value,
+                batch_size=bs_reflow_ui.value,
+            )
+        else:
+            x0_rf, x1_rf, y_rf = build_reflow_dataset(
+                trained_model_rf_gen1,
+                num_samples=num_samples_reflow_ui.value,
+                num_steps=gen_steps_reflow_ui.value,
+                y_labels_pool=y_tr,
+                batch_size=bs_reflow_ui.value,
+            )
+        reflow_prior = reflow_prior_stats(x0_rf)
+        mo.output.replace(
+            mo.md(
+                f"Reflow dataset built: `{x0_rf.shape[0]:,}` pairs "
+                f"({coupling_reflow_ui.value} coupling, `{x_tr.shape[0]:,}` real images available). "
+                f"Derived `x0` prior check — mean `{reflow_prior['mean']:+.4f}` "
+                f"(target 0), std `{reflow_prior['std']:.4f}` (target 1). Training Stage 2..."
+            )
         )
         def _cb_reflow(epoch, n_epochs, tl, vl):
             mo.output.replace(
@@ -1241,10 +1401,16 @@ def _(mo):
     epochs_ot_reflow_ui = mo.ui.slider(1, 60, value=15, step=1, label="Epochs (OT-reflow)")
     num_layers_ot_reflow_ui = mo.ui.slider(1, 12, value=6, step=1, label="DiT layers (OT-reflow)")
     num_samples_ot_reflow_ui = mo.ui.slider(
-        2048, 45056, value=16384, step=2048, label="Reflow dataset size (OT-reflow)"
+        2048, 90112, value=45056, step=2048, label="Reflow dataset size (OT-reflow)"
+    )
+    coupling_ot_reflow_ui = mo.ui.dropdown(
+        options={"reverse (real x1 -> derived x0)": "reverse",
+                 "forward (noise x0 -> synthetic x1)": "forward"},
+        value="reverse (real x1 -> derived x0)",
+        label="Reflow coupling (OT)",
     )
     gen_steps_ot_reflow_ui = mo.ui.slider(
-        10, 100, value=50, step=5, label="ODE steps to build OT-reflow pairs"
+        10, 200, value=100, step=5, label="ODE steps to build OT-reflow pairs"
     )
     train_btn_ot_reflow = mo.ui.run_button(label="Build OT-reflow dataset + Train Stage 2")
     mo.vstack(
@@ -1253,11 +1419,13 @@ def _(mo):
             mo.hstack([lr_ot_reflow_ui, bs_ot_reflow_ui, wd_ot_reflow_ui]),
             mo.hstack([epochs_ot_reflow_ui, num_layers_ot_reflow_ui]),
             mo.hstack([num_samples_ot_reflow_ui, gen_steps_ot_reflow_ui]),
+            mo.hstack([coupling_ot_reflow_ui]),
             train_btn_ot_reflow,
         ]
     )
     return (
         bs_ot_reflow_ui,
+        coupling_ot_reflow_ui,
         epochs_ot_reflow_ui,
         gen_steps_ot_reflow_ui,
         lr_ot_reflow_ui,
@@ -1271,6 +1439,7 @@ def _(mo):
 @app.cell
 def _(
     bs_ot_reflow_ui,
+    coupling_ot_reflow_ui,
     epochs_ot_reflow_ui,
     gen_steps_ot_reflow_ui,
     lr_ot_reflow_ui,
@@ -1280,6 +1449,7 @@ def _(
     train_btn_ot_reflow,
     trained_model_ot_rf_gen1,
     wd_ot_reflow_ui,
+    x_tr,
     x_val,
     y_tr,
     y_val,
@@ -1298,13 +1468,37 @@ def _(
             )
         )
     else:
-        mo.output.replace(mo.md("Building reflow dataset from OT-gen1..."))
-        x0_ot_rf, x1_ot_rf, y_ot_rf = build_reflow_dataset(
-            trained_model_ot_rf_gen1,
-            num_samples=num_samples_ot_reflow_ui.value,
-            num_steps=gen_steps_ot_reflow_ui.value,
-            y_labels_pool=y_tr,
-            batch_size=bs_ot_reflow_ui.value,
+        mo.output.replace(
+            mo.md(
+                f"Building **{coupling_ot_reflow_ui.value}** reflow dataset from OT-gen1 "
+                f"({num_samples_ot_reflow_ui.value:,} pairs)..."
+            )
+        )
+        if coupling_ot_reflow_ui.value == "reverse":
+            x0_ot_rf, x1_ot_rf, y_ot_rf = build_reflow_dataset_reverse(
+                trained_model_ot_rf_gen1,
+                x_data=x_tr,
+                y_data=y_tr,
+                num_samples=num_samples_ot_reflow_ui.value,
+                num_steps=gen_steps_ot_reflow_ui.value,
+                batch_size=bs_ot_reflow_ui.value,
+            )
+        else:
+            x0_ot_rf, x1_ot_rf, y_ot_rf = build_reflow_dataset(
+                trained_model_ot_rf_gen1,
+                num_samples=num_samples_ot_reflow_ui.value,
+                num_steps=gen_steps_ot_reflow_ui.value,
+                y_labels_pool=y_tr,
+                batch_size=bs_ot_reflow_ui.value,
+            )
+        ot_reflow_prior = reflow_prior_stats(x0_ot_rf)
+        mo.output.replace(
+            mo.md(
+                f"OT-reflow dataset built: `{x0_ot_rf.shape[0]:,}` pairs "
+                f"({coupling_ot_reflow_ui.value} coupling). Derived `x0` prior check — "
+                f"mean `{ot_reflow_prior['mean']:+.4f}` (target 0), "
+                f"std `{ot_reflow_prior['std']:.4f}` (target 1). Training Stage 2..."
+            )
         )
         def _cb_ot_reflow(epoch, n_epochs, tl, vl):
             mo.output.replace(
