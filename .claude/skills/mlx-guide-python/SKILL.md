@@ -66,6 +66,62 @@ model = MLP(784, 256, 10)
 mx.eval(model.parameters())    # initialize weights
 ```
 
+## Buffers vs Parameters — the `_` Rule
+
+MLX has **no `register_buffer`**. Every `mx.array` attribute of an `nn.Module`
+becomes a trainable parameter unless its name starts with `_`:
+
+```python
+# mlx/nn/layers/base.py
+@staticmethod
+def valid_parameter_filter(module, key, value):
+    return isinstance(value, (dict, list, mx.array)) and not key.startswith("_")
+```
+
+So every **fixed constant** — RoPE theta banks, sinusoidal frequency tables, cached
+cos/sin, position indices, masks, precomputed statistics — must be `_`-prefixed, or
+the optimizer will silently train it.
+
+```python
+class RoPEAttention(nn.Module):
+    def __init__(self, dim, num_heads, seq_len):
+        super().__init__()
+        half = dim // num_heads // 2
+        # fixed geometry -> underscore, excluded from parameters()
+        self._freqs = 1.0 / (10000.0 ** (mx.arange(0, half, dtype=mx.float32) / half))
+        self._cos = mx.cos(mx.arange(seq_len, dtype=mx.float32)[:, None] * self._freqs[None, :])
+        self._sin = mx.sin(mx.arange(seq_len, dtype=mx.float32)[:, None] * self._freqs[None, :])
+        # learned weights -> bare name
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+```
+
+This fails **silently** — no error, no warning, just a loss curve that flattens. At
+`lr=1e-3` AdamW moves each entry by ~1e-3 per step, so a frequency bank
+`[1, 0.32, ..., 3.2e-4]` is ground into noise within a single epoch; rotation angles
+then shift every step and the attention lattice can never settle on a spatial pattern.
+
+Audit any model before training:
+
+```python
+import mlx.utils
+print([k for k, _ in mlx.utils.tree_flatten(model.trainable_parameters())])
+# no 'freqs', 'cos', 'sin', 'inv_freq', 'pe', 'mask' should appear
+```
+
+Two ways to keep a constant fixed:
+
+| Approach | Appears in `parameters()` / checkpoints | Use when |
+|---|---|---|
+| `self._freqs = ...` | no | new code — the constant is pure geometry |
+| `self.freqs = ...` then `self.freeze(keys=["freqs"], recurse=False)` in `__init__` | yes | you must stay compatible with existing checkpoints |
+
+`freeze` excludes the key from gradients **and** from weight decay, while keeping it
+in `parameters()` so `save_weights` still writes it. Note `freeze` is keyword-only:
+`freeze(*, recurse=True, keys=None, strict=False)`.
+
+Deliberately learnable tables stay bare — `self.pos_embed = mx.zeros((1, n, d))` is
+correct as written.
+
 ## Training Loop
 
 ```python

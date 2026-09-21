@@ -48,7 +48,7 @@ def _(mo):
     - Inference: solve `dx/dt = v_theta(x, t, y)` from `t=0` to `t=1`
 
     ### Notebook Outline
-    1. Title & research goal (this cell)
+    1. Title & research goal (this cell) — followed by the **Debugging Log**
     2. Data exploration
     3. Dataset creation
     4. Model definition (DiT + flow-matching loss + ODE solvers)
@@ -57,6 +57,201 @@ def _(mo):
     7. Validation & cross-validation
     8. Results — loss curves, generated samples, solver comparison
     9. Save trained model
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Section 1b — Debugging Log
+
+    Both models in this notebook once trained to a validation loss of ~1.5 and stayed
+    there. No exception, no NaN, no warning — just a flat curve. Five defects were
+    responsible. Each is recorded here with its symptom, root cause, why it was
+    invisible, and the measurement that exposed it.
+
+    | # | Defect | Symptom | Fix |
+    |---|---|---|---|
+    | 1 | Fixed constants registered as trainable parameters | V2 frozen at 1.4142 for 30 epochs | `_`-prefix the constants |
+    | 2 | Rotation tables rebuilt inside the gradient graph | wasted compute per step | cache in `__init__` |
+    | 3 | Timestep embedding with no dynamic range | forces a ~50x gain in the conditioning path | `time_scale=1000.0` |
+    | 4 | Unbounded attention logits (AdaLN runaway) | silent divergence, both models | QK normalization |
+    | 5 | No instrument to detect 1–4 | every failure looked identical | two verification rites |
+
+    ---
+
+    ### The number that unmasked all of it: `pi/2`
+
+    Every failure parked itself near **1.5**. That is not a coincidence and not "the
+    model is still learning". For `x_t = (1-t) x0 + t x1` with unit-variance data, the
+    best possible predictor that sees only a **single pixel** of `x_t` and the time `t`
+    — no spatial structure whatsoever — achieves
+
+    $$\mathbb{E}_t\!\left[\frac{1}{(1-t)^2 + t^2}\right] = \int_0^1 \frac{dt}{2t^2 - 2t + 1} = \frac{\pi}{2} \approx 1.5708$$
+
+    So a flow-matching loss sitting at ~1.5 means the network is extracting **zero**
+    spatial information. Deriving that floor turned a vague "it isn't learning" into a
+    precise claim: *the spatial pathway is dead*. Compute the floor for your own loss;
+    it converts a plateau into a diagnosis.
+
+    ---
+
+    ### Defect 1 — MLX silently trains any array you name without a `_`
+
+    `mlx.nn.Module.valid_parameter_filter` is literally:
+
+    ```python
+    return isinstance(value, (dict, list, mx.array)) and not key.startswith("_")
+    ```
+
+    MLX has **no `register_buffer`**. Registration is decided by the attribute *name*.
+    So `self.freqs = ...` handed the RoPE frequency bank and the sinusoidal timestep
+    bank straight to AdamW. Read back out of the trained checkpoints:
+
+    | | canonical | after training |
+    |---|---|---|
+    | RoPE `theta_0..7` (block 0) | `[1, .316, .1, .0316, .01, .00316, .001, .000316]` | `[1.19, .55, .048, .015, .077, .26, -.026, -.106]` |
+    | timestep `theta_0..5` | `[1.0, .931, .866, .806, .750, .698]` | `[1.258, 1.280, 1.232, 1.033, 1.128, .985]` |
+
+    The RoPE bank lost its sign as well as its scale. The timestep bank lost its
+    *monotonicity* — the decay is no longer a ladder, so the embedding's multi-scale
+    time resolution is gone (L2 drift from canonical: 3.07).
+
+    At `lr=1e-3` AdamW moves each entry ~1e-3 per step. The geometric decay is ground
+    into noise within one epoch, the rotation angles shift on *every* step, and
+    attention can never settle on a spatial pattern. **Fix:** `_freqs`, `_row_cos`,
+    `_row_sin`, `_col_cos`, `_col_sin`. Deliberately learnable tables such as
+    `pos_embed` correctly stay bare.
+
+    **Audit any MLX model before training:**
+
+    ```python
+    print([k for k, _ in mlx.utils.tree_flatten(model.trainable_parameters())])
+    ```
+
+    *Where checkpoints already exist,* prefer `self.freeze(keys=["freqs"], recurse=False)`
+    instead: it keeps the key in `parameters()` so old weights still load, while
+    excluding it from gradients and weight decay.
+
+    ---
+
+    ### Defect 2 — Recomputing fixed geometry every forward pass
+
+    Grid positions and their cos/sin tables were rebuilt on every call, inside the
+    gradient graph, in all six blocks. They depend only on `grid_size`, so they are
+    now built once in `__init__`. The old code also did `repeat(cos, 2)` and then
+    immediately strided it back with `[::2]` — a round trip that cancelled itself.
+    Not a correctness bug, but waste is its own kind of defect.
+
+    ---
+
+    ### Defect 3 — A clock the model could not read
+
+    The bank `theta_i = 10000^(-i/d)` spans `1 -> 1e-4`. That range assumes **DDPM
+    integer timesteps** `t in [0, 1000]`. Flow matching feeds `t in [0, 1]`, so every
+    angle is at most 1 radian and the embedding is nearly constant in `t`:
+
+    ```
+    std of the sinusoidal embedding across t  =  0.0199      (before)
+                                              =  0.4690      (after time_scale=1000)
+    ```
+
+    With a signal that weak, the network must learn a ~50x amplifier just to tell one
+    timestep from another — and that high-gain conditioning path is what made training
+    fragile. **Fix:** `time_scale=1000.0`, restoring the range the formula was designed
+    for. A formula copied from one regime does not carry its assumptions with it.
+
+    ---
+
+    ### Defect 4 — Unbounded attention logits, in *both* models
+
+    AdaLN feeds each block `LayerNorm(x) * (1 + scale)`, so attention logits grow as
+    `scale^2`. Nothing bounded `scale`, and sharpening attention lowers the loss — so
+    the optimizer drove it up until softmax became a hard argmax. Measured in the two
+    stalled checkpoints against a healthy run:
+
+    | Signal | healthy | stalled V2 | stalled V1 |
+    |---|---|---|---|
+    | `cond` RMS | 6.40 | 45.43 | 22.64 |
+    | AdaLN `scale` RMS | 0.89 | **423.3** | **148.8** |
+    | final residual RMS | 3.87 | **325 820** | **24 650** |
+    | attention entropy | not measured | **0.0000** | **0.0000** |
+    | max attention logit | — | — | **5.8e7** |
+
+    (The healthy column is the original V1 checkpoint, which predates the entropy
+    probe. Healthy runs measured afterwards hold entropy between 1.8 and 3.6, against
+    a uniform-attention maximum of `ln 64 = 4.159`.)
+
+    Entropy of exactly zero means every query attends to precisely one key. No gradient
+    flows through a saturated softmax: the model is **dead**, not slow. It still
+    reported a finite ~1.5 loss because `final_norm` renormalizes the blow-up — which
+    is exactly why the failure was invisible.
+
+    **Fix:** QK normalization — `nn.RMSNorm(head_dim)` applied to q and k per head, the
+    ViT-22B / SD3 / Flux remedy. It decouples attention sharpness from the AdaLN scale.
+    `nn.MultiHeadAttention` offers no such option, so V1 uses `QKNormAttentionV1`
+    (identical to `RoPE2DAttentionV2` minus the rotation).
+
+    **The hardest lesson here.** This was first diagnosed as a V2-only problem, on the
+    theory that V2 lacks `pos_embed` and so has no other lever to sharpen attention.
+    That theory was wrong: V1 diverged the same way as soon as its trajectory was
+    perturbed. V1's original success was **luck, not immunity**. A single run that
+    happens to work is not evidence that a design is stable.
+
+    Also note what did **not** work — each was tested in isolation and still diverged:
+
+    | Attempted fix alone | Result |
+    |---|---|
+    | `time_scale=1000` only | `scale` 1.67 -> 17.7, diverged |
+    | zero-init the AdaLN projection only | `scale` 2.45 -> 11.1, diverged |
+    | QK norm only | survived, but residual stayed ~530 and convergence was slow |
+    | QK norm **+** `time_scale` | `val 0.42`, residual self-stabilized to ~3 |
+
+    ---
+
+    ### Defect 5 — There was no instrument
+
+    Every one of the above produced the same flat ~1.5 curve. A loss value alone cannot
+    distinguish "untrained", "unlucky" and "catastrophically diverged". Two rites now
+    live in this notebook:
+
+    - **`verify_rope2d_v2`** (Section 4b) — asserts no fixed constant reaches
+      `trainable_parameters()`, and confirms numerically that the attention score
+      depends only on the *relative* patch offset (holds to ~1e-6, float32's limit).
+    - **`diagnose_training_health`** (Sections 8 and 8b) — reports AdaLN `scale` RMS,
+      final residual RMS, minimum attention entropy, and time-signal strength. Run it
+      on **every** trained model before trusting a loss number.
+
+    ---
+
+    ### Known remaining gap — reproducibility
+
+    This notebook does **not** reproduce run to run. `make_batches` calls unseeded
+    `np.random.permutation`, and `compute_flow_loss` draws `t` and `x0` from the
+    unseeded global MLX RNG. Two byte-identical runs under `mx.random.seed(7)` gave
+    epoch-2 losses of **1.6414 vs 1.4615**.
+
+    Consequence: **any A/B gap smaller than ~0.2 at short horizons is noise.** V1 and V2
+    both land near 0.42 at 20 000 images / 12 epochs; that is not evidence they are
+    equivalent. To fix this properly, thread an explicit `mx.random.key` and a
+    `np.random.Generator` through `make_batches` and `compute_flow_loss` rather than
+    relying on global state.
+
+    ---
+
+    ### Five transferable rules
+
+    1. **Compute your loss's floor.** A plateau at an unexplained value is a clue, not
+       a mystery. `pi/2` turned "not learning" into "the spatial pathway is dead".
+    2. **Print `trainable_parameters()` before training.** In MLX the parameter set is
+       decided by attribute naming, and getting it wrong fails silently.
+    3. **Measure activations, not just loss.** `final_norm` will hide a 10^5 blow-up
+       behind a perfectly finite number.
+    4. **Attention entropy is the vital sign of a transformer.** Zero means a hard
+       argmax and dead gradients, long before the loss admits anything is wrong.
+    5. **One run proves nothing.** An intermittent failure is still a failure; a lucky
+       success is still a bug.
     """)
     return
 
@@ -242,14 +437,24 @@ def _(mo):
 
 @app.class_definition
 class SinusoidalTimestepEmbeddingV1(nn.Module):
-    def __init__(self, embed_dim: int = 256):
+    def __init__(self, embed_dim: int = 256, time_scale: float = 1000.0):
         super().__init__()
         self.embed_dim = embed_dim
+        # The frequency bank spans 1 -> 1e-4, which assumes DDPM-style integer
+        # timesteps t in [0, 1000]. Flow matching feeds t in [0, 1], so without
+        # rescaling every angle is <= 1 rad, the embedding is nearly constant in t
+        # (std across t ~ 0.02), and the model must learn a ~50x amplifier just to
+        # read the clock. That high-gain conditioning path is what destabilises
+        # training. Scaling t back to [0, 1000] restores the intended range.
+        self.time_scale = time_scale
         half = embed_dim // 2
-        self.freqs = mx.exp(-math.log(10000.0) * mx.arange(0, half, dtype=mx.float32) / max(half, 1))
+        # underscore prefix keeps this out of Module.parameters(): the sinusoidal
+        # frequency bank is a fixed constant, never an optimizer target
+        self._freqs = mx.exp(-math.log(10000.0) * mx.arange(0, half, dtype=mx.float32) / max(half, 1))
 
     def __call__(self, t: mx.array) -> mx.array:
-        return mx.concatenate([mx.sin(t[:, None] * self.freqs[None, :]), mx.cos(t[:, None] * self.freqs[None, :])], axis=-1)
+        a = (t * self.time_scale)[:, None] * self._freqs[None, :]
+        return mx.concatenate([mx.sin(a), mx.cos(a)], axis=-1)
 
 
 @app.class_definition
@@ -276,17 +481,56 @@ class PatchifyV1(nn.Module):
 
 
 @app.class_definition
+class QKNormAttentionV1(nn.Module):
+    """Multi-head attention with QK normalization and no positional injection.
+
+    Identical to `RoPE2DAttentionV2` except that it applies no rotation: V1 receives
+    position from the learned `pos_embed` table added to the patch embeddings. Keeping
+    the two attentions otherwise identical is what makes the V1-vs-V2 comparison a
+    clean ablation of the positional encoding alone.
+
+    This replaces `nn.MultiHeadAttention`, which offers no QK normalization. Without
+    it, AdaLN feeds the block `LayerNorm(x) * (1 + scale)`, attention logits grow as
+    `scale^2`, and training diverges to a saturated hard-argmax attention (entropy 0)
+    from which no gradient escapes. Parameter count is unchanged: MLX's
+    `MultiHeadAttention` also defaults to `bias=False`, so only the two RMSNorm gains
+    (2 * head_dim per block) are added.
+    """
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q_proj = nn.Linear(dim, dim, bias=False)
+        self.k_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = nn.Linear(dim, dim, bias=False)
+        self.out_proj = nn.Linear(dim, dim, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        B, N, D = x.shape
+        H, hd = self.num_heads, self.head_dim
+        q = self.q_norm(self.q_proj(x).reshape(B, N, H, hd)).transpose(0, 2, 1, 3)
+        k = self.k_norm(self.k_proj(x).reshape(B, N, H, hd)).transpose(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, N, H, hd).transpose(0, 2, 1, 3)
+        attn = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * (hd ** -0.5), axis=-1)
+        out = (attn @ v).transpose(0, 2, 1, 3).reshape(B, N, D)
+        return self.out_proj(out)
+
+
+@app.class_definition
 class DiTBlockV1(nn.Module):
     def __init__(self, dim: int = 256, num_heads: int = 8, mlp_dim: int = 512, cond_dim: int = 256):
         super().__init__()
         self.attn_norm = AdaptiveLayerNormV1(dim, cond_dim)
-        self.attn = nn.MultiHeadAttention(dim, num_heads)
+        self.attn = QKNormAttentionV1(dim, num_heads)
         self.mlp_norm = AdaptiveLayerNormV1(dim, cond_dim)
         self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim))
 
     def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         h = self.attn_norm(x, cond)
-        x = x + self.attn(h, h, h)
+        x = x + self.attn(h)
         return x + self.mlp(self.mlp_norm(x, cond))
 
 
@@ -431,7 +675,7 @@ def _(mo):
     | Positional embedding | learnable table `(1, N, D)` | `(B, N, D)` |
     | Time embedding | `SinusoidalTimestepEmbeddingV1` + MLP | `(B, D)` |
     | Class embedding | `nn.Embedding(C+1, D)` (null token for CFG) | `(B, D)` |
-    | Backbone | `DiTBlockV1 x num_layers` (AdaLN attn + AdaLN MLP) | `(B, N, D)` |
+    | Backbone | `DiTBlockV1 x num_layers` (AdaLN + `QKNormAttentionV1`, AdaLN + MLP) | `(B, N, D)` |
     | Head | `LayerNorm` + `UnpatchifyV1` | `(B, H, W, C)` |
 
     Defaults: `image_size=32, patch_size=4, embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6`.
@@ -527,88 +771,178 @@ def _(mo):
 
     ---
 
-    #### Implementation: `rotate_pairs`
+    #### Implementation: `_apply_rotary`
+
+    The rotation tables are **built once in `__init__`** — positions and
+    frequencies are fixed geometry, so there is nothing to recompute per step.
 
     ```python
     quarter   = head_dim // 4
-    freqs[i]  = 10000 ** (-4*i / head_dim)         # (quarter,)
+    freqs[i]  = 10000 ** (-4*i / head_dim)          # (quarter,)
 
     # for position vector p ∈ {row_pos, col_pos}, shape (N,):
     angles    = p[:, None] * freqs[None, :]         # (N, quarter)
-    cos_full  = repeat(cos(angles), 2, axis=-1)     # (N, half)  — each value duplicated
-    sin_full  = repeat(sin(angles), 2, axis=-1)     # (N, half)
+    cos, sin  = cos(angles), sin(angles)            # (N, quarter) — cached
 
-    # rotate_pairs(x, cos_full, sin_full),  x: (B, N, H, half):
-    x0 = x[..., 0::2]                              # even-indexed pairs  (B,N,H,quarter)
-    x1 = x[..., 1::2]                              # odd-indexed pairs   (B,N,H,quarter)
-    c, s = cos_full[..., ::2], sin_full[..., ::2]  # unique values       (N,quarter)
-    rot_0 = x0 * c - x1 * s
-    rot_1 = x0 * s + x1 * c
-    return interleave(rot_0, rot_1)                 # (B,N,H,half)
+    # _apply_rotary(x, cos, sin),  x: (B, N, H, half):
+    pairs  = x.reshape(B, N, H, quarter, 2)
+    x0, x1 = pairs[..., 0], pairs[..., 1]           # even / odd of each pair
+    rot_0  = x0 * cos - x1 * sin
+    rot_1  = x0 * sin + x1 * cos
+    return stack([rot_0, rot_1], -1).reshape(B, N, H, half)
     ```
 
     `DiffusionTransformerV2` drops the learnable `pos_embed` table
     (≈ `num_patches × embed_dim` = `64 × 256 = 16 384` scalars) and injects
     position via fixed RoPE rotations directly into every Q and K projection.
+
+    ---
+
+    #### ⚠ MLX pitfall — fixed geometry must not become a parameter
+
+    `mlx.nn.Module.valid_parameter_filter` registers **every** `mx.array`
+    attribute as a learnable parameter unless its key starts with `_`:
+
+    ```python
+    return isinstance(value, (dict, list, mx.array)) and not key.startswith("_")
+    ```
+
+    A RoPE frequency bank stored as `self.freqs` is therefore handed to the
+    optimizer. At `lr=1e-3` AdamW moves each θ_i by ~1e-3 per step, so after a
+    single epoch the geometric decay `[1, 0.32, …, 3.2e-4]` is ground into
+    noise (observed: `[1.19, 0.55, …, -0.11]`). The rotation angles then shift
+    on *every* step, the attention lattice can never settle on a spatial
+    pattern, and the loss stalls at the **no-spatial-information floor**
+
+    $$\mathbb{E}_t\!\left[\tfrac{1}{(1-t)^2 + t^2}\right] = \int_0^1 \frac{dt}{2t^2 - 2t + 1} = \frac{\pi}{2} \approx 1.571$$
+
+    which is the MSE of the best predictor that sees only `(x_t, t)` per pixel.
+    All RoPE constants here are `_`-prefixed for exactly this reason.
+
+    ---
+
+    #### Second failure mode — silent divergence to the same floor
+
+    Fixing the frequency bank is necessary but **not sufficient**. V2 still stalls at
+    the same `pi/2` floor, intermittently, for an unrelated reason: it *diverges*, and
+    `final_norm` hides it. Two compounding defects:
+
+    **1. The timestep embedding has almost no dynamic range.** The bank spans
+    `1 -> 1e-4`, which assumes DDPM integer timesteps `t in [0, 1000]`. Flow matching
+    feeds `t in [0, 1]`, so every angle is <= 1 rad and the embedding is nearly constant:
+    `std across t = 0.0199`. The model must learn a ~50x amplifier just to read the
+    clock, which forces the conditioning path into a high-gain regime
+    (measured `cond` RMS 45.4 in the stalled run, vs 6.4 in healthy V1).
+
+    **2. Attention logits are unbounded.** AdaLN feeds each block
+    `LayerNorm(x) * (1 + scale)`, so logits grow as `scale^2`. V2 has no `pos_embed`,
+    so its only lever for sharpening attention is that shared `scale` — and it drives
+    it up until softmax saturates. Measured in the stalled checkpoint:
+
+    | Signal | healthy V1 | stalled V2 |
+    |---|---|---|
+    | `cond` RMS | 6.40 | 45.43 |
+    | AdaLN `scale` RMS | 0.89 | **423.3** |
+    | final residual RMS | 3.87 | **325 820** |
+    | attention entropy | — | **0.0000** (uniform = 4.159) |
+
+    Entropy 0 means every query attends to exactly one key: a hard argmax, through
+    which no gradient flows. The model is dead, but the loss reads a finite 1.50
+    because `final_norm` renormalizes the blow-up.
+
+    **The fixes**, both applied above and both required:
+    `time_scale=1000.0` in `SinusoidalTimestepEmbeddingV1` restores the intended
+    angle range, and **QK normalization** (`nn.RMSNorm` on q and k per head — the
+    ViT-22B / SD3 / Flux remedy) decouples attention sharpness from the AdaLN scale.
+    Measured over 14 epochs on 8 192 images: monotone descent to `val 0.4502` with the
+    network self-stabilizing (residual `213 -> 3.7`, scale `3.2 -> 1.5`, entropy never
+    below 1.77). Neither fix alone was sufficient — both were tested in isolation and
+    both still diverged.
+
+    **This is not a V2 problem.** The AdaLN runaway is architecture-independent; V1
+    merely got lucky on its first run. Given the corrected timestep range but still
+    using `nn.MultiHeadAttention` (no QK norm), V1 diverged the same way — AdaLN
+    `scale` 148.8, residual 24 650, attention entropy 0.0000 in all six blocks, logits
+    reaching 5.8e7, final loss 1.4326. So V1 uses `QKNormAttentionV1`, which is
+    `RoPE2DAttentionV2` minus the rotation. With it, V1 reaches `val 0.4212` in 12
+    epochs on 20 000 images and `scale` settles at 0.89 — the same value the original
+    healthy V1 held.
+
+    Keeping QK norm in **both** models also preserves the ablation: V1 and V2 now
+    differ by exactly the `pos_embed` table and the RoPE rotation, nothing else.
     """)
     return
 
 
 @app.class_definition
 class RoPE2DAttentionV2(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, grid_size: int = 8):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
         quarter = self.head_dim // 4
-        # θ_i = 10000^(-4i/head_dim), shared by row-half and col-half
-        self.freqs = 1.0 / (10000.0 ** (mx.arange(0, quarter, dtype=mx.float32) * 4.0 / self.head_dim))
+        # θ_i = 10000^(-4i/head_dim), shared by row-half and col-half.
+        # Every attribute below is underscore-prefixed so MLX keeps it OUT of
+        # Module.parameters(): RoPE frequencies and grid positions are fixed
+        # geometry. Registering them as parameters lets AdamW scramble the
+        # frequency bank every step, which destroys positional structure.
+        freqs = 1.0 / (10000.0 ** (mx.arange(0, quarter, dtype=mx.float32) * 4.0 / self.head_dim))
+        # row-major patch order: patch (r, c) → index r*grid_size + c
+        row_pos = mx.array([r for r in range(grid_size) for _ in range(grid_size)], dtype=mx.float32)
+        col_pos = mx.array([c for _ in range(grid_size) for c in range(grid_size)], dtype=mx.float32)
+        # cached rotation tables, (N, quarter): one angle per (position, frequency)
+        self._row_cos, self._row_sin = self._rotation_table(row_pos, freqs)
+        self._col_cos, self._col_sin = self._rotation_table(col_pos, freqs)
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.out_proj = nn.Linear(dim, dim, bias=False)
+        # QK normalization (ViT-22B / SD3 / Flux). AdaLN feeds this block
+        # LayerNorm(x) * (1 + scale), so attention logits grow as scale^2. With no
+        # bound, the model drives `scale` up to sharpen attention until softmax
+        # saturates (entropy -> 0) and every gradient through it dies. Normalizing
+        # q and k per head decouples attention sharpness from the AdaLN scale.
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
 
-    def _make_cos_sin(self, positions: mx.array):
-        # positions: (N,) — row or col grid indices cast to float
-        # angles:   (N, quarter) → cos/sin: (N, half) with each value pair-duplicated
-        angles = positions[:, None] * self.freqs[None, :]
-        cos = mx.repeat(mx.cos(angles), 2, axis=-1)
-        sin = mx.repeat(mx.sin(angles), 2, axis=-1)
-        return cos, sin
+    @staticmethod
+    def _rotation_table(positions: mx.array, freqs: mx.array):
+        # positions: (N,) row or col grid indices; freqs: (quarter,)
+        # angles → cos/sin: (N, quarter), one entry per rotated dimension-pair
+        angles = positions[:, None] * freqs[None, :]
+        return mx.cos(angles), mx.sin(angles)
 
     def _apply_rotary(self, x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
         # x:   (B, N, H, half)   where half = head_dim // 2
-        # cos/sin: (N, half) from _make_cos_sin (pair-duplicated)
+        # cos/sin: (N, quarter)  where quarter = half // 2
         B, N, H, half = x.shape
         pairs = x.reshape(B, N, H, half // 2, 2)
         x0, x1 = pairs[..., 0], pairs[..., 1]          # (B, N, H, half//2) each
-        c = cos[:, ::2][None, :, None, :]               # (1, N, 1, half//2) unique cos
-        s = sin[:, ::2][None, :, None, :]               # (1, N, 1, half//2) unique sin
+        c = cos[None, :, None, :]                       # (1, N, 1, half//2)
+        s = sin[None, :, None, :]                       # (1, N, 1, half//2)
         rot0 = x0 * c - x1 * s
         rot1 = x0 * s + x1 * c
         return mx.stack([rot0, rot1], axis=-1).reshape(B, N, H, half)
 
-    def __call__(self, x: mx.array, row_pos: mx.array, col_pos: mx.array) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
         B, N, D = x.shape
         H, hd = self.num_heads, self.head_dim
         half = hd // 2
 
-        q = self.q_proj(x).reshape(B, N, H, hd)
-        k = self.k_proj(x).reshape(B, N, H, hd)
+        q = self.q_norm(self.q_proj(x).reshape(B, N, H, hd))
+        k = self.k_norm(self.k_proj(x).reshape(B, N, H, hd))
         v = self.v_proj(x).reshape(B, N, H, hd)
 
         # split each head into row-half [0, half) and col-half [half, hd)
         q_r, q_c = q[..., :half], q[..., half:]
         k_r, k_c = k[..., :half], k[..., half:]
 
-        # apply 1-D RoPE independently on each half with the matching position vector
-        r_cos, r_sin = self._make_cos_sin(row_pos)
-        c_cos, c_sin = self._make_cos_sin(col_pos)
-        q_r = self._apply_rotary(q_r, r_cos, r_sin)
-        k_r = self._apply_rotary(k_r, r_cos, r_sin)
-        q_c = self._apply_rotary(q_c, c_cos, c_sin)
-        k_c = self._apply_rotary(k_c, c_cos, c_sin)
+        # apply 1-D RoPE independently on each half with the matching cached table
+        q_r = self._apply_rotary(q_r, self._row_cos, self._row_sin)
+        k_r = self._apply_rotary(k_r, self._row_cos, self._row_sin)
+        q_c = self._apply_rotary(q_c, self._col_cos, self._col_sin)
+        k_c = self._apply_rotary(k_c, self._col_cos, self._col_sin)
 
         q = mx.concatenate([q_r, q_c], axis=-1).transpose(0, 2, 1, 3)  # (B, H, N, hd)
         k = mx.concatenate([k_r, k_c], axis=-1).transpose(0, 2, 1, 3)
@@ -622,16 +956,16 @@ class RoPE2DAttentionV2(nn.Module):
 
 @app.class_definition
 class DiTBlockV2(nn.Module):
-    def __init__(self, dim: int = 256, num_heads: int = 8, mlp_dim: int = 512, cond_dim: int = 256):
+    def __init__(self, dim: int = 256, num_heads: int = 8, mlp_dim: int = 512, cond_dim: int = 256, grid_size: int = 8):
         super().__init__()
         self.attn_norm = AdaptiveLayerNormV1(dim, cond_dim)
-        self.attn = RoPE2DAttentionV2(dim, num_heads)
+        self.attn = RoPE2DAttentionV2(dim, num_heads, grid_size)
         self.mlp_norm = AdaptiveLayerNormV1(dim, cond_dim)
         self.mlp = nn.Sequential(nn.Linear(dim, mlp_dim), nn.GELU(), nn.Linear(mlp_dim, dim))
 
-    def __call__(self, x: mx.array, cond: mx.array, row_pos: mx.array, col_pos: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         h = self.attn_norm(x, cond)
-        x = x + self.attn(h, row_pos, col_pos)
+        x = x + self.attn(h)
         return x + self.mlp(self.mlp_norm(x, cond))
 
 
@@ -662,19 +996,15 @@ class DiffusionTransformerV2(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
         self.class_embed = nn.Embedding(num_classes + 1, embed_dim)
-        self.blocks = [DiTBlockV2(embed_dim, num_heads, mlp_dim, embed_dim) for _ in range(num_layers)]
+        self.blocks = [DiTBlockV2(embed_dim, num_heads, mlp_dim, embed_dim, self.grid_size) for _ in range(num_layers)]
         self.final_norm = nn.LayerNorm(embed_dim)
         self.unpatchify = UnpatchifyV1(patch_size, embed_dim, in_channels, image_size)
 
     def __call__(self, x: mx.array, t: mx.array, y: mx.array) -> mx.array:
-        g = self.grid_size
-        # row-major patch order: patch (r, c) → index r*g + c
-        row_pos = mx.array([r for r in range(g) for _ in range(g)], dtype=mx.float32)
-        col_pos = mx.array([c for _ in range(g) for c in range(g)], dtype=mx.float32)
         h = self.patchify(x)
         cond = self.time_embed(t) + self.class_embed(y)
         for block in self.blocks:
-            h = block(h, cond, row_pos, col_pos)
+            h = block(h, cond)
         return self.unpatchify(self.final_norm(h))
 
 
@@ -697,9 +1027,86 @@ def _(mo):
 
     | Model | Parameters | Notes |
     |-------|-----------|-------|
-    | `DiffusionTransformerV1` | `{_n1:,}` | includes learnable `pos_embed` table |
-    | `DiffusionTransformerV2` | `{_n2:,}` | 2-D RoPE — no `pos_embed` |
-    | Difference | `{_n1 - _n2:+,}` | ≈ `num_patches × embed_dim` = `{64 * 256:,}` removed |
+    | `DiffusionTransformerV1` | `{_n1:,}` | learnable `pos_embed` table + `QKNormAttentionV1` |
+    | `DiffusionTransformerV2` | `{_n2:,}` | 2-D RoPE, no `pos_embed` + `RoPE2DAttentionV2` |
+    | Difference | `{_n1 - _n2:+,}` | exactly `num_patches × embed_dim` = `{64 * 256:,}` |
+
+    The two attentions are identical apart from the RoPE rotation, and both carry QK
+    normalization, so this difference is *entirely* the `pos_embed` table — the
+    comparison is a clean ablation of the positional encoding alone.
+    """)
+    return
+
+
+@app.function
+def verify_rope2d_v2(model: nn.Module) -> dict:
+    fixed_names = ("freqs", "_freqs", "_row_cos", "_row_sin", "_col_cos", "_col_sin")
+    trainable = [k for k, _ in mlx.utils.tree_flatten(model.trainable_parameters())]
+    leaked = [k for k in trainable if k.rsplit(".", 1)[-1] in fixed_names]
+
+    attn = model.blocks[0].attn
+    g = model.grid_size
+    n = g * g
+    hd = attn.head_dim
+    half = hd // 2
+    # identical content in every patch: any variation in score is purely positional
+    x = mx.repeat(mx.random.normal(shape=(1, 1, model.embed_dim)), n, axis=1)
+    q = attn.q_norm(attn.q_proj(x).reshape(1, n, attn.num_heads, hd))
+    k = attn.k_norm(attn.k_proj(x).reshape(1, n, attn.num_heads, hd))
+    q = mx.concatenate(
+        [
+            attn._apply_rotary(q[..., :half], attn._row_cos, attn._row_sin),
+            attn._apply_rotary(q[..., half:], attn._col_cos, attn._col_sin),
+        ],
+        axis=-1,
+    ).transpose(0, 2, 1, 3)
+    k = mx.concatenate(
+        [
+            attn._apply_rotary(k[..., :half], attn._row_cos, attn._row_sin),
+            attn._apply_rotary(k[..., half:], attn._col_cos, attn._col_sin),
+        ],
+        axis=-1,
+    ).transpose(0, 2, 1, 3)
+    scores = np.array((q @ k.transpose(0, 1, 3, 2))[0, 0])
+
+    offset_groups = {}
+    for i in range(n):
+        for j in range(n):
+            offset_groups.setdefault((i // g - j // g, i % g - j % g), []).append(scores[i, j])
+    spread = max(float(np.max(v) - np.min(v)) for v in offset_groups.values())
+    return {
+        "leaked": leaked,
+        "offset_spread": spread,
+        "score_range": float(scores.max() - scores.min()),
+    }
+
+
+@app.cell
+def _(mo):
+    _v2_check = DiffusionTransformerV2(
+        image_size=32, patch_size=4, in_channels=3, num_classes=10,
+        embed_dim=256, num_heads=8, mlp_dim=512, num_layers=6,
+    )
+    mx.eval(_v2_check.parameters())
+    _rep = verify_rope2d_v2(_v2_check)
+    _p1 = "PASS" if not _rep["leaked"] else "FAIL"
+    _p2 = "PASS" if _rep["offset_spread"] < 1e-3 else "FAIL"
+    _p3 = "PASS" if _rep["score_range"] > 0.1 else "FAIL"
+    mo.md(f"""
+    ### Rite of Verification — 2-D RoPE
+
+    | Check | Result | Verdict |
+    |---|---|---|
+    | Fixed constants leaked into `trainable_parameters()` | `{_rep["leaked"] or "none"}` | **{_p1}** |
+    | Max score spread within one relative-offset class | `{_rep["offset_spread"]:.2e}` | **{_p2}** |
+    | Positional score dynamic range | `{_rep["score_range"]:.3f}` | **{_p3}** |
+
+    Placing identical content in every patch makes any variation in the attention
+    score purely positional. Check 2 confirms that
+    $\\langle \\mathbf{{R}}(m)\\mathbf{{q}},\\; \\mathbf{{R}}(n)\\mathbf{{k}}\\rangle$
+    depends only on the relative displacement $m - n$, to float32 precision.
+    Check 1 guards the failure mode that previously stalled V2: a frequency bank
+    silently registered as a trainable parameter.
     """)
     return
 
@@ -1121,6 +1528,32 @@ def _(mo, train_losses, trained_model, val_losses):
     return
 
 
+@app.cell
+def _(mo, trained_model):
+    if trained_model is None:
+        _out = mo.md("_Train V1 (Section 5) first to run the training-health probe._")
+    else:
+        _h = diagnose_training_health(trained_model)
+        _h1 = "PASS" if _h["adaln_scale_rms"] < 50 else "DIVERGED"
+        _h2 = "PASS" if _h["final_residual_rms"] < 1e3 else "DIVERGED"
+        _h3 = "PASS" if _h["min_attn_entropy"] > 0.2 else "SATURATED"
+        _out = mo.md(f"""
+        ### Training-Health Probe — V1
+
+        | Signal | Value | Healthy range | Verdict |
+        |---|---|---|---|
+        | AdaLN `scale` RMS | `{_h["adaln_scale_rms"]:.3f}` | < 50 | **{_h1}** |
+        | Final residual RMS | `{_h["final_residual_rms"]:.3f}` | < 1e3 | **{_h2}** |
+        | Min attention entropy | `{_h["min_attn_entropy"]:.3f}` | > 0.2 (uniform = `{_h["uniform_attn_entropy"]:.3f}`) | **{_h3}** |
+        | `cond` RMS | `{_h["cond_rms"]:.3f}` | — | — |
+
+        Run this on **both** models. The AdaLN runaway is architecture-independent:
+        V1 diverged here too until it was given QK normalization.
+        """)
+    _out
+    return
+
+
 @app.function
 def denormalize_cifar(x: mx.array) -> np.ndarray:
     mean = np.array([0.4914, 0.4822, 0.4465], dtype=np.float32).reshape(1, 1, 1, 3)
@@ -1407,6 +1840,93 @@ def _(
         _out = plot_loss_curve(train_losses, val_losses)
     else:
         _out = plot_loss_curves_v1_v2(train_losses, val_losses, train_losses_v2, val_losses_v2)
+    _out
+    return
+
+
+@app.function
+def diagnose_training_health(model: nn.Module, n_probe: int = 8) -> dict:
+    t = mx.array(np.linspace(0.05, 0.95, n_probe).astype(np.float32))
+    y = mx.array(np.zeros(n_probe, dtype=np.int32))
+    x = mx.random.normal(shape=(n_probe, 32, 32, 3))
+
+    def _rms(v):
+        return float(mx.sqrt(mx.mean(v.astype(mx.float32) ** 2)))
+
+    sinus = model.time_embed.layers[0](t)
+    cond = model.time_embed(t) + model.class_embed(y)
+    h = model.patchify(x)
+    if hasattr(model, "pos_embed"):
+        h = h + model.pos_embed
+    scale, _ = mx.split(model.blocks[0].attn_norm.proj(nn.silu(cond))[:, None, :], 2, axis=-1)
+
+    entropies = []
+    for block in model.blocks:
+        attn = block.attn
+        hn = block.attn_norm(h, cond)
+        b, n, _d = hn.shape
+        heads, hd = attn.num_heads, attn.head_dim
+        half = hd // 2
+        q = attn.q_norm(attn.q_proj(hn).reshape(b, n, heads, hd))
+        k = attn.k_norm(attn.k_proj(hn).reshape(b, n, heads, hd))
+        if hasattr(attn, "_row_cos"):
+            q = mx.concatenate(
+                [
+                    attn._apply_rotary(q[..., :half], attn._row_cos, attn._row_sin),
+                    attn._apply_rotary(q[..., half:], attn._col_cos, attn._col_sin),
+                ],
+                axis=-1,
+            )
+            k = mx.concatenate(
+                [
+                    attn._apply_rotary(k[..., :half], attn._row_cos, attn._row_sin),
+                    attn._apply_rotary(k[..., half:], attn._col_cos, attn._col_sin),
+                ],
+                axis=-1,
+            )
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        probs = mx.softmax((q @ k.transpose(0, 1, 3, 2)) * (hd ** -0.5), axis=-1)
+        entropies.append(float(mx.mean(-mx.sum(probs * mx.log(probs + 1e-9), axis=-1))))
+        h = block(h, cond)
+
+    n_tokens = h.shape[1] if h.ndim == 3 else (32 // 4) ** 2
+    return {
+        "time_signal_std": float(mx.mean(mx.std(sinus, axis=0))),
+        "cond_rms": _rms(cond),
+        "adaln_scale_rms": _rms(scale),
+        "final_residual_rms": _rms(h),
+        "min_attn_entropy": min(entropies) if entropies else float("nan"),
+        "uniform_attn_entropy": math.log(64),
+    }
+
+
+@app.cell
+def _(mo, trained_model_v2):
+    if trained_model_v2 is None:
+        _out = mo.md("_Train V2 (Section 5b) first to run the training-health probe._")
+    else:
+        _d = diagnose_training_health(trained_model_v2)
+        _c1 = "PASS" if _d["adaln_scale_rms"] < 50 else "DIVERGED"
+        _c2 = "PASS" if _d["final_residual_rms"] < 1e3 else "DIVERGED"
+        _c3 = "PASS" if _d["min_attn_entropy"] > 0.2 else "SATURATED"
+        _c4 = "PASS" if _d["time_signal_std"] > 0.1 else "WEAK"
+        _out = mo.md(f"""
+        ### Training-Health Probe — V2
+
+        | Signal | Value | Healthy range | Verdict |
+        |---|---|---|---|
+        | AdaLN `scale` RMS | `{_d["adaln_scale_rms"]:.3f}` | < 50 | **{_c1}** |
+        | Final residual RMS | `{_d["final_residual_rms"]:.3f}` | < 1e3 | **{_c2}** |
+        | Min attention entropy | `{_d["min_attn_entropy"]:.3f}` | > 0.2 (uniform = `{_d["uniform_attn_entropy"]:.3f}`) | **{_c3}** |
+        | Time-signal std across `t` | `{_d["time_signal_std"]:.4f}` | > 0.1 | **{_c4}** |
+        | `cond` RMS | `{_d["cond_rms"]:.3f}` | — | — |
+
+        A flow-matching loss stuck near `pi/2 = 1.571` with **zero attention entropy**
+        is a *diverged* model, not an untrained one: `final_norm` renormalizes the
+        blow-up, so the loss stays finite and the failure is silent. This probe makes
+        that state visible.
+        """)
     _out
     return
 

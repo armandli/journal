@@ -8,7 +8,9 @@ All in `mlx.nn` (imported as `nn`).
 class MyModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # Assign nn.Module or mx.array attributes — MLX tracks them automatically
+        # nn.Module and mx.array attributes are tracked automatically.
+        # An mx.array attribute becomes a TRAINABLE PARAMETER unless the
+        # name starts with "_" — see "Parameters vs Buffers" below.
 
     def __call__(self, x):
         # forward pass
@@ -16,15 +18,52 @@ class MyModel(nn.Module):
 
 model = MyModel()
 mx.eval(model.parameters())          # initialize (allocates memory)
-params = model.parameters()          # nested dict of arrays
+params = model.parameters()          # nested dict of arrays (includes frozen)
+trainable = model.trainable_parameters()   # what grads/optimizer actually see
 model.update(new_params)             # replace parameters
-model.apply(lambda x: x * 2)        # map fn over all params in-place
+model.apply(lambda x: x * 2)         # map fn over all params in-place
 model.train()                        # set training mode (affects Dropout, BatchNorm)
 model.eval()                         # set eval mode
 model.freeze()                       # exclude all from grad
 model.freeze(keys=["embed"])         # freeze specific submodules
 model.unfreeze()
-trainable = model.trainable_parameters()
+```
+
+## Parameters vs Buffers
+
+MLX has **no `register_buffer`**. Registration is decided purely by the attribute name:
+
+```python
+@staticmethod                          # mlx/nn/layers/base.py
+def valid_parameter_filter(module, key, value):
+    return isinstance(value, (dict, list, mx.array)) and not key.startswith("_")
+```
+
+| Attribute | In `parameters()` | In `trainable_parameters()` | Saved by `save_weights` |
+|---|---|---|---|
+| `self.w = mx.zeros(...)` | yes | yes | yes |
+| `self._w = mx.zeros(...)` | no | no | no |
+| `self.w = ...` + `freeze(keys=["w"], recurse=False)` | yes | **no** | yes |
+
+Any array that is **fixed geometry** must be `_`-prefixed: RoPE theta banks,
+sinusoidal frequency tables, cached cos/sin, position index vectors, attention masks,
+precomputed normalization statistics. Naming one of these without the underscore hands
+it to the optimizer, which corrupts it silently — no error, only a flat loss curve.
+
+```python
+self._freqs = 1.0 / (10000.0 ** (mx.arange(0, half, dtype=mx.float32) / half))  # constant
+self.pos_embed = mx.zeros((1, num_patches, dim))                                # learned
+```
+
+Use the `freeze` form instead of `_` only when an existing checkpoint already contains
+the key. `freeze` is keyword-only — `freeze(*, recurse=True, keys=None, strict=False)` —
+and excludes the key from gradients **and** from weight decay.
+
+Audit before training:
+
+```python
+import mlx.utils
+print([k for k, _ in mlx.utils.tree_flatten(model.trainable_parameters())])
 ```
 
 ## Linear Layers

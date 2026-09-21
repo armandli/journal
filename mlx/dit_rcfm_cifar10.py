@@ -286,6 +286,13 @@ class SinusoidalTimestepEmbeddingV1(nn.Module):
         self.embed_dim = embed_dim
         half = embed_dim // 2
         self.freqs = mx.exp(-math.log(10000.0) * mx.arange(0, half, dtype=mx.float32) / max(half, 1))
+        # MLX registers every non-underscore mx.array attribute as a TRAINABLE
+        # parameter (nn.Module.valid_parameter_filter). A sinusoidal frequency
+        # bank is fixed geometry: left unfrozen, AdamW grinds its geometric
+        # decay into noise and the time embedding loses multi-scale resolution.
+        # freeze() is used here rather than a "_freqs" rename so the key stays
+        # in parameters() and existing checkpoints still load.
+        self.freeze(keys=["freqs"], recurse=False)
 
     def __call__(self, t: mx.array) -> mx.array:
         return mx.concatenate(

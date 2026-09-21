@@ -194,3 +194,4 @@ mx.eval(model.parameters())
 | Wrong conv output | PyTorch `(N,C,H,W)` habit | MLX uses `(N,H,W,C)` — transpose inputs |
 | Recompile every step | Shape changes | Pad inputs to fixed shape or use `shapeless=True` |
 | NaN gradients | No clipping | `optim.clip_grad_norm(grads, max_norm=1.0)` |
+| Loss flat, no error | Constant `mx.array` attribute registered as a parameter (no `_` prefix) and trained | Rename to `self._freqs` / `self._mask`, or `freeze(keys=[...], recurse=False)`; audit `trainable_parameters()` |

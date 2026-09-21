@@ -314,16 +314,11 @@ class GPTV2(nn.Module):
     def __init__(self, token_sz, em_sz, attn_hz, attn_lz):
         super().__init__()
         self.embedding = nn.Embedding(token_sz, em_sz)
-        self.pos_encoder = nn.SinusoidalPositionalEncoding(em_sz)
         self.tencoder = TransformerEncoderV2(attn_lz, em_sz, attn_hz)
         self.linear = nn.Linear(em_sz, token_sz)
 
     def __call__(self, tokens):
         em = self.embedding(tokens)
-        # pos_encoder expects sequence positions, not token ids
-        positions = mx.arange(tokens.shape[-1])
-        pem = self.pos_encoder(positions)
-        em = em + pem
         em = self.tencoder(em, 'causal')
         em = self.linear(em)
         return em
