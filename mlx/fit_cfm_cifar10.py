@@ -123,21 +123,19 @@ def _():
 
 @app.cell
 def _(mo, x_test_np, x_train_np):
-    mo.md(
-        f"""
-        ### Dataset overview
+    mo.md(f"""
+    ### Dataset overview
 
-        CIFAR-10 is loaded via `mlx.data.datasets.load_cifar10` from
-        `../data/cifar10/` (each split's Buffer is collapsed into a single
-        full batch, then materialised to NumPy). Each image is a `float32`
-        array shaped `(32, 32, 3)` in `[0, 1]`; labels are `int32` in `[0, 9]`.
+    CIFAR-10 is loaded via `mlx.data.datasets.load_cifar10` from
+    `../data/cifar10/` (each split's Buffer is collapsed into a single
+    full batch, then materialised to NumPy). Each image is a `float32`
+    array shaped `(32, 32, 3)` in `[0, 1]`; labels are `int32` in `[0, 9]`.
 
-        | Split | Size | Shape |
-        |-------|------|-------|
-        | Train (raw) | {x_train_np.shape[0]:,} | {tuple(x_train_np.shape[1:])} |
-        | Test | {x_test_np.shape[0]:,} | {tuple(x_test_np.shape[1:])} |
-        """
-    )
+    | Split | Size | Shape |
+    |-------|------|-------|
+    | Train (raw) | {x_train_np.shape[0]:,} | {tuple(x_train_np.shape[1:])} |
+    | Test | {x_test_np.shape[0]:,} | {tuple(x_test_np.shape[1:])} |
+    """)
     return
 
 
@@ -755,11 +753,9 @@ def _():
 
 @app.cell
 def _(default_fit_param_count, mo):
-    mo.md(
-        f"""
-        **Default `FiTModelV1` parameter count**: `{default_fit_param_count:,}`
-        """
-    )
+    mo.md(f"""
+    **Default `FiTModelV1` parameter count**: `{default_fit_param_count:,}`
+    """)
     return
 
 
