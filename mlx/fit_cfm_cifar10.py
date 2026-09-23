@@ -277,8 +277,17 @@ def _(mo):
     Encode the continuous time index $t \in [0, 1]$ into a
     `(B, embed_dim)` feature vector via sin/cos features spanning a
     geometric range of frequencies. Frequencies are precomputed once at
-    construction and stored as `self.freqs` for reuse across every
+    construction and stored as `self._freqs` for reuse across every
     training step.
+
+    **Why the underscore matters.** MLX's parameter filter is
+    `isinstance(value, (dict, list, mx.array)) and not key.startswith("_")`,
+    so *any* bare `mx.array` attribute of an `nn.Module` is registered as a
+    **trainable** parameter. A frequency bank is fixed geometry, not a
+    learnable table: written as `self.freqs` it would be handed to AdamW and
+    ground into noise. The `_` prefix keeps it out of `parameters()` and
+    `trainable_parameters()` entirely — the only correct way to express a
+    non-learnable buffer in MLX.
     """)
     return
 
@@ -289,12 +298,13 @@ class SinusoidalTimestepEmbeddingV1(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         half = embed_dim // 2
-        self.freqs = mx.exp(
+        # underscore prefix: fixed geometry, NOT a trainable parameter
+        self._freqs = mx.exp(
             -math.log(10000.0) * mx.arange(0, half, dtype=mx.float32) / max(half, 1)
         )
 
     def __call__(self, t: mx.array) -> mx.array:
-        angles = t[:, None] * self.freqs[None, :]
+        angles = t[:, None] * self._freqs[None, :]
         return mx.concatenate([mx.sin(angles), mx.cos(angles)], axis=-1)
 
 
@@ -356,8 +366,9 @@ def _(mo):
     | $[0, d/2)$ — *row half* | row index $r$ | vertical offset $r - r'$ |
     | $[d/2, d)$ — *col half* | column index $c$ | horizontal offset $c - c'$ |
 
-    Both halves share the frequency bank
-    $\theta_i = 10000^{-4i/d}$ for $i \in [0, d/4)$.
+    Both halves share the fixed frequency bank
+    $\theta_i = 10000^{-4i/d}$ for $i \in [0, d/4)$, stored as `self._freqs`
+    so that MLX excludes it from the trainable parameter set (see 4a).
     Because $\mathbf{R}(m)^{\top}\mathbf{R}(n) = \mathbf{R}(m - n)$ the
     rotated inner product depends only on the relative displacement
     $(r - r',\, c - c')$ — attention becomes translation-equivariant in
@@ -380,7 +391,8 @@ class RoPE2DAttentionV1(nn.Module):
         assert self.head_dim % 4 == 0, "head_dim must be divisible by 4 for 2D RoPE"
         quarter = self.head_dim // 4
         # theta_i = 10000^(-4i/head_dim), shared by row-half and col-half
-        self.freqs = 1.0 / (
+        # underscore prefix: fixed geometry, NOT a trainable parameter
+        self._freqs = 1.0 / (
             10000.0 ** (mx.arange(0, quarter, dtype=mx.float32) * 4.0 / self.head_dim)
         )
         self.q_proj = nn.Linear(dim, dim, bias=False)
@@ -389,7 +401,7 @@ class RoPE2DAttentionV1(nn.Module):
         self.out_proj = nn.Linear(dim, dim, bias=False)
 
     def _make_cos_sin(self, positions: mx.array):
-        angles = positions[:, None] * self.freqs[None, :]           # (N, quarter)
+        angles = positions[:, None] * self._freqs[None, :]          # (N, quarter)
         cos = mx.repeat(mx.cos(angles), 2, axis=-1)                 # (N, half)
         sin = mx.repeat(mx.sin(angles), 2, axis=-1)                 # (N, half)
         return cos, sin
@@ -705,6 +717,23 @@ def count_parameters(model: nn.Module) -> int:
 
 
 @app.function
+def trainable_parameter_keys(model: nn.Module) -> list:
+    return [k for k, _ in mlx.utils.tree_flatten(model.trainable_parameters())]
+
+
+@app.function
+def find_leaked_buffers(model: nn.Module, patterns: tuple = ("freq", "pos", "cos", "sin")) -> list:
+    """Return trainable keys that look like fixed geometry rather than weights.
+
+    MLX registers every non-underscore mx.array attribute as trainable, so a
+    frequency bank or cached position table written without a leading `_` is
+    silently optimised. Any hit here is a bug.
+    """
+    keys = trainable_parameter_keys(model)
+    return [k for k in keys if any(p in k.lower() for p in patterns)]
+
+
+@app.function
 def compute_flow_loss(model: nn.Module, x1: mx.array, y: mx.array) -> mx.array:
     t = mx.random.uniform(shape=(x1.shape[0],))
     x0 = mx.random.normal(shape=x1.shape)
@@ -791,6 +820,9 @@ def _(mo):
     mx.eval(_dummy_out)
     _smoke_loss = compute_flow_loss(_smoke_model, _dummy_x, _dummy_y)
     mx.eval(_smoke_loss)
+    _leaked = find_leaked_buffers(_smoke_model)
+    assert not _leaked, f"fixed geometry registered as trainable: {_leaked}"
+    _n_trainable = len(trainable_parameter_keys(_smoke_model))
     mo.md(
         f"""
         Smoke test passed:
@@ -799,6 +831,7 @@ def _(mo):
         - Output dtype: `{_dummy_out.dtype}`
         - Sample flow-matching loss on dummy data: `{_smoke_loss.item():.4f}`
         - Small model parameter count: `{count_parameters(_smoke_model):,}`
+        - Trainable arrays: `{_n_trainable}` — fixed-geometry leak check: **clean**
         """
     )
     return
