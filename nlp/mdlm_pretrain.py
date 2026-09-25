@@ -43,7 +43,7 @@ def _(config_file):
 
 @app.cell
 def _(config_data):
-    s3_path = config_data['S3_DATA_PATH'] + 'pretrain_dataset_v2/'
+    s3_path = config_data['S3_DATA_PATH'] + 'pretrain_dataset_v1/'
     return (s3_path,)
 
 
@@ -205,7 +205,7 @@ def _(
     )
 
     #accelerator.load_state(path + 'pretrained_model')
-    return (model,)
+    return eval_dataloader, model, optimizer, scheduler, train_dataloader
 
 
 @app.cell
@@ -219,7 +219,7 @@ def _(accelerator, model):
 @app.cell
 def _():
     loss_func = nn.CrossEntropyLoss(reduction="none")
-    return
+    return (loss_func,)
 
 
 @app.cell
@@ -411,20 +411,31 @@ def pretrain(
 
 
 @app.cell
-def _():
-    # pretrain(
-    #     model,
-    #     tokenizer,
-    #     train_dataloader,
-    #     eval_dataloader,
-    #     optimizer,
-    #     scheduler,
-    #     accelerator,
-    #     loss_func,
-    #     path,
-    #     n_training_steps,
-    #     evaluation_interval=50000,
-    # )
+def _(
+    accelerator,
+    eval_dataloader,
+    loss_func,
+    model,
+    n_training_steps,
+    optimizer,
+    path,
+    scheduler,
+    tokenizer,
+    train_dataloader,
+):
+    pretrain(
+        model,
+        tokenizer,
+        train_dataloader,
+        eval_dataloader,
+        optimizer,
+        scheduler,
+        accelerator,
+        loss_func,
+        path,
+        n_training_steps,
+        evaluation_interval=50000,
+    )
     return
 
 
