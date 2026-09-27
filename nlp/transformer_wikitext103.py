@@ -51,7 +51,8 @@ def _(mo):
     The architecture uses **RMSNorm**, **rotary positional embedding (RoPE)**,
     **SwiGLU MLP**, **weight-tied embeddings**, and **causal self-attention** routed
     through PyTorch's **FlashAttention-2 SDPA backend** for both forward and backward.
-    Training uses **bfloat16 autocast** mixed precision, fused AdamW, gradient
+    Training uses **bfloat16 autocast** mixed precision, fused AdamW or **Muon**
+    (`torch.optim.Muon` for the hidden weight matrices, AdamW for the rest), gradient
     accumulation, cosine decay with linear warmup, and gradient clipping.
 
     ## What is *not* used, and why
@@ -82,7 +83,7 @@ def _(mo):
        `CausalSelfAttentionV1` (Flash SDPA + RoPE + KV cache), `GPTBlockV1`,
        `GPTLanguageModelV1`; sanity check with flash-only forward
     5. Training — presets (tiny/small/base/medium), fractional epochs, AMP (bf16),
-       fused AdamW, grad accumulation, cosine schedule, live progress
+       fused AdamW or Muon + AdamW, grad accumulation, cosine schedule, live progress
     6. Optional hyperparameter search — lr × preset grid, short token budget
     7. Validation & 5-fold cross-validation — test loss (nats/token), token PPL,
        bits-per-byte, word PPL; 5-fold CV on the train stream (behind its own gate)
@@ -1197,6 +1198,65 @@ def split_parameters_for_weight_decay(
 
 
 @app.function
+def optimizer_choices() -> Dict[str, str]:
+    return {"AdamW": "adamw", "Muon + AdamW": "muon"}
+
+
+@app.function
+def split_parameters_for_muon(
+    model: nn.Module,
+    weight_decay: float = 0.1,
+) -> Tuple[List[torch.nn.Parameter], List[Dict[str, Any]]]:
+    excluded = {id(m.weight) for m in model.modules() if isinstance(m, nn.Embedding)}
+    head = getattr(model, "lm_head", None)
+    if isinstance(head, nn.Linear):
+        excluded.add(id(head.weight))
+    muon_params: List[torch.nn.Parameter] = []
+    decay_params: List[torch.nn.Parameter] = []
+    no_decay_params: List[torch.nn.Parameter] = []
+    seen: set = set()
+    for _, p in model.named_parameters():
+        if not p.requires_grad or id(p) in seen:
+            continue
+        seen.add(id(p))
+        if p.dim() == 2 and id(p) not in excluded:
+            muon_params.append(p)
+        elif p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            no_decay_params.append(p)
+    adamw_groups = [
+        {"params": decay_params, "weight_decay": float(weight_decay)},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    return muon_params, adamw_groups
+
+
+@app.function
+def describe_optimizers(optimizers: List[torch.optim.Optimizer]) -> List[Dict[str, Any]]:
+    described: List[Dict[str, Any]] = []
+    for optimizer in optimizers:
+        groups = optimizer.param_groups
+        entry: Dict[str, Any] = {
+            "type": type(optimizer).__name__,
+            "base_lr": float(groups[0].get("base_lr", groups[0]["lr"])),
+            "weight_decay": [float(g.get("weight_decay", 0.0)) for g in groups],
+            "num_params": int(sum(p.numel() for g in groups for p in g["params"])),
+        }
+        if isinstance(optimizer, torch.optim.Muon):
+            entry.update(
+                {
+                    "momentum": float(groups[0]["momentum"]),
+                    "nesterov": bool(groups[0]["nesterov"]),
+                    "ns_steps": int(groups[0]["ns_steps"]),
+                    "adjust_lr_fn": str(groups[0]["adjust_lr_fn"] or "original"),
+                }
+            )
+        described.append(entry)
+    return described
+
+
+@app.function
 def linear_warmup_cosine_schedule(
     step: int,
     total_steps: int,
@@ -1338,7 +1398,37 @@ def _(mo):
     - **Warmup fraction**: dropdown.
     - **Val batches during training**: dropdown; number of fixed validation windows used
       at each periodic-eval milestone.
+    - **Optimizer**: *AdamW* (default) or *Muon + AdamW* — see below.
     - Click **Train** to start.
+
+    ### Muon
+
+    [`torch.optim.Muon`](https://docs.pytorch.org/docs/2.14/generated/torch.optim.Muon.html)
+    runs SGD-momentum (Nesterov) and replaces each update by its nearest semi-orthogonal
+    matrix via a 5-step Newton–Schulz iteration (computed in bf16), so every direction of
+    a weight matrix moves at a similar rate. It is defined only for **2-D hidden-layer
+    matrices**, so *Muon + AdamW* splits the parameters:
+
+    | Parameters | Optimizer |
+    |---|---|
+    | attention `qkv` / `proj`, MLP `w_gate` / `w_up` / `w_down` in every block | Muon |
+    | token embedding (tied with the LM head) | AdamW, with weight decay |
+    | RMSNorm gains | AdamW, no weight decay |
+
+    **Muon LR Scaling** selects `adjust_lr_fn` for an $A \times B$ matrix:
+
+    - `match_rms_adamw` (default) — $\text{lr} \cdot 0.2\sqrt{\max(A, B)}$, which matches
+      AdamW's update RMS, so the AdamW *Learning Rate* and *Weight Decay* carry over
+      unchanged (leave *Muon LR* / *Muon Weight Decay* on "=").
+    - `original` (Keller Jordan) — $\text{lr} \cdot \sqrt{\max(1, A/B)}$; pick a *Muon LR*
+      around `0.02` with little or no weight decay (Muon's decay is decoupled,
+      $\theta \leftarrow \theta\,(1 - \text{lr}\cdot\lambda)$, so a large LR multiplies its strength).
+
+    The 2.14 documentation also lists `spectral_unclamped`; the installed torch 2.10
+    rejects it, so it is not offered. Both optimizers follow the same warmup + cosine
+    multiplier, applied to each parameter group's own base LR, and a single `GradScaler`
+    steps both (the documented multi-optimizer pattern). HP search and cross-validation
+    keep using AdamW.
 
     Every training helper uses `torch.autocast(device_type=device.type, dtype=amp_dtype)`
     around the forward pass + loss, and a `GradScaler` that is a no-op under bf16
@@ -1375,6 +1465,39 @@ def _(mo):
     )
     val_batches_ui = mo.ui.dropdown(options=[8, 16, 32, 64], value=16, label="Val batches per check")
     eval_every_ui = mo.ui.dropdown(options=[50, 100, 200, 500], value=100, label="Eval every N steps")
+    optimizer_ui = mo.ui.dropdown(options=optimizer_choices(), value="AdamW", label="Optimizer")
+    muon_scaling_ui = mo.ui.dropdown(
+        options={
+            "match_rms_adamw (reuse AdamW LR / WD)": "match_rms_adamw",
+            "original (Keller; Muon LR ≈ 0.02)": "original",
+        },
+        value="match_rms_adamw (reuse AdamW LR / WD)",
+        label="Muon LR Scaling",
+    )
+    muon_lr_ui = mo.ui.dropdown(
+        options={
+            "= Learning Rate": None,
+            "3e-4": 3e-4,
+            "6e-4": 6e-4,
+            "1e-3": 1e-3,
+            "3e-3": 3e-3,
+            "0.01": 0.01,
+            "0.02": 0.02,
+            "0.05": 0.05,
+        },
+        value="= Learning Rate",
+        label="Muon LR",
+    )
+    muon_wd_ui = mo.ui.dropdown(
+        options={"= Weight Decay": None, "0.0": 0.0, "0.01": 0.01, "0.05": 0.05, "0.1": 0.1},
+        value="= Weight Decay",
+        label="Muon Weight Decay",
+    )
+    muon_momentum_ui = mo.ui.dropdown(
+        options={"0.9": 0.9, "0.95": 0.95, "0.98": 0.98},
+        value="0.95",
+        label="Muon Momentum",
+    )
     train_btn = mo.ui.run_button(label="Train")
     mo.vstack(
         [
@@ -1382,6 +1505,8 @@ def _(mo):
             mo.hstack([preset_ui, lr_ui, wd_ui]),
             mo.hstack([micro_bs_ui, grad_accum_ui, epochs_ui]),
             mo.hstack([warmup_frac_ui, val_batches_ui, eval_every_ui]),
+            mo.md("**Optimizer** — the Muon settings apply only when *Muon + AdamW* is selected."),
+            mo.hstack([optimizer_ui, muon_scaling_ui, muon_lr_ui, muon_wd_ui, muon_momentum_ui]),
             train_btn,
         ]
     )
@@ -1391,6 +1516,11 @@ def _(mo):
         grad_accum_ui,
         lr_ui,
         micro_bs_ui,
+        muon_lr_ui,
+        muon_momentum_ui,
+        muon_scaling_ui,
+        muon_wd_ui,
+        optimizer_ui,
         preset_ui,
         train_btn,
         val_batches_ui,
@@ -1400,7 +1530,7 @@ def _(mo):
 
 
 @app.function
-def build_gpt_model_and_optimizer(
+def build_gpt_model_and_optimizers(
     tokenizer_vocab_size: int,
     preset: str,
     context_length: int,
@@ -1408,7 +1538,12 @@ def build_gpt_model_and_optimizer(
     lr: float,
     weight_decay: float,
     dropout: float = 0.0,
-) -> Tuple[GPTLanguageModelV1, torch.optim.Optimizer]:
+    optimizer_name: str = "adamw",
+    muon_lr: Optional[float] = None,
+    muon_weight_decay: Optional[float] = None,
+    muon_momentum: float = 0.95,
+    muon_adjust_lr_fn: str = "match_rms_adamw",
+) -> Tuple[GPTLanguageModelV1, List[torch.optim.Optimizer]]:
     config = make_gpt_config(
         tokenizer_vocab_size,
         preset=preset,
@@ -1416,15 +1551,30 @@ def build_gpt_model_and_optimizer(
         dropout=dropout,
     )
     model = GPTLanguageModelV1(config).to(device)
-    param_groups = split_parameters_for_weight_decay(model, weight_decay=weight_decay)
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=lr,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        fused=True,
-    )
-    return model, optimizer
+    if optimizer_name == "adamw":
+        param_groups = split_parameters_for_weight_decay(model, weight_decay=weight_decay)
+        optimizers: List[torch.optim.Optimizer] = [
+            torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=True)
+        ]
+    elif optimizer_name == "muon":
+        muon_params, adamw_groups = split_parameters_for_muon(model, weight_decay=weight_decay)
+        optimizers = [
+            torch.optim.Muon(
+                muon_params,
+                lr=float(lr if muon_lr is None else muon_lr),
+                weight_decay=float(weight_decay if muon_weight_decay is None else muon_weight_decay),
+                momentum=float(muon_momentum),
+                nesterov=True,
+                adjust_lr_fn=str(muon_adjust_lr_fn),
+            ),
+            torch.optim.AdamW(adamw_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=True),
+        ]
+    else:
+        raise ValueError(f"Unknown optimizer {optimizer_name!r}; expected one of {sorted(optimizer_choices().values())}.")
+    for optimizer in optimizers:
+        for group in optimizer.param_groups:
+            group["base_lr"] = float(group["lr"])
+    return model, optimizers
 
 
 @app.function
@@ -1441,7 +1591,7 @@ def move_batch_to_device(
 @app.function
 def run_train_step(
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    optimizers: List[torch.optim.Optimizer],
     scaler: "torch.amp.GradScaler",
     train_ids: np.ndarray,
     rng: np.random.Generator,
@@ -1454,7 +1604,8 @@ def run_train_step(
     grad_clip: float = 1.0,
 ) -> float:
     model.train()
-    optimizer.zero_grad(set_to_none=True)
+    for optimizer in optimizers:
+        optimizer.zero_grad(set_to_none=True)
     total_loss = 0.0
     for _ in range(grad_accum):
         x, y = sample_contiguous_windows(train_ids, micro_batch, context_length, rng)
@@ -1467,9 +1618,11 @@ def run_train_step(
         scaler.scale(scaled).backward()
         total_loss += float(loss.detach())
     if grad_clip > 0.0:
-        scaler.unscale_(optimizer)
+        for optimizer in optimizers:
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    scaler.step(optimizer)
+    for optimizer in optimizers:
+        scaler.step(optimizer)
     scaler.update()
     return total_loss / grad_accum
 
@@ -1546,15 +1699,26 @@ def train_gpt_language_model(
     amp_dtype: torch.dtype,
     seed: int,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    optimizer_name: str = "adamw",
+    muon_lr: Optional[float] = None,
+    muon_weight_decay: Optional[float] = None,
+    muon_momentum: float = 0.95,
+    muon_adjust_lr_fn: str = "match_rms_adamw",
 ) -> Dict[str, Any]:
-    model, optimizer = build_gpt_model_and_optimizer(
+    model, optimizers = build_gpt_model_and_optimizers(
         tokenizer_vocab_size=tokenizer_vocab_size,
         preset=preset,
         context_length=context_length,
         device=device,
         lr=lr,
         weight_decay=weight_decay,
+        optimizer_name=optimizer_name,
+        muon_lr=muon_lr,
+        muon_weight_decay=muon_weight_decay,
+        muon_momentum=muon_momentum,
+        muon_adjust_lr_fn=muon_adjust_lr_fn,
     )
+    muon_optimizer = next((o for o in optimizers if isinstance(o, torch.optim.Muon)), None)
     scaler = torch.amp.GradScaler(device.type, enabled=(amp_dtype == torch.float16))
     rng = np.random.default_rng(seed)
     train_losses: List[float] = []
@@ -1566,11 +1730,12 @@ def train_gpt_language_model(
     for step in range(num_steps):
         scale = linear_warmup_cosine_schedule(step, num_steps, warmup_steps)
         current_lr = lr * scale
-        for pg in optimizer.param_groups:
-            pg["lr"] = current_lr
+        for optimizer in optimizers:
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg["base_lr"] * scale
         loss = run_train_step(
             model=model,
-            optimizer=optimizer,
+            optimizers=optimizers,
             scaler=scaler,
             train_ids=train_ids,
             rng=rng,
@@ -1608,6 +1773,7 @@ def train_gpt_language_model(
                     "num_steps": num_steps,
                     "loss": loss,
                     "lr": current_lr,
+                    "muon_lr": float(muon_optimizer.param_groups[0]["lr"]) if muon_optimizer is not None else None,
                     "tokens_per_s": tok_per_s,
                     "elapsed_s": elapsed,
                     "latest_val": latest_val,
@@ -1622,6 +1788,7 @@ def train_gpt_language_model(
         "tokens_seen": tokens_per_step * num_steps,
         "elapsed_s": time.perf_counter() - start_time,
         "config": model.config,
+        "optimizers": describe_optimizers(optimizers),
     }
 
 
@@ -1635,6 +1802,11 @@ def _(
     lr_ui,
     micro_bs_ui,
     mo,
+    muon_lr_ui,
+    muon_momentum_ui,
+    muon_scaling_ui,
+    muon_wd_ui,
+    optimizer_ui,
     preset_ui,
     seed_ui,
     tokenizer_vocab_size,
@@ -1667,7 +1839,7 @@ def _(
         _warmup_steps = max(1, int(round(_num_steps * float(warmup_frac_ui.value))))
         mo.output.replace(
             mo.md(
-                f"Starting training — preset `{preset_ui.value}`, "
+                f"Starting training — preset `{preset_ui.value}`, optimizer `{optimizer_ui.value}`, "
                 f"{_num_steps:,} steps × {_tokens_per_step:,} tokens/step "
                 f"= {_num_steps * _tokens_per_step:,} tokens."
             )
@@ -1681,11 +1853,12 @@ def _(
                 if latest_val is not None
                 else ""
             )
+            muon_str = f" | muon lr: {info['muon_lr']:.2e}" if info.get("muon_lr") is not None else ""
             mo.output.replace(
                 mo.md(
                     f"**step {info['step']}/{info['num_steps']}** "
                     f"— loss: {info['loss']:.4f} "
-                    f"| lr: {info['lr']:.2e} "
+                    f"| lr: {info['lr']:.2e}{muon_str} "
                     f"| toks/s: {info['tokens_per_s']:,.0f} "
                     f"| elapsed: {info['elapsed_s']:.1f}s "
                     f"| ETA: {eta_s:.1f}s{val_str}"
@@ -1709,6 +1882,11 @@ def _(
             device=device,
             amp_dtype=amp_dtype,
             seed=int(seed_ui.value),
+            optimizer_name=str(optimizer_ui.value),
+            muon_lr=muon_lr_ui.value,
+            muon_weight_decay=muon_wd_ui.value,
+            muon_momentum=float(muon_momentum_ui.value),
+            muon_adjust_lr_fn=str(muon_scaling_ui.value),
         )
         trained_model = _result["model"]
         train_losses = _result["train_losses"]
@@ -1722,6 +1900,8 @@ def _(
             "final_train_loss": float(train_losses[-1]) if train_losses else float("nan"),
             "final_val_loss": float(val_history[-1]["loss"]) if val_history else float("nan"),
             "final_val_ppl": float(val_history[-1]["perplexity"]) if val_history else float("nan"),
+            "optimizer": str(optimizer_ui.value),
+            "optimizers": _result["optimizers"],
         }
         mo.output.replace(
             mo.md(
@@ -2196,6 +2376,7 @@ def _(mo, train_summary: Dict[str, Any]):
     ### Training summary
 
     - Preset: **{train_summary.get('preset', '')}**
+    - Optimizer: **{train_summary.get('optimizer', 'adamw')}** — {", ".join(f"{o['type']} ({o['num_params']:,} params, base lr {o['base_lr']:.1e})" for o in train_summary.get('optimizers', []))}
     - Optimizer steps: **{train_summary.get('num_steps', 0):,}**
     - Tokens seen: **{train_summary.get('tokens_seen', 0):,}**
     - Wall time: **{train_summary.get('elapsed_s', 0):.1f} s**

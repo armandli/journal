@@ -103,7 +103,8 @@ def _(mo):
     4. **Model Definition** — `DiffusionTransformerTTSV1` composed of
        versioned building blocks; adaLN-Zero self-attn 2D RoPE + cross-attn
        with soft diagonal alignment prior.
-    5. **Training — 1-Rectified Flow (gen1)** — AdamW + warmup + AMP + EMA.
+    5. **Training — 1-Rectified Flow (gen1)** — AdamW + warmup + a configurable
+       `torch.optim.lr_scheduler` schedule (cosine by default) + AMP + EMA.
     6. **Hyperparameter Search** (optional).
     7. **Validation & Cross-Validation** — masked flow-matching loss, per-timestep-bin
        loss, straightness, k-fold CV, optional ASR-based CER (with vocoder ceiling).
@@ -2438,14 +2439,111 @@ def update_ema(ema_model: nn.Module, model: nn.Module, decay: float, num_updates
 
 
 @app.function
-def make_warmup_scheduler(optimizer: torch.optim.Optimizer, warmup_steps: int):
-    if warmup_steps <= 0:
-        return None
+def lr_schedule_choices() -> Dict[str, str]:
+    return {
+        "constant (after warmup)": "constant",
+        "cosine annealing": "cosine",
+        "linear decay": "linear",
+        "exponential decay": "exponential",
+        "step decay": "step",
+        "cosine warm restarts": "cosine_restarts",
+        "one-cycle": "onecycle",
+        "reduce on plateau": "plateau",
+    }
 
-    def _lr_lambda(step: int) -> float:
-        return min(1.0, (step + 1) / warmup_steps)
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
+@app.function
+def build_lr_schedulers(
+    optimizer: torch.optim.Optimizer,
+    train_cfg: "TrainConfigV1",
+    steps_per_epoch: int,
+) -> Tuple[Optional[torch.optim.lr_scheduler.LRScheduler], Optional[torch.optim.lr_scheduler.ReduceLROnPlateau]]:
+    sched = torch.optim.lr_scheduler
+    steps_per_epoch = max(int(steps_per_epoch), 1)
+    total_steps = max(int(train_cfg.epochs) * steps_per_epoch, 1)
+    warmup_steps = min(max(int(train_cfg.warmup_steps), 0), total_steps - 1)
+    main_steps = max(total_steps - warmup_steps, 1)
+    min_ratio = min(max(float(train_cfg.min_lr_ratio), 0.0), 1.0)
+    eta_min = float(train_cfg.lr) * min_ratio
+    period = max(int(train_cfg.lr_period_epochs), 1) * steps_per_epoch
+    name = str(train_cfg.lr_schedule)
+    if name == "onecycle":
+        pct_start = warmup_steps / total_steps if warmup_steps > 0 else 0.3
+        one_cycle = sched.OneCycleLR(
+            optimizer,
+            max_lr=float(train_cfg.lr),
+            total_steps=total_steps,
+            pct_start=float(min(max(pct_start, 1e-3), 0.9)),
+            anneal_strategy="cos",
+            cycle_momentum=False,
+            div_factor=25.0,
+            final_div_factor=1.0 / (25.0 * max(min_ratio, 1e-4)),
+        )
+        return one_cycle, None
+    warmup = (
+        sched.LinearLR(optimizer, start_factor=1.0 / warmup_steps, end_factor=1.0, total_iters=warmup_steps)
+        if warmup_steps > 0
+        else None
+    )
+    if name == "plateau":
+        plateau = sched.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(train_cfg.lr_gamma),
+            patience=int(train_cfg.lr_plateau_patience),
+            min_lr=eta_min,
+        )
+        return warmup, plateau
+    if name == "constant":
+        main = sched.ConstantLR(optimizer, factor=1.0, total_iters=0)
+    elif name == "cosine":
+        main = sched.CosineAnnealingLR(optimizer, T_max=main_steps, eta_min=eta_min)
+    elif name == "linear":
+        main = sched.LinearLR(optimizer, start_factor=1.0, end_factor=min_ratio, total_iters=main_steps)
+    elif name == "exponential":
+        main = sched.ExponentialLR(optimizer, gamma=max(min_ratio, 1e-3) ** (1.0 / main_steps))
+    elif name == "step":
+        main = sched.StepLR(optimizer, step_size=period, gamma=float(train_cfg.lr_gamma))
+    elif name == "cosine_restarts":
+        main = sched.CosineAnnealingWarmRestarts(optimizer, T_0=period, eta_min=eta_min)
+    else:
+        raise ValueError(f"Unknown LR schedule {name!r}; expected one of {sorted(lr_schedule_choices().values())}.")
+    if warmup is None:
+        return main, None
+    return sched.SequentialLR(optimizer, schedulers=[warmup, main], milestones=[warmup_steps]), None
+
+
+@app.function
+def simulate_lr_schedule(train_cfg: "TrainConfigV1", steps_per_epoch: int) -> List[float]:
+    param = nn.Parameter(torch.zeros(1))
+    optimizer = torch.optim.SGD([param], lr=float(train_cfg.lr))
+    step_scheduler, plateau_scheduler = build_lr_schedulers(optimizer, train_cfg, steps_per_epoch)
+    lrs: List[float] = []
+    for _ in range(int(train_cfg.epochs)):
+        for _ in range(max(int(steps_per_epoch), 1)):
+            lrs.append(float(optimizer.param_groups[0]["lr"]))
+            optimizer.step()
+            if step_scheduler is not None:
+                step_scheduler.step()
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(1.0)
+    return lrs
+
+
+@app.function
+def plot_lr_schedule(train_cfg: "TrainConfigV1", steps_per_epoch: int, title: str = "LR schedule preview"):
+    lrs = simulate_lr_schedule(train_cfg, steps_per_epoch)
+    fig, ax = plt.subplots(figsize=(8, 2.8))
+    epochs_axis = np.arange(len(lrs)) / max(int(steps_per_epoch), 1)
+    ax.plot(epochs_axis, lrs, color="steelblue", lw=1.5)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Learning rate")
+    note = " (assuming val loss stops improving)" if train_cfg.lr_schedule == "plateau" else ""
+    ax.set_title(f"{title} — {train_cfg.lr_schedule}{note}, {len(lrs):,} optimizer steps")
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
 
 
 @app.function
@@ -2471,7 +2569,7 @@ def run_train_epoch(
     joint_dropout_prob: float = 0.0,
     grad_clip: float = 1.0,
     t_scheme: str = "uniform",
-    warmup_scheduler=None,
+    lr_scheduler=None,
     ema_model: Optional[nn.Module] = None,
     ema_decay: float = 0.0,
     max_steps: Optional[int] = None,
@@ -2501,8 +2599,8 @@ def run_train_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
-        if warmup_scheduler is not None:
-            warmup_scheduler.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         if ema_model is not None and ema_decay > 0.0:
             update_ema(ema_model, model, ema_decay, num_updates=step)
         losses.append(float(loss.detach().item()))
@@ -2565,6 +2663,28 @@ def _(mo):
     $\beta_n = \min(\beta, (1+n)/(10+n))$ progresses continuously and the
     averaged weights track the whole training run.
 
+    **Learning-rate schedule.** `Learning Rate` is the *peak* rate. A linear warmup
+    (`torch.optim.lr_scheduler.LinearLR`) ramps up to it over *Warmup Steps*, then the
+    chosen PyTorch scheduler takes over, stepped once per optimizer step and chained
+    through `SequentialLR`:
+
+    | Schedule | PyTorch class | After warmup |
+    |---|---|---|
+    | constant | `ConstantLR` | holds the peak (the original behaviour) |
+    | cosine annealing | `CosineAnnealingLR` | half-cosine from the peak to *Min LR* at the last step |
+    | linear decay | `LinearLR` | straight line from the peak to *Min LR* |
+    | exponential decay | `ExponentialLR` | geometric decay reaching *Min LR* at the last step |
+    | step decay | `StepLR` | multiply by *γ* every *Period* epochs |
+    | cosine warm restarts | `CosineAnnealingWarmRestarts` | cosine to *Min LR*, restarting every *Period* epochs |
+    | one-cycle | `OneCycleLR` | its own warmup from peak/25 (length = *Warmup Steps*), cosine down to *Min LR*; momentum cycling is disabled so AdamW's β₁ is untouched |
+    | reduce on plateau | `ReduceLROnPlateau` | multiply by *γ* when the validation loss has not improved for *Patience* epochs (floor *Min LR*) |
+
+    The total step count honours *Max Steps / Epoch*. The preview under the
+    controls simulates the schedule for the current settings, and the schedule
+    fields are part of `TrainConfigV1`, so they are recorded in the checkpoint
+    sidecar. The HP search and cross-validation runs use the `TrainConfigV1`
+    defaults (cosine to 0.1× peak).
+
     Training can be skipped on later runs: the *Resume from a checkpoint* block
     below loads a gen1 model saved by Section 11.
     """)
@@ -2585,6 +2705,11 @@ class TrainConfigV1:
     p_uncond: float = 0.1
     max_steps_per_epoch: int = 0
     seed: int = 1337
+    lr_schedule: str = "cosine"
+    min_lr_ratio: float = 0.1
+    lr_period_epochs: int = 10
+    lr_gamma: float = 0.5
+    lr_plateau_patience: int = 3
 
 
 @app.cell
@@ -2619,12 +2744,27 @@ def _(mo):
         options={"0.0": 0.0, "0.05": 0.05, "0.1": 0.1, "0.2": 0.2}, value="0.1", label="p_uncond"
     )
     max_steps_ui = mo.ui.number(value=0, label="Max Steps / Epoch (0 = full)", start=0, stop=100000)
+    lr_schedule_ui = mo.ui.dropdown(options=lr_schedule_choices(), value="cosine annealing", label="LR Schedule")
+    min_lr_ui = mo.ui.dropdown(
+        options={"0": 0.0, "0.01": 0.01, "0.05": 0.05, "0.1": 0.1, "0.2": 0.2},
+        value="0.1",
+        label="Min LR (× peak)",
+    )
+    lr_period_ui = mo.ui.number(value=10, start=1, stop=200, step=1, label="Step / Restart Period (epochs)")
+    lr_gamma_ui = mo.ui.dropdown(
+        options={"0.1": 0.1, "0.3": 0.3, "0.5": 0.5, "0.7": 0.7},
+        value="0.5",
+        label="Decay γ (step / plateau)",
+    )
+    lr_patience_ui = mo.ui.number(value=3, start=1, stop=50, step=1, label="Plateau Patience (epochs)")
     train_btn = mo.ui.run_button(label="Train (1-Rectified Flow)")
     mo.vstack(
         [
             mo.md("### Training Hyperparameters"),
             mo.hstack([lr_ui, bs_ui, wd_ui, epochs_ui]),
             mo.hstack([warmup_ui, grad_clip_ui, ema_ui, t_scheme_ui]),
+            mo.md("**Learning-rate schedule** — `Learning Rate` is the peak value reached after warmup."),
+            mo.hstack([lr_schedule_ui, min_lr_ui, lr_period_ui, lr_gamma_ui, lr_patience_ui]),
             mo.hstack([p_uncond_ui, max_steps_ui, train_btn]),
         ]
     )
@@ -2633,14 +2773,55 @@ def _(mo):
         ema_ui,
         epochs_ui,
         grad_clip_ui,
+        lr_gamma_ui,
+        lr_patience_ui,
+        lr_period_ui,
+        lr_schedule_ui,
         lr_ui,
         max_steps_ui,
+        min_lr_ui,
         p_uncond_ui,
         t_scheme_ui,
         train_btn,
         warmup_ui,
         wd_ui,
     )
+
+
+@app.cell
+def _(
+    bs_ui,
+    epochs_ui,
+    lr_gamma_ui,
+    lr_patience_ui,
+    lr_period_ui,
+    lr_schedule_ui,
+    lr_ui,
+    max_steps_ui,
+    min_lr_ui,
+    train_utts,
+    warmup_ui,
+):
+    plot_lr_schedule(
+        TrainConfigV1(
+            lr=float(lr_ui.value),
+            batch_size=int(bs_ui.value),
+            epochs=int(epochs_ui.value),
+            warmup_steps=int(warmup_ui.value),
+            lr_schedule=str(lr_schedule_ui.value),
+            min_lr_ratio=float(min_lr_ui.value),
+            lr_period_epochs=int(lr_period_ui.value),
+            lr_gamma=float(lr_gamma_ui.value),
+            lr_plateau_patience=int(lr_patience_ui.value),
+        ),
+        steps_per_epoch=(
+            min(math.ceil(len(train_utts) / int(bs_ui.value)), int(max_steps_ui.value))
+            if int(max_steps_ui.value) > 0
+            else math.ceil(len(train_utts) / int(bs_ui.value))
+        ),
+        title="gen1 LR schedule preview",
+    )
+    return
 
 
 @app.function
@@ -2662,7 +2843,9 @@ def fit_flow_model(
         betas=(0.9, 0.99),
     )
     scaler = make_grad_scaler(device, use_amp, amp_dtype)
-    warmup = make_warmup_scheduler(optimizer, train_cfg.warmup_steps)
+    max_steps = train_cfg.max_steps_per_epoch if train_cfg.max_steps_per_epoch > 0 else None
+    steps_per_epoch = len(train_loader) if max_steps is None else min(len(train_loader), int(max_steps))
+    step_scheduler, plateau_scheduler = build_lr_schedulers(optimizer, train_cfg, steps_per_epoch)
     ema_model: Optional[nn.Module] = None
     if train_cfg.ema_decay > 0.0:
         ema_model = copy.deepcopy(model).to(device)
@@ -2670,8 +2853,8 @@ def fit_flow_model(
         ema_model.eval()
     train_losses: List[float] = []
     val_losses: List[float] = []
+    lr_history: List[float] = []
     start_time = time.perf_counter()
-    max_steps = train_cfg.max_steps_per_epoch if train_cfg.max_steps_per_epoch > 0 else None
     global_step = 0
     for epoch in range(train_cfg.epochs):
         if hasattr(train_loader, "batch_sampler") and hasattr(train_loader.batch_sampler, "set_epoch"):
@@ -2687,7 +2870,7 @@ def fit_flow_model(
             joint_dropout_prob=train_cfg.p_uncond,
             grad_clip=train_cfg.grad_clip,
             t_scheme=train_cfg.t_scheme,
-            warmup_scheduler=warmup,
+            lr_scheduler=step_scheduler,
             ema_model=ema_model,
             ema_decay=train_cfg.ema_decay,
             max_steps=max_steps,
@@ -2704,8 +2887,11 @@ def fit_flow_model(
             seed=train_cfg.seed + 1000,
             max_batches=max_steps,
         )
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(val_loss)
         train_losses.append(train_loss)
         val_losses.append(val_loss)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
         if progress_cb is not None:
             progress_cb(epoch + 1, train_cfg.epochs, train_loss, val_loss)
     final_model = ema_model if ema_model is not None else model
@@ -2714,6 +2900,7 @@ def fit_flow_model(
         "model": final_model,
         "train_losses": train_losses,
         "val_losses": val_losses,
+        "lr_history": lr_history,
         "wall_time": time.perf_counter() - start_time,
         "ema_used": ema_model is not None,
         "global_step": global_step,
@@ -2774,11 +2961,16 @@ def _(
     ema_ui,
     epochs_ui,
     grad_clip_ui,
+    lr_gamma_ui,
+    lr_patience_ui,
+    lr_period_ui,
+    lr_schedule_ui,
     lr_ui,
     max_steps_ui,
     mel_cache,
     mel_norm_mean,
     mel_norm_std,
+    min_lr_ui,
     mo,
     model_cfg,
     p_uncond_ui,
@@ -2816,6 +3008,11 @@ def _(
                 p_uncond=float(p_uncond_ui.value),
                 max_steps_per_epoch=int(max_steps_ui.value),
                 seed=int(seed_ui.value),
+                lr_schedule=str(lr_schedule_ui.value),
+                min_lr_ratio=float(min_lr_ui.value),
+                lr_period_epochs=int(lr_period_ui.value),
+                lr_gamma=float(lr_gamma_ui.value),
+                lr_plateau_patience=int(lr_patience_ui.value),
             ),
             mel_cache=mel_cache,
             train_utts=train_utts,
@@ -2836,7 +3033,8 @@ def _(
             mo.md(
                 f"**Training complete** in {session_gen1_run['wall_time']:.1f}s — final train "
                 f"{session_gen1_run['train_losses'][-1]:.4f} | final val {session_gen1_run['val_losses'][-1]:.4f} "
-                f"| using EMA weights: {session_gen1_run['ema_used']} | global steps: {session_gen1_run['global_step']}"
+                f"| using EMA weights: {session_gen1_run['ema_used']} | global steps: {session_gen1_run['global_step']} "
+                f"| {session_gen1_run['train_config'].lr_schedule} schedule, final LR {session_gen1_run['lr_history'][-1]:.2e}"
             )
         )
     return (session_gen1_run,)
@@ -2928,7 +3126,10 @@ def train_config_from_snapshot(snapshot: Optional[Dict[str, object]]) -> Optiona
     if not snapshot:
         return None
     known = set(asdict(TrainConfigV1()).keys())
-    return TrainConfigV1(**{k: v for k, v in snapshot.items() if k in known})
+    fields_present = {k: v for k, v in snapshot.items() if k in known}
+    # snapshots saved before LR schedules existed were trained at a constant LR after warmup
+    fields_present.setdefault("lr_schedule", "constant")
+    return TrainConfigV1(**fields_present)
 
 
 @app.function
@@ -3902,7 +4103,8 @@ def _(mo):
     field **backward** from $t = 1$ to $t = 0$ to obtain
     $x_0 = \Phi^{-1}(x_1, c, s)$. Store $(x_0, x_1, c, s)$ pairs on CPU
     in fp16 and train the reflow model on that fixed dataset with the same
-    masked flow-matching objective and the same CFG dropout.
+    masked flow-matching objective and the same CFG dropout, with its own
+    configurable learning-rate schedule.
 
     The inversion guidance scale is configurable (default 1.0 = no guidance,
     which is the recommended setting for reflow pair generation). Inversion
@@ -4586,7 +4788,7 @@ def run_reflow_train_epoch(
     joint_dropout_prob: float = 0.0,
     grad_clip: float = 1.0,
     t_scheme: str = "uniform",
-    warmup_scheduler=None,
+    lr_scheduler=None,
     ema_model: Optional[nn.Module] = None,
     ema_decay: float = 0.0,
     start_step: int = 0,
@@ -4614,8 +4816,8 @@ def run_reflow_train_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         scaler.step(optimizer)
         scaler.update()
-        if warmup_scheduler is not None:
-            warmup_scheduler.step()
+        if lr_scheduler is not None:
+            lr_scheduler.step()
         if ema_model is not None and ema_decay > 0.0:
             update_ema(ema_model, model, ema_decay, num_updates=step)
         losses.append(float(loss.detach().item()))
@@ -4674,7 +4876,7 @@ def fit_reflow_model(
         model.parameters(), lr=train_cfg.lr, weight_decay=train_cfg.weight_decay, betas=(0.9, 0.99)
     )
     scaler = make_grad_scaler(device, use_amp, amp_dtype)
-    warmup = make_warmup_scheduler(optimizer, train_cfg.warmup_steps)
+    step_scheduler, plateau_scheduler = build_lr_schedulers(optimizer, train_cfg, len(reflow_train_loader))
     ema_model: Optional[nn.Module] = None
     if train_cfg.ema_decay > 0.0:
         ema_model = copy.deepcopy(model).to(device)
@@ -4682,6 +4884,7 @@ def fit_reflow_model(
         ema_model.eval()
     train_losses: List[float] = []
     val_losses: List[float] = []
+    lr_history: List[float] = []
     start_time = time.perf_counter()
     global_step = 0
     for epoch in range(train_cfg.epochs):
@@ -4692,7 +4895,7 @@ def fit_reflow_model(
             loader=reflow_train_loader, device=device, use_amp=use_amp, amp_dtype=amp_dtype,
             joint_dropout_prob=train_cfg.p_uncond,
             grad_clip=train_cfg.grad_clip, t_scheme=train_cfg.t_scheme,
-            warmup_scheduler=warmup, ema_model=ema_model, ema_decay=train_cfg.ema_decay,
+            lr_scheduler=step_scheduler, ema_model=ema_model, ema_decay=train_cfg.ema_decay,
             start_step=global_step,
         )
         global_step += int(steps_taken)
@@ -4701,8 +4904,11 @@ def fit_reflow_model(
             loader=reflow_val_loader, device=device, use_amp=use_amp, amp_dtype=amp_dtype,
             t_scheme=train_cfg.t_scheme, seed=train_cfg.seed + 2000,
         )
+        if plateau_scheduler is not None:
+            plateau_scheduler.step(vl)
         train_losses.append(tl)
         val_losses.append(vl)
+        lr_history.append(float(optimizer.param_groups[0]["lr"]))
         if progress_cb is not None:
             progress_cb(epoch + 1, train_cfg.epochs, tl, vl)
     final = ema_model if ema_model is not None else model
@@ -4711,6 +4917,7 @@ def fit_reflow_model(
         "model": final,
         "train_losses": train_losses,
         "val_losses": val_losses,
+        "lr_history": lr_history,
         "wall_time": time.perf_counter() - start_time,
         "ema_used": ema_model is not None,
         "global_step": global_step,
@@ -4741,12 +4948,37 @@ def _(mo):
     reflow_init_ui = mo.ui.dropdown(
         options=["from-previous", "from-scratch"], value="from-previous", label="Reflow Init"
     )
+    reflow_lr_schedule_ui = mo.ui.dropdown(
+        options=lr_schedule_choices(), value="cosine annealing", label="Reflow LR Schedule"
+    )
+    reflow_min_lr_ui = mo.ui.dropdown(
+        options={"0": 0.0, "0.01": 0.01, "0.05": 0.05, "0.1": 0.1, "0.2": 0.2},
+        value="0.1",
+        label="Reflow Min LR (× peak)",
+    )
+    reflow_lr_period_ui = mo.ui.number(value=3, start=1, stop=100, step=1, label="Step / Restart Period (epochs)")
+    reflow_lr_gamma_ui = mo.ui.dropdown(
+        options={"0.1": 0.1, "0.3": 0.3, "0.5": 0.5, "0.7": 0.7},
+        value="0.5",
+        label="Decay γ (step / plateau)",
+    )
+    reflow_lr_patience_ui = mo.ui.number(value=2, start=1, stop=50, step=1, label="Plateau Patience (epochs)")
     reflow_train_btn = mo.ui.run_button(label="Train Reflow Model")
     mo.vstack(
         [
             mo.md("### Reflow training hyperparameters"),
             mo.hstack([reflow_lr_ui, reflow_bs_ui, reflow_wd_ui, reflow_epochs_ui]),
             mo.hstack([reflow_warmup_ui, reflow_grad_clip_ui, reflow_ema_ui, reflow_t_scheme_ui]),
+            mo.md("**Reflow learning-rate schedule** (same options as Section 5; `Reflow LR` is the peak)."),
+            mo.hstack(
+                [
+                    reflow_lr_schedule_ui,
+                    reflow_min_lr_ui,
+                    reflow_lr_period_ui,
+                    reflow_lr_gamma_ui,
+                    reflow_lr_patience_ui,
+                ]
+            ),
             mo.hstack([reflow_init_ui, reflow_train_btn]),
         ]
     )
@@ -4756,12 +4988,65 @@ def _(mo):
         reflow_epochs_ui,
         reflow_grad_clip_ui,
         reflow_init_ui,
+        reflow_lr_gamma_ui,
+        reflow_lr_patience_ui,
+        reflow_lr_period_ui,
+        reflow_lr_schedule_ui,
         reflow_lr_ui,
+        reflow_min_lr_ui,
         reflow_t_scheme_ui,
         reflow_train_btn,
         reflow_warmup_ui,
         reflow_wd_ui,
     )
+
+
+@app.function
+def reflow_train_pair_count(n_pairs: int, val_fraction: float) -> int:
+    n = int(n_pairs)
+    if n <= 0:
+        return 0
+    n_val = min(max(1, int(round(n * float(val_fraction)))), max(n - 1, 1))
+    return n - n_val
+
+
+@app.cell
+def _(
+    reflow_bs_ui,
+    reflow_epochs_ui,
+    reflow_lr_gamma_ui,
+    reflow_lr_patience_ui,
+    reflow_lr_period_ui,
+    reflow_lr_schedule_ui,
+    reflow_lr_ui,
+    reflow_min_lr_ui,
+    reflow_pairs: Optional[List[Dict[str, object]]],
+    reflow_pairs_num_ui,
+    reflow_val_frac_ui,
+    reflow_warmup_ui,
+):
+    plot_lr_schedule(
+        TrainConfigV1(
+            lr=float(reflow_lr_ui.value),
+            batch_size=int(reflow_bs_ui.value),
+            epochs=int(reflow_epochs_ui.value),
+            warmup_steps=int(reflow_warmup_ui.value),
+            lr_schedule=str(reflow_lr_schedule_ui.value),
+            min_lr_ratio=float(reflow_min_lr_ui.value),
+            lr_period_epochs=int(reflow_lr_period_ui.value),
+            lr_gamma=float(reflow_lr_gamma_ui.value),
+            lr_plateau_patience=int(reflow_lr_patience_ui.value),
+        ),
+        steps_per_epoch=math.ceil(
+            reflow_train_pair_count(
+                len(reflow_pairs) if reflow_pairs is not None else int(reflow_pairs_num_ui.value),
+                float(reflow_val_frac_ui.value),
+            )
+            / int(reflow_bs_ui.value)
+        ),
+        title="Reflow LR schedule preview",
+    )
+    return
 
 
 @app.function
@@ -4823,7 +5108,8 @@ def run_reflow_training_view(
         mo.md(
             f"**Reflow training complete** in {run['wall_time']:.1f}s — "
             f"final train {run['train_losses'][-1]:.4f} | "
-            f"final val (held-out pairs) {run['val_losses'][-1]:.4f}"
+            f"final val (held-out pairs) {run['val_losses'][-1]:.4f} | "
+            f"{reflow_train_cfg.lr_schedule} schedule, final LR {run['lr_history'][-1]:.2e}"
         )
     )
     return run
@@ -4865,7 +5151,12 @@ def _(
     reflow_epochs_ui,
     reflow_grad_clip_ui,
     reflow_init_ui,
+    reflow_lr_gamma_ui,
+    reflow_lr_patience_ui,
+    reflow_lr_period_ui,
+    reflow_lr_schedule_ui,
     reflow_lr_ui,
+    reflow_min_lr_ui,
     reflow_pairs: Optional[List[Dict[str, object]]],
     reflow_pairs_meta: Optional[Dict[str, object]],
     reflow_prior: Optional[Dict[str, float]],
@@ -4894,6 +5185,11 @@ def _(
             t_scheme=str(reflow_t_scheme_ui.value),
             p_uncond=float(gen1_train_cfg_used.p_uncond) if gen1_train_cfg_used is not None else 0.1,
             seed=int(seed_ui.value) + 7,
+            lr_schedule=str(reflow_lr_schedule_ui.value),
+            min_lr_ratio=float(reflow_min_lr_ui.value),
+            lr_period_epochs=int(reflow_lr_period_ui.value),
+            lr_gamma=float(reflow_lr_gamma_ui.value),
+            lr_plateau_patience=int(reflow_lr_patience_ui.value),
         ),
         reflow_val_fraction=float(reflow_val_frac_ui.value),
         init_mode=str(reflow_init_ui.value),
