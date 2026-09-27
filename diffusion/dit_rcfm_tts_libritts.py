@@ -113,6 +113,23 @@ def _(mo):
     10. **Sampling from the Trained Model** — text + speaker + duration UI.
     11. **Save Trained Model** — state dict + JSON sidecar under `models/`.
     12. **Load Saved Model for Sampling** — reload + sample from any saved checkpoint.
+
+    ## Resuming from checkpoints
+
+    The full pipeline takes hours, so every long stage can be skipped on a later
+    run by loading what an earlier run saved:
+
+    | Stage | Save with | Resume with |
+    |---|---|---|
+    | gen1 training | Section 11 → `models/*.pt` + `.json` | Section 5 — *Load gen1 Checkpoint* |
+    | Reflow pair building | Section 8 → `~/data/libritts_reflow/*.pt` + `.json` | Section 8 — *Load Reflow Pairs* |
+    | Reflow training | Section 11 → `models/*.pt` + `.json` | Section 8 — *Load Reflow Checkpoint* |
+
+    A loaded checkpoint or pair file is used for training only when its
+    vocabulary, speaker ids, mel config and mel normalization match this run's
+    data pipeline (otherwise token / speaker ids would be misaligned). A loaded
+    artefact takes precedence over one computed in the same session; select
+    *(none)* in its dropdown to switch back.
     """)
     return
 
@@ -2547,6 +2564,9 @@ def _(mo):
     across epochs, not restarted per epoch), so the warmup
     $\beta_n = \min(\beta, (1+n)/(10+n))$ progresses continuously and the
     averaged weights track the whole training run.
+
+    Training can be skipped on later runs: the *Resume from a checkpoint* block
+    below loads a gen1 model saved by Section 11.
     """)
     return
 
@@ -2774,13 +2794,15 @@ def _(
     warmup_ui,
     wd_ui,
 ):
-    gen1_run: Optional[Dict[str, object]] = None
+    session_gen1_run: Optional[Dict[str, object]] = None
     if mel_cache is None:
         mo.output.replace(mo.md("_Data pipeline not ready — check Section 2 filters._"))
     elif not train_btn.value:
-        mo.output.replace(mo.md("Click **Train (1-Rectified Flow)** to begin training."))
+        mo.output.replace(
+            mo.md("Click **Train (1-Rectified Flow)** to begin training — or load a saved checkpoint below.")
+        )
     else:
-        gen1_run = run_gen1_training(
+        session_gen1_run = run_gen1_training(
             model_cfg=model_cfg,
             train_cfg=TrainConfigV1(
                 lr=float(lr_ui.value),
@@ -2812,20 +2834,301 @@ def _(
         )
         mo.output.replace(
             mo.md(
-                f"**Training complete** in {gen1_run['wall_time']:.1f}s — final train "
-                f"{gen1_run['train_losses'][-1]:.4f} | final val {gen1_run['val_losses'][-1]:.4f} "
-                f"| using EMA weights: {gen1_run['ema_used']} | global steps: {gen1_run['global_step']}"
+                f"**Training complete** in {session_gen1_run['wall_time']:.1f}s — final train "
+                f"{session_gen1_run['train_losses'][-1]:.4f} | final val {session_gen1_run['val_losses'][-1]:.4f} "
+                f"| using EMA weights: {session_gen1_run['ema_used']} | global steps: {session_gen1_run['global_step']}"
             )
         )
-    train_losses: List[float] = gen1_run["train_losses"] if gen1_run else []
-    val_losses: List[float] = gen1_run["val_losses"] if gen1_run else []
-    trained_model: Optional[nn.Module] = gen1_run["model"] if gen1_run else None
-    train_wall_time: float = gen1_run["wall_time"] if gen1_run else 0.0
-    trained_ema_used: bool = bool(gen1_run["ema_used"]) if gen1_run else False
-    gen1_train_cfg_used: Optional[TrainConfigV1] = gen1_run["train_config"] if gen1_run else None
-    gen1_loaders: Optional[Dict[str, object]] = gen1_run["loaders"] if gen1_run else None
+    return (session_gen1_run,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Resume from a checkpoint — skip gen1 training
+
+    Pick a checkpoint saved by Section 11 in the repo-root `models/` directory and
+    click **Load gen1 Checkpoint**. The loaded model becomes the active gen1 model
+    for Sections 7–11 — reflow pair building and the *from-previous*
+    initialization of the reflow model included — and restores its training
+    config (so reflow keeps gen1's `p_uncond`) and, for checkpoints saved by this
+    version of the notebook, its loss history. The checkpoint is accepted only if
+    its vocabulary, speaker ids, mel config and mel normalization match this run's
+    data pipeline. A loaded checkpoint takes precedence over a model trained in
+    this session; select *(none)* to switch back.
+    """)
+    return
+
+
+@app.function
+def file_sha256(path: Path, chunk_bytes: int = 1 << 24) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_bytes), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@app.function
+def model_fingerprint(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+@app.function
+def ordered_speaker_ids(speaker_to_id: Dict[str, int]) -> List[str]:
+    ordered = [""] * (max(speaker_to_id.values(), default=0) + 1)
+    for name, idx in speaker_to_id.items():
+        if 0 <= int(idx) < len(ordered):
+            ordered[int(idx)] = str(name)
+    return ordered
+
+
+@app.function
+def pipeline_signature(
+    tokenizer: CharTokenizerV1,
+    speaker_to_id: Dict[str, int],
+    mel_config: Dict[str, object],
+    mel_mean: torch.Tensor,
+    mel_std: torch.Tensor,
+) -> Dict[str, object]:
+    return {
+        "vocab": list(tokenizer.vocab),
+        "speaker_ids": ordered_speaker_ids(speaker_to_id),
+        "mel_config": {k: (v if not isinstance(v, torch.Tensor) else v.tolist()) for k, v in mel_config.items()},
+        "mel_mean": mel_mean.to(torch.float32).tolist(),
+        "mel_std": mel_std.to(torch.float32).tolist(),
+    }
+
+
+@app.function
+def pipeline_mismatches(reference: Dict[str, object], current: Dict[str, object]) -> List[str]:
+    problems: List[str] = []
+    if list(reference.get("vocab", [])) != list(current["vocab"]):
+        problems.append("character vocabulary differs")
+    if list(reference.get("speaker_ids", [])) != list(current["speaker_ids"]):
+        problems.append("speaker id map differs")
+    if json.loads(json.dumps(reference.get("mel_config", {}), sort_keys=True)) != json.loads(
+        json.dumps(current["mel_config"], sort_keys=True)
+    ):
+        problems.append("mel config differs")
+    for key in ("mel_mean", "mel_std"):
+        ref = torch.tensor(list(reference.get(key, [])), dtype=torch.float32)
+        cur = torch.tensor(list(current[key]), dtype=torch.float32)
+        if ref.shape != cur.shape or not torch.allclose(ref, cur, rtol=1e-5, atol=1e-6):
+            problems.append(f"{key.replace('_', ' ')} differs")
+    return problems
+
+
+@app.function
+def train_config_from_snapshot(snapshot: Optional[Dict[str, object]]) -> Optional[TrainConfigV1]:
+    if not snapshot:
+        return None
+    known = set(asdict(TrainConfigV1()).keys())
+    return TrainConfigV1(**{k: v for k, v in snapshot.items() if k in known})
+
+
+@app.function
+def resume_checkpoint_options(models_dir: Path, tag: str, generation: Optional[str] = None) -> Dict[str, str]:
+    options: Dict[str, str] = {"(none)": ""}
+    for weights_path in list_saved_checkpoints(models_dir, tag):
+        try:
+            gen = str(json.loads(weights_path.with_suffix(".json").read_text()).get("generation", "?"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if generation is None or gen == generation:
+            options[f"{weights_path.name} ({gen})"] = str(weights_path)
+    return options
+
+
+@app.function
+def load_resume_checkpoint(
+    weights_path: Path,
+    device: torch.device,
+    tag: str,
+    current_pipeline: Dict[str, object],
+) -> Dict[str, object]:
+    model, sidecar, err = load_saved_bundle(weights_path, device, tag)
+    if model is None:
+        raise ValueError(err)
+    problems = pipeline_mismatches(sidecar, current_pipeline)
+    if problems:
+        raise ValueError(
+            "checkpoint does not match this run's data pipeline (" + "; ".join(problems) + "). "
+            "Re-run with the data settings the checkpoint was trained with, or sample from it in Section 12."
+        )
+    model.requires_grad_(False)
+    return {
+        "model": model,
+        "sidecar": sidecar,
+        "path": weights_path,
+        "sha256": file_sha256(weights_path),
+        "fingerprint": model_fingerprint(model),
+    }
+
+
+@app.function
+def resolve_generation(
+    session_run: Optional[Dict[str, object]],
+    loaded_ckpt: Optional[Dict[str, object]],
+    label: str,
+) -> Dict[str, object]:
+    if loaded_ckpt is not None:
+        sidecar = loaded_ckpt["sidecar"]
+        history = sidecar.get("history") or {}
+        name = Path(loaded_ckpt["path"]).name
+        note = (
+            " A model trained in this session also exists; select *(none)* to use it instead."
+            if session_run is not None
+            else ""
+        )
+        return {
+            "model": loaded_ckpt["model"],
+            "train_losses": [float(v) for v in history.get("train_losses", [])],
+            "val_losses": [float(v) for v in history.get("val_losses", [])],
+            "wall_time": float(history.get("wall_time", 0.0)),
+            "ema_used": bool(sidecar.get("ema_used", False)),
+            "train_config": train_config_from_snapshot(sidecar.get("train_config")),
+            "provenance": sidecar.get("reflow_provenance"),
+            "loaders": None,
+            "source": {
+                "kind": "checkpoint",
+                "file": name,
+                "sha256": loaded_ckpt["sha256"],
+                "fingerprint": loaded_ckpt["fingerprint"],
+            },
+            "summary": f"**Active {label} model:** checkpoint `{name}` "
+            f"(fingerprint `{loaded_ckpt['fingerprint']}`).{note}",
+        }
+    if session_run is not None:
+        fingerprint = model_fingerprint(session_run["model"])
+        return {
+            "model": session_run["model"],
+            "train_losses": list(session_run["train_losses"]),
+            "val_losses": list(session_run["val_losses"]),
+            "wall_time": float(session_run["wall_time"]),
+            "ema_used": bool(session_run["ema_used"]),
+            "train_config": session_run.get("train_config"),
+            "provenance": session_run.get("provenance"),
+            "loaders": session_run.get("loaders"),
+            "source": {"kind": "session", "file": None, "sha256": None, "fingerprint": fingerprint},
+            "summary": f"**Active {label} model:** trained in this session (fingerprint `{fingerprint}`) "
+            "— save it in Section 11 to resume from it later.",
+        }
+    return {
+        "model": None,
+        "train_losses": [],
+        "val_losses": [],
+        "wall_time": 0.0,
+        "ema_used": False,
+        "train_config": None,
+        "provenance": None,
+        "loaders": None,
+        "source": None,
+        "summary": f"_No {label} model yet — train one or load a checkpoint._",
+    }
+
+
+@app.cell
+def _():
+    models_dir = Path(__file__).resolve().parent.parent / "models"
+    return (models_dir,)
+
+
+@app.cell
+def _(mel_config, mel_norm_mean, mel_norm_std, speaker_to_id, text_tokenizer):
+    current_pipeline = pipeline_signature(text_tokenizer, speaker_to_id, mel_config, mel_norm_mean, mel_norm_std)
+    return (current_pipeline,)
+
+
+@app.cell
+def _(mo):
+    gen1_ckpt_refresh_btn = mo.ui.run_button(label="Refresh Checkpoint List")
+    gen1_ckpt_refresh_btn
+    return (gen1_ckpt_refresh_btn,)
+
+
+@app.cell
+def _(gen1_ckpt_refresh_btn, mo, models_dir):
+    gen1_ckpt_refresh_btn.value
+    gen1_ckpt_ui = mo.ui.dropdown(
+        options=resume_checkpoint_options(models_dir, format_tag()),
+        value="(none)",
+        label="gen1 Checkpoint",
+    )
+    gen1_load_btn = mo.ui.run_button(label="Load gen1 Checkpoint")
+    mo.hstack([gen1_ckpt_ui, gen1_load_btn], justify="start")
+    return gen1_ckpt_ui, gen1_load_btn
+
+
+@app.cell
+def _(current_pipeline, device, gen1_ckpt_ui, gen1_load_btn, mo):
+    loaded_gen1_ckpt: Optional[Dict[str, object]] = None
+    if not gen1_ckpt_ui.value:
+        _out = mo.md("_No checkpoint selected — Sections 7–11 use the model trained in this session._")
+    elif not gen1_load_btn.value:
+        _out = mo.md("Click **Load gen1 Checkpoint** to load the selected file.")
+    else:
+        try:
+            loaded_gen1_ckpt = load_resume_checkpoint(
+                Path(str(gen1_ckpt_ui.value)), device, format_tag(), current_pipeline
+            )
+            _out = mo.md(
+                f"**Loaded** `{loaded_gen1_ckpt['path'].name}` — generation "
+                f"`{loaded_gen1_ckpt['sidecar'].get('generation', '?')}`, "
+                f"{count_parameters(loaded_gen1_ckpt['model']):,} parameters, "
+                f"sha256 `{loaded_gen1_ckpt['sha256'][:12]}…`"
+            )
+        except (ValueError, RuntimeError, OSError) as _err:
+            _out = mo.md(f"**Load failed** — {_err}")
+    _out
+    return (loaded_gen1_ckpt,)
+
+
+@app.cell
+def _(
+    loaded_gen1_ckpt: Optional[Dict[str, object]],
+    mel_cache,
+    mel_norm_mean,
+    mel_norm_std,
+    mo,
+    session_gen1_run: Optional[Dict[str, object]],
+    speaker_to_id,
+    test_utts,
+    text_tokenizer,
+    train_utts,
+    val_utts,
+):
+    gen1_resolved = resolve_generation(session_gen1_run, loaded_gen1_ckpt, "gen1")
+    trained_model: Optional[nn.Module] = gen1_resolved["model"]
+    train_losses: List[float] = gen1_resolved["train_losses"]
+    val_losses: List[float] = gen1_resolved["val_losses"]
+    train_wall_time: float = gen1_resolved["wall_time"]
+    trained_ema_used: bool = gen1_resolved["ema_used"]
+    gen1_train_cfg_used: Optional[TrainConfigV1] = gen1_resolved["train_config"]
+    gen1_source: Optional[Dict[str, object]] = gen1_resolved["source"]
+    gen1_loaders: Optional[Dict[str, object]] = gen1_resolved["loaders"]
+    if gen1_loaders is None and trained_model is not None and mel_cache is not None:
+        gen1_loaders = make_datasets(
+            mel_cache=mel_cache,
+            train_utts=train_utts,
+            val_utts=val_utts,
+            test_utts=test_utts,
+            tokenizer=text_tokenizer,
+            speaker_to_id=speaker_to_id,
+            mel_mean=mel_norm_mean,
+            mel_std=mel_norm_std,
+            batch_size=int(gen1_train_cfg_used.batch_size) if gen1_train_cfg_used is not None else 16,
+            patch_time=int(trained_model.config.patch_time),
+            seed=int(gen1_train_cfg_used.seed) if gen1_train_cfg_used is not None else 1337,
+        )
+    mo.md(gen1_resolved["summary"])
     return (
         gen1_loaders,
+        gen1_source,
         gen1_train_cfg_used,
         train_losses,
         train_wall_time,
@@ -3613,6 +3916,14 @@ def _(mo):
     Reflow validation loss is computed on a **held-out subset of the pairs
     themselves** (the same coupled objective the reflow model is trained on),
     not on independent Gaussian x0.
+
+    **Checkpoints.** Building pairs integrates the ODE over every training
+    utterance, so the pairs can be saved to `~/data/libritts_reflow/` (with a
+    JSON sidecar recording the inversion settings, prior statistics, round-trip
+    MSE, the fingerprint of the gen1 model that produced them, and this run's
+    data-pipeline signature) and reloaded on a later run instead of being rebuilt.
+    The reflow model itself can likewise be loaded from a Section 11 checkpoint at
+    the end of this section.
     """)
     return
 
@@ -3800,10 +4111,12 @@ def build_reflow_pairs_view(
     mo,
 ) -> Tuple[Optional[List[Dict[str, object]]], float, Optional[Dict[str, float]], Optional[Dict[str, float]]]:
     if trained_model is None or mel_cache is None:
-        mo.output.replace(mo.md("_Train the 1st-generation model first (Section 5)._"))
+        mo.output.replace(
+            mo.md("_Train or load the gen1 model first (Section 5) — or load saved reflow pairs below._")
+        )
         return None, 0.0, None, None
     if not is_clicked:
-        mo.output.replace(mo.md("Click **Build Reflow Pairs**."))
+        mo.output.replace(mo.md("Click **Build Reflow Pairs** — or load saved pairs below."))
         return None, 0.0, None, None
     ldrs = make_datasets(
         mel_cache=mel_cache,
@@ -3842,6 +4155,7 @@ def build_reflow_pairs_view(
 @app.cell
 def _(
     device,
+    gen1_source: Optional[Dict[str, object]],
     mel_cache,
     mel_norm_mean,
     mel_norm_std,
@@ -3859,7 +4173,7 @@ def _(
     trained_model: Optional[nn.Module],
     val_utts,
 ):
-    reflow_pairs, reflow_gen_time, reflow_prior, reflow_roundtrip = build_reflow_pairs_view(
+    _pairs, _gen_time, _prior, _roundtrip = build_reflow_pairs_view(
         trained_model=trained_model,
         train_utts=train_utts, val_utts=val_utts, test_utts=test_utts,
         mel_cache=mel_cache, tokenizer=text_tokenizer, speaker_to_id=speaker_to_id,
@@ -3873,7 +4187,251 @@ def _(
         is_clicked=bool(reflow_pairs_btn.value),
         mo=mo,
     )
-    return reflow_pairs, reflow_prior, reflow_roundtrip
+    generated_reflow: Optional[Dict[str, object]] = None
+    if _pairs is not None:
+        generated_reflow = {
+            "pairs": _pairs,
+            "prior": _prior,
+            "roundtrip": _roundtrip,
+            "meta": {
+                "inversion_steps": int(reflow_steps_ui.value),
+                "inversion_method": str(reflow_method_ui.value),
+                "inversion_guidance_scale": float(reflow_guidance_ui.value),
+                "pair_count": len(_pairs),
+                "generation_seconds": float(_gen_time),
+                "gen1_source": gen1_source,
+            },
+        }
+    return (generated_reflow,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Save / load reflow pairs
+
+    **Save** writes the built pairs (fp16 $x_0$ / $x_1$, tokens, speaker, masks,
+    utterance ids) to `~/data/libritts_reflow/<name>.pt` and their provenance plus
+    this run's data-pipeline signature to `<name>.json`. **Load** restores a saved
+    file after checking that signature against the current pipeline; loaded pairs
+    then take precedence over pairs built in this session (select *(none)* to
+    switch back).
+    """)
+    return
+
+
+@app.cell
+def _():
+    reflow_data_dir = data_root() / "libritts_reflow"
+    return (reflow_data_dir,)
+
+
+@app.function
+def save_reflow_pair_bundle(
+    generated: Dict[str, object],
+    pipeline: Dict[str, object],
+    data_dir: Path,
+    filename: str,
+    overwrite: bool = False,
+) -> Tuple[Path, Path]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    name = filename if filename.endswith(".pt") else f"{filename}.pt"
+    pairs_path = data_dir / name
+    sidecar_path = pairs_path.with_suffix(".json")
+    if pairs_path.exists() and not overwrite:
+        raise FileExistsError(f"`{pairs_path}` already exists — tick *Overwrite* or choose another name.")
+    torch.save({"pairs": list(generated["pairs"])}, pairs_path)
+    payload = {
+        "format": "dit_rcfm_tts_libritts_reflow_pairs_v1",
+        "meta": generated["meta"],
+        "prior": generated["prior"],
+        "roundtrip": generated["roundtrip"],
+        "pipeline": pipeline,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(sidecar_path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return pairs_path, sidecar_path
+
+
+@app.function
+def reflow_pair_file_options(data_dir: Path) -> Dict[str, str]:
+    options: Dict[str, str] = {"(none)": ""}
+    if not data_dir.exists():
+        return options
+    for pairs_path in sorted(data_dir.glob("*.pt")):
+        sidecar_path = pairs_path.with_suffix(".json")
+        if not sidecar_path.exists():
+            continue
+        try:
+            payload = json.loads(sidecar_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("format") != "dit_rcfm_tts_libritts_reflow_pairs_v1":
+            continue
+        meta = payload.get("meta", {})
+        options[
+            f"{pairs_path.name} ({meta.get('pair_count', '?')} pairs, "
+            f"{meta.get('inversion_steps', '?')} {meta.get('inversion_method', '?')} steps)"
+        ] = str(pairs_path)
+    return options
+
+
+@app.function
+def load_reflow_pair_bundle(pairs_path: Path, current_pipeline: Dict[str, object]) -> Dict[str, object]:
+    payload = json.loads(pairs_path.with_suffix(".json").read_text())
+    problems = pipeline_mismatches(payload.get("pipeline", {}), current_pipeline)
+    if problems:
+        raise ValueError(
+            "saved pairs do not match this run's data pipeline (" + "; ".join(problems) + "), "
+            "so their token / speaker ids or mel normalization would be misaligned."
+        )
+    blob = torch.load(str(pairs_path), map_location="cpu", weights_only=True)
+    return {
+        "pairs": list(blob["pairs"]),
+        "prior": payload.get("prior"),
+        "roundtrip": payload.get("roundtrip"),
+        "meta": payload.get("meta", {}),
+        "timestamp": payload.get("timestamp"),
+        "path": pairs_path,
+    }
+
+
+@app.function
+def resolve_reflow_pairs(
+    generated: Optional[Dict[str, object]],
+    loaded: Optional[Dict[str, object]],
+    gen1_source: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    chosen = loaded if loaded is not None else generated
+    if chosen is None:
+        return {
+            "pairs": None,
+            "prior": None,
+            "roundtrip": None,
+            "meta": None,
+            "summary": "_No reflow pairs yet — build them or load a saved file._",
+        }
+    meta = dict(chosen["meta"])
+    meta["source_file"] = str(Path(chosen["path"]).name) if loaded is not None else None
+    origin = f"file `{Path(chosen['path']).name}`" if loaded is not None else "built in this session"
+    producer = (meta.get("gen1_source") or {}).get("fingerprint")
+    active = (gen1_source or {}).get("fingerprint")
+    warning = ""
+    if producer and active and producer != active:
+        warning = (
+            f"\n\n**Note:** these pairs were produced by the gen1 model with fingerprint `{producer}`, "
+            f"but the active gen1 model is `{active}`. Reflow training still works, but the "
+            "*from-previous* initialization then starts from a different model than the one that built the pairs."
+        )
+    return {
+        "pairs": chosen["pairs"],
+        "prior": chosen["prior"],
+        "roundtrip": chosen["roundtrip"],
+        "meta": meta,
+        "summary": f"**Active reflow pairs:** {origin} — {len(chosen['pairs']):,} pairs.{warning}",
+    }
+
+
+@app.cell
+def _(mo):
+    pairs_save_name_ui = mo.ui.text(
+        value="libritts_reflow_pairs_v1.pt",
+        label="Filename (saved into ~/data/libritts_reflow/)",
+        full_width=True,
+    )
+    pairs_overwrite_ui = mo.ui.checkbox(value=False, label="Overwrite if the file exists")
+    pairs_save_btn = mo.ui.run_button(label="Save Reflow Pairs")
+    mo.vstack([pairs_save_name_ui, mo.hstack([pairs_overwrite_ui, pairs_save_btn], justify="start")])
+    return pairs_overwrite_ui, pairs_save_btn, pairs_save_name_ui
+
+
+@app.cell
+def _(
+    current_pipeline,
+    generated_reflow: Optional[Dict[str, object]],
+    mo,
+    pairs_overwrite_ui,
+    pairs_save_btn,
+    pairs_save_name_ui,
+    reflow_data_dir,
+):
+    if generated_reflow is None:
+        _out = mo.md("_Build reflow pairs above to enable saving._")
+    elif not pairs_save_btn.value:
+        _out = mo.md("Choose a filename and click **Save Reflow Pairs**.")
+    else:
+        try:
+            _pairs_path, _sidecar_path = save_reflow_pair_bundle(
+                generated=generated_reflow,
+                pipeline=current_pipeline,
+                data_dir=reflow_data_dir,
+                filename=str(pairs_save_name_ui.value).strip() or "libritts_reflow_pairs_v1.pt",
+                overwrite=bool(pairs_overwrite_ui.value),
+            )
+            _out = mo.md(f"**Saved.**\n\n- pairs: `{_pairs_path}`\n- sidecar: `{_sidecar_path}`")
+        except (FileExistsError, OSError) as _err:
+            _out = mo.md(f"**Not saved** — {_err}")
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    pairs_refresh_btn = mo.ui.run_button(label="Refresh Pair List")
+    pairs_refresh_btn
+    return (pairs_refresh_btn,)
+
+
+@app.cell
+def _(mo, pairs_refresh_btn, reflow_data_dir):
+    pairs_refresh_btn.value
+    pairs_file_ui = mo.ui.dropdown(
+        options=reflow_pair_file_options(reflow_data_dir),
+        value="(none)",
+        label="Saved Reflow Pairs",
+    )
+    pairs_load_btn = mo.ui.run_button(label="Load Reflow Pairs")
+    mo.hstack([pairs_file_ui, pairs_load_btn], justify="start")
+    return pairs_file_ui, pairs_load_btn
+
+
+@app.cell
+def _(current_pipeline, mo, pairs_file_ui, pairs_load_btn):
+    loaded_reflow_pairs: Optional[Dict[str, object]] = None
+    if not pairs_file_ui.value:
+        _out = mo.md("_No saved pairs selected — the reflow model trains on pairs built in this session._")
+    elif not pairs_load_btn.value:
+        _out = mo.md("Click **Load Reflow Pairs** to load the selected file.")
+    else:
+        try:
+            loaded_reflow_pairs = load_reflow_pair_bundle(Path(str(pairs_file_ui.value)), current_pipeline)
+            _meta = loaded_reflow_pairs["meta"]
+            _out = mo.md(
+                f"**Loaded** `{loaded_reflow_pairs['path'].name}` — {len(loaded_reflow_pairs['pairs']):,} pairs, "
+                f"{_meta.get('inversion_steps')} {_meta.get('inversion_method')} steps, "
+                f"guidance {_meta.get('inversion_guidance_scale')}, saved {loaded_reflow_pairs['timestamp']}"
+            )
+        except (ValueError, KeyError, RuntimeError, OSError, json.JSONDecodeError) as _err:
+            _out = mo.md(f"**Load failed** — {_err}")
+    _out
+    return (loaded_reflow_pairs,)
+
+
+@app.cell
+def _(
+    gen1_source: Optional[Dict[str, object]],
+    generated_reflow: Optional[Dict[str, object]],
+    loaded_reflow_pairs: Optional[Dict[str, object]],
+    mo,
+):
+    reflow_pairs_resolved = resolve_reflow_pairs(generated_reflow, loaded_reflow_pairs, gen1_source)
+    reflow_pairs: Optional[List[Dict[str, object]]] = reflow_pairs_resolved["pairs"]
+    reflow_prior: Optional[Dict[str, float]] = reflow_pairs_resolved["prior"]
+    reflow_roundtrip: Optional[Dict[str, float]] = reflow_pairs_resolved["roundtrip"]
+    reflow_pairs_meta: Optional[Dict[str, object]] = reflow_pairs_resolved["meta"]
+    mo.md(reflow_pairs_resolved["summary"])
+    return reflow_pairs, reflow_pairs_meta, reflow_prior, reflow_roundtrip
 
 
 @app.function
@@ -4271,10 +4829,35 @@ def run_reflow_training_view(
     return run
 
 
+@app.function
+def reflow_provenance_record(
+    pairs_meta: Dict[str, object],
+    pairs: List[Dict[str, object]],
+    prior: Optional[Dict[str, float]],
+    roundtrip: Optional[Dict[str, float]],
+    gen1_source: Optional[Dict[str, object]],
+    init_mode: str,
+) -> Dict[str, object]:
+    return {
+        "inversion_steps": int(pairs_meta.get("inversion_steps", 0)),
+        "inversion_method": str(pairs_meta.get("inversion_method", "")),
+        "inversion_guidance_scale": float(pairs_meta.get("inversion_guidance_scale", 1.0)),
+        "pair_count": len(pairs),
+        "prior_mean": float(prior["mean"]) if prior is not None else None,
+        "prior_std": float(prior["std"]) if prior is not None else None,
+        "roundtrip_mse": float(roundtrip["roundtrip_mse"]) if roundtrip is not None else None,
+        "pairs_file": pairs_meta.get("source_file"),
+        "pairs_gen1_source": pairs_meta.get("gen1_source"),
+        "gen1_source": gen1_source,
+        "init": str(init_mode),
+    }
+
+
 @app.cell
 def _(
     amp_dtype,
     device,
+    gen1_source: Optional[Dict[str, object]],
     gen1_train_cfg_used: Optional[TrainConfigV1],
     mo,
     reflow_bs_ui,
@@ -4283,7 +4866,10 @@ def _(
     reflow_grad_clip_ui,
     reflow_init_ui,
     reflow_lr_ui,
-    reflow_pairs,
+    reflow_pairs: Optional[List[Dict[str, object]]],
+    reflow_pairs_meta: Optional[Dict[str, object]],
+    reflow_prior: Optional[Dict[str, float]],
+    reflow_roundtrip: Optional[Dict[str, float]],
     reflow_t_scheme_ui,
     reflow_train_btn,
     reflow_val_frac_ui,
@@ -4294,7 +4880,7 @@ def _(
     trained_model: Optional[nn.Module],
     use_amp,
 ):
-    reflow_run = run_reflow_training_view(
+    session_reflow_run = run_reflow_training_view(
         trained_model=trained_model,
         reflow_pairs=reflow_pairs,
         reflow_train_cfg=TrainConfigV1(
@@ -4316,15 +4902,94 @@ def _(
         is_clicked=bool(reflow_train_btn.value),
         mo=mo,
     )
-    reflow_train_losses: List[float] = reflow_run["train_losses"] if reflow_run else []
-    reflow_val_losses: List[float] = reflow_run["val_losses"] if reflow_run else []
-    reflow_model: Optional[nn.Module] = reflow_run["model"] if reflow_run else None
-    reflow_wall_time: float = reflow_run["wall_time"] if reflow_run else 0.0
-    reflow_ema_used: bool = bool(reflow_run["ema_used"]) if reflow_run else False
-    reflow_train_cfg_used: Optional[TrainConfigV1] = reflow_run["train_config"] if reflow_run else None
+    if session_reflow_run is not None:
+        session_reflow_run["provenance"] = reflow_provenance_record(
+            pairs_meta=reflow_pairs_meta or {},
+            pairs=reflow_pairs or [],
+            prior=reflow_prior,
+            roundtrip=reflow_roundtrip,
+            gen1_source=gen1_source,
+            init_mode=str(reflow_init_ui.value),
+        )
+    return (session_reflow_run,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Resume from a checkpoint — skip reflow training
+
+    Load a reflow model saved by Section 11 to run Sections 9–11 without
+    retraining it (load the gen1 checkpoint in Section 5 as well to compare both
+    generations). The same data-pipeline check as in Section 5 applies. A loaded
+    checkpoint takes precedence over a reflow model trained in this session;
+    select *(none)* to switch back.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    reflow_ckpt_refresh_btn = mo.ui.run_button(label="Refresh Checkpoint List")
+    reflow_ckpt_refresh_btn
+    return (reflow_ckpt_refresh_btn,)
+
+
+@app.cell
+def _(mo, models_dir, reflow_ckpt_refresh_btn):
+    reflow_ckpt_refresh_btn.value
+    reflow_ckpt_ui = mo.ui.dropdown(
+        options=resume_checkpoint_options(models_dir, format_tag(), generation="reflow"),
+        value="(none)",
+        label="Reflow Checkpoint",
+    )
+    reflow_ckpt_load_btn = mo.ui.run_button(label="Load Reflow Checkpoint")
+    mo.hstack([reflow_ckpt_ui, reflow_ckpt_load_btn], justify="start")
+    return reflow_ckpt_load_btn, reflow_ckpt_ui
+
+
+@app.cell
+def _(current_pipeline, device, mo, reflow_ckpt_load_btn, reflow_ckpt_ui):
+    loaded_reflow_ckpt: Optional[Dict[str, object]] = None
+    if not reflow_ckpt_ui.value:
+        _out = mo.md("_No checkpoint selected — Sections 9–11 use the reflow model trained in this session._")
+    elif not reflow_ckpt_load_btn.value:
+        _out = mo.md("Click **Load Reflow Checkpoint** to load the selected file.")
+    else:
+        try:
+            loaded_reflow_ckpt = load_resume_checkpoint(
+                Path(str(reflow_ckpt_ui.value)), device, format_tag(), current_pipeline
+            )
+            _out = mo.md(
+                f"**Loaded** `{loaded_reflow_ckpt['path'].name}` — "
+                f"{count_parameters(loaded_reflow_ckpt['model']):,} parameters, "
+                f"sha256 `{loaded_reflow_ckpt['sha256'][:12]}…`"
+            )
+        except (ValueError, RuntimeError, OSError) as _err:
+            _out = mo.md(f"**Load failed** — {_err}")
+    _out
+    return (loaded_reflow_ckpt,)
+
+
+@app.cell
+def _(
+    loaded_reflow_ckpt: Optional[Dict[str, object]],
+    mo,
+    session_reflow_run: Optional[Dict[str, object]],
+):
+    reflow_resolved = resolve_generation(session_reflow_run, loaded_reflow_ckpt, "reflow")
+    reflow_model: Optional[nn.Module] = reflow_resolved["model"]
+    reflow_train_losses: List[float] = reflow_resolved["train_losses"]
+    reflow_val_losses: List[float] = reflow_resolved["val_losses"]
+    reflow_wall_time: float = reflow_resolved["wall_time"]
+    reflow_ema_used: bool = reflow_resolved["ema_used"]
+    reflow_train_cfg_used: Optional[TrainConfigV1] = reflow_resolved["train_config"]
+    reflow_provenance: Optional[Dict[str, object]] = reflow_resolved["provenance"]
+    mo.md(reflow_resolved["summary"])
     return (
         reflow_ema_used,
         reflow_model,
+        reflow_provenance,
         reflow_train_cfg_used,
         reflow_train_losses,
         reflow_val_losses,
@@ -5225,10 +5890,13 @@ def _(mo):
     The chosen generation's state dict is written to the repo-root `models/`
     directory (created if missing). A JSON sidecar carries everything needed
     to sample later without touching the dataset — model + mel config, mel
-    normalization stats, vocabulary, speaker ids, `frames_per_char`, and the
-    training-config snapshot actually used. Reflow checkpoints also carry
-    the pair provenance (inversion steps / method / guidance / pair count /
-    prior stats / round-trip MSE).
+    normalization stats, vocabulary, speaker ids, `frames_per_char`, the
+    training-config snapshot actually used, and the loss history (restored when
+    the checkpoint is loaded back in Section 5 or 8). Reflow checkpoints also
+    carry the provenance recorded when the reflow model was trained (inversion
+    steps / method / guidance / pair count / prior stats / round-trip MSE, the
+    pair file and the gen1 model used). Existing files are only replaced when
+    *Overwrite* is ticked.
     """)
     return
 
@@ -5263,9 +5931,10 @@ def _(mo, save_which_ui):
         label="Filename (saved into models/)",
         full_width=True,
     )
+    save_overwrite_ui = mo.ui.checkbox(value=False, label="Overwrite if the file exists")
     save_btn = mo.ui.run_button(label="Save Model")
-    mo.vstack([save_filename_ui, save_btn])
-    return save_btn, save_filename_ui
+    mo.vstack([save_filename_ui, mo.hstack([save_overwrite_ui, save_btn], justify="start")])
+    return save_btn, save_filename_ui, save_overwrite_ui
 
 
 @app.function
@@ -5288,15 +5957,13 @@ def save_model_bundle(
     train_cfg_snapshot: Dict[str, object],
     ema_used: bool,
     reflow_provenance: Optional[Dict[str, object]] = None,
+    history: Optional[Dict[str, object]] = None,
 ) -> Tuple[Path, Path]:
     save_dir.mkdir(parents=True, exist_ok=True)
     weights_path = save_dir / filename
     sidecar_path = weights_path.with_suffix(".json")
     torch.save(model.state_dict(), weights_path)
-    ordered_speakers = [""] * (max(speaker_to_id.values(), default=0) + 1)
-    for name, idx in speaker_to_id.items():
-        if 0 <= int(idx) < len(ordered_speakers):
-            ordered_speakers[int(idx)] = str(name)
+    ordered_speakers = ordered_speaker_ids(speaker_to_id)
     payload = {
         "format": format_tag(),
         "generation": generation,
@@ -5311,6 +5978,8 @@ def save_model_bundle(
         "ema_used": bool(ema_used),
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if history is not None:
+        payload["history"] = history
     if reflow_provenance is not None:
         payload["reflow_provenance"] = reflow_provenance
     with open(sidecar_path, "w") as f:
@@ -5328,12 +5997,9 @@ def save_checkpoint(
     reflow_train_cfg_used: Optional[TrainConfigV1],
     trained_ema_used: bool,
     reflow_ema_used: bool,
-    reflow_prior: Optional[Dict[str, float]],
-    reflow_roundtrip: Optional[Dict[str, float]],
-    reflow_pairs: Optional[List[Dict[str, object]]],
-    reflow_invert_steps: int,
-    reflow_invert_method: str,
-    reflow_invert_guidance: float,
+    gen1_history: Dict[str, object],
+    reflow_history: Dict[str, object],
+    reflow_provenance: Optional[Dict[str, object]],
     mel_config: Dict[str, object],
     mel_mean: torch.Tensor,
     mel_std: torch.Tensor,
@@ -5342,27 +6008,25 @@ def save_checkpoint(
     frames_per_char: float,
     save_dir: Path,
     mo,
+    overwrite: bool = False,
 ) -> object:
     target = trained_model if which == "gen1" else reflow_model
     if target is None:
         return mo.md("_Requested model is not trained yet._")
     fname = str(filename).strip() or default_checkpoint_name(str(which))
+    fname = fname if fname.endswith(".pt") else f"{fname}.pt"
+    if (save_dir / fname).exists() and not overwrite:
+        return mo.md(f"**Not saved** — `{save_dir / fname}` already exists; tick *Overwrite* or choose another name.")
     if which == "gen1":
         cfg_used = gen1_train_cfg_used
         ema_used = bool(trained_ema_used)
         provenance = None
+        history = gen1_history
     else:
         cfg_used = reflow_train_cfg_used
         ema_used = bool(reflow_ema_used)
-        provenance = {
-            "inversion_steps": int(reflow_invert_steps),
-            "inversion_method": str(reflow_invert_method),
-            "inversion_guidance_scale": float(reflow_invert_guidance),
-            "pair_count": len(reflow_pairs) if reflow_pairs is not None else 0,
-            "prior_mean": float(reflow_prior["mean"]) if reflow_prior is not None else None,
-            "prior_std": float(reflow_prior["std"]) if reflow_prior is not None else None,
-            "roundtrip_mse": float(reflow_roundtrip["roundtrip_mse"]) if reflow_roundtrip is not None else None,
-        }
+        provenance = reflow_provenance
+        history = reflow_history
     train_cfg_snapshot = asdict(cfg_used) if cfg_used is not None else {}
     weights_path, sidecar_path = save_model_bundle(
         model=target, save_dir=save_dir, filename=fname, generation=str(which),
@@ -5371,6 +6035,7 @@ def save_checkpoint(
         frames_per_char=frames_per_char,
         train_cfg_snapshot=train_cfg_snapshot, ema_used=ema_used,
         reflow_provenance=provenance,
+        history=history,
     )
     return mo.md(
         f"**Saved.**\n\n- weights: `{weights_path}`\n- sidecar: `{sidecar_path}`\n\n"
@@ -5387,22 +6052,25 @@ def _(
     mel_norm_mean,
     mel_norm_std,
     mo,
+    models_dir,
     reflow_ema_used: bool,
-    reflow_guidance_ui,
-    reflow_method_ui,
     reflow_model: Optional[nn.Module],
-    reflow_pairs,
-    reflow_prior,
-    reflow_roundtrip,
-    reflow_steps_ui,
+    reflow_provenance: Optional[Dict[str, object]],
     reflow_train_cfg_used: Optional[TrainConfigV1],
+    reflow_train_losses: List[float],
+    reflow_val_losses: List[float],
+    reflow_wall_time: float,
     save_btn,
     save_filename_ui,
+    save_overwrite_ui,
     save_which_ui,
     speaker_to_id,
     text_tokenizer,
+    train_losses: List[float],
+    train_wall_time: float,
     trained_ema_used: bool,
     trained_model: Optional[nn.Module],
+    val_losses: List[float],
 ):
     if str(save_which_ui.value) == "none":
         _out = mo.md("_Train first (Section 5 and/or Section 8)._")
@@ -5417,16 +6085,19 @@ def _(
             reflow_train_cfg_used=reflow_train_cfg_used,
             trained_ema_used=bool(trained_ema_used),
             reflow_ema_used=bool(reflow_ema_used),
-            reflow_prior=reflow_prior, reflow_roundtrip=reflow_roundtrip,
-            reflow_pairs=reflow_pairs,
-            reflow_invert_steps=int(reflow_steps_ui.value),
-            reflow_invert_method=str(reflow_method_ui.value),
-            reflow_invert_guidance=float(reflow_guidance_ui.value),
+            gen1_history={"train_losses": train_losses, "val_losses": val_losses, "wall_time": train_wall_time},
+            reflow_history={
+                "train_losses": reflow_train_losses,
+                "val_losses": reflow_val_losses,
+                "wall_time": reflow_wall_time,
+            },
+            reflow_provenance=reflow_provenance,
             mel_config=mel_config, mel_mean=mel_norm_mean, mel_std=mel_norm_std,
             tokenizer=text_tokenizer, speaker_to_id=speaker_to_id,
             frames_per_char=frames_per_char,
-            save_dir=Path(__file__).resolve().parent.parent / "models",
+            save_dir=models_dir,
             mo=mo,
+            overwrite=bool(save_overwrite_ui.value),
         )
     _out
     return

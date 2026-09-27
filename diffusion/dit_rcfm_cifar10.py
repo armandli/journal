@@ -5,6 +5,7 @@ app = marimo.App(width="medium")
 
 with app.setup:
     import copy
+    import hashlib
     import json
     import math
     import random
@@ -89,17 +90,35 @@ def _(mo):
     4. **Model Definition** — versioned DiT modules, configurable, with a builder
        function and flow-matching helpers (loss, Euler ODE, CFG, straightness).
     5. **Training (1-Rectified Flow)** — AdamW + linear warmup + AMP + EMA, gated by
-       a run button.
+       a run button — or **load a saved 1st-gen checkpoint** from `models/` to skip
+       training entirely.
     6. **Hyperparameter Search** — small grid (optional).
     7. **Validation & Cross-Validation** — mean loss, per-timestep-bin loss,
        straightness, 5-fold CV.
     8. **Reflow (2-Rectified Flow)** — invert the 1st-gen model over the whole
        train + val split to build $(x_0, x_1, y)$ pairs; retrain on those pairs.
+       The pairs can be **saved to / reloaded from** `~/data/cifar10_reflow/`, and a
+       saved reflow checkpoint can be loaded instead of retraining.
     9. **Denoising Process Demonstration** — snapshots of $x_t$ and $\hat{x}_1$ at
        evenly spaced $t$ for each generation.
     10. **Results** — loss curves, class-conditional samples, few-step comparison
         (1, 2, 4, 8, 16, 64 Euler steps), model comparison table.
-    11. **Save Trained Model** — state dict + JSON config sidecar under `models/`.
+    11. **Save Trained Model** — state dict + JSON sidecar (config, loss history,
+        provenance) under `models/`.
+
+    ## Resuming from checkpoints
+
+    The full pipeline takes hours, so every long stage can be skipped on a later
+    run by loading what an earlier run saved:
+
+    | Stage | Save with | Resume with |
+    |---|---|---|
+    | 1st-gen training | Section 11 → `models/*.pt` + `.json` | Section 5 — *Load 1st-gen Checkpoint* |
+    | Reflow pair generation | Section 8 → `~/data/cifar10_reflow/*.pt` + `.json` | Section 8 — *Load Reflow Pairs* |
+    | Reflow training | Section 11 → `models/*.pt` + `.json` | Section 8 — *Load Reflow Checkpoint* |
+
+    A loaded artefact takes precedence over one computed in the same session;
+    select *(none)* in its dropdown to switch back.
     """)
     return
 
@@ -220,7 +239,7 @@ def _(mo):
     mo.md(r"""
     ## 2. Data Exploration
 
-    CIFAR-10 is downloaded (if missing) into the repo-root `data/cifar10` directory.
+    CIFAR-10 is downloaded (if missing) into `~/data/cifar10`, outside the repo.
     All 60,000 images (50k train + 10k test) are loaded once as a `uint8`
     NCHW tensor on CPU. This bulk-tensor layout lets us do fast slicing +
     on-device normalization + optional horizontal-flip augmentation each batch,
@@ -246,7 +265,7 @@ def load_cifar10_raw(data_dir: Path) -> Tuple[torch.Tensor, torch.Tensor, torch.
 
 @app.cell
 def _():
-    cifar_dir = Path("~") / "data" / "cifar10"
+    cifar_dir = Path.home() / "data" / "cifar10"
     train_images_all, train_labels_all, test_images, test_labels, class_names = load_cifar10_raw(cifar_dir)
     return (
         class_names,
@@ -411,7 +430,14 @@ def _(train_images_all, train_labels_all):
     val_labels = splits["val_labels"]
     train_indices = splits["train_indices"]
     val_indices = splits["val_indices"]
-    return train_images_uint8, train_labels, val_images_uint8, val_labels
+    return (
+        train_images_uint8,
+        train_indices,
+        train_labels,
+        val_images_uint8,
+        val_indices,
+        val_labels,
+    )
 
 
 @app.cell
@@ -1413,6 +1439,9 @@ def _(mo):
     long ones (a fixed $\beta = 0.9999$ would otherwise keep ~75% of the
     initialization after ~2,800 steps). The same `fit_flow_model` rite trains the
     reflow generation in Section 8.
+
+    Training can be skipped on later runs: the *Resume from a checkpoint* block
+    below loads a 1st-gen model saved by Section 11.
     """)
     return
 
@@ -1598,9 +1627,11 @@ def _(
     warmup_ui,
     wd_ui,
 ):
-    gen1_run: Optional[Dict[str, object]] = None
+    session_gen1_run: Optional[Dict[str, object]] = None
     if not train_btn.value:
-        mo.output.replace(mo.md("Click **Train (1-Rectified Flow)** to begin training."))
+        mo.output.replace(
+            mo.md("Click **Train (1-Rectified Flow)** to begin training — or load a saved checkpoint below.")
+        )
     else:
         gen1_train_cfg = TrainConfigV1(
             lr=float(lr_ui.value),
@@ -1615,7 +1646,7 @@ def _(
             seed=int(seed_ui.value),
         )
         set_seed(gen1_train_cfg.seed)
-        gen1_run = fit_flow_model(
+        session_gen1_run = fit_flow_model(
             model=build_model_from_config(model_cfg, device=device),
             train_cfg=gen1_train_cfg,
             train_images_uint8=train_images_uint8,
@@ -1629,19 +1660,250 @@ def _(
                 mo.md(f"**Epoch {epoch}/{total}** — train loss: {tl:.4f} | val loss: {vl:.4f}")
             ),
         )
+        session_gen1_run["train_config"] = asdict(gen1_train_cfg)
         mo.output.replace(
             mo.md(
-                f"**Training complete** in {gen1_run['wall_time']:.1f}s — final train "
-                f"{gen1_run['train_losses'][-1]:.4f} | final val {gen1_run['val_losses'][-1]:.4f}"
-                f" | using EMA weights: {gen1_run['ema_used']}"
+                f"**Training complete** in {session_gen1_run['wall_time']:.1f}s — final train "
+                f"{session_gen1_run['train_losses'][-1]:.4f} | final val {session_gen1_run['val_losses'][-1]:.4f}"
+                f" | using EMA weights: {session_gen1_run['ema_used']}"
             )
         )
-    train_losses: List[float] = gen1_run["train_losses"] if gen1_run else []
-    val_losses: List[float] = gen1_run["val_losses"] if gen1_run else []
-    trained_model: Optional[nn.Module] = gen1_run["model"] if gen1_run else None
-    train_wall_time: float = gen1_run["wall_time"] if gen1_run else 0.0
-    trained_ema_used: bool = bool(gen1_run["ema_used"]) if gen1_run else False
+    return (session_gen1_run,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Resume from a checkpoint — skip 1st-generation training
+
+    Pick a checkpoint saved by Section 11 in the repo-root `models/` directory and
+    click **Load 1st-gen Checkpoint**. The loaded model becomes the active
+    1st-generation model for Sections 7–11 — reflow pair generation and the
+    *from-previous* initialization of the reflow model included — and restores its
+    loss history for the Section 10 plots. A loaded checkpoint takes precedence over
+    a model trained in this session; select *(none)* to switch back.
+
+    Both sidecar formats are accepted: the current one (format tag, config, loss
+    history, provenance) and the older config-only JSON such as
+    `cifar10_dit_rcfm_v1.json`, which carries no loss history.
+    """)
+    return
+
+
+@app.function
+def format_tag() -> str:
+    return "dit_rcfm_cifar10_v1"
+
+
+@app.function
+def file_sha256(path: Path, chunk_bytes: int = 1 << 24) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_bytes), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@app.function
+def model_fingerprint(model: nn.Module) -> str:
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        digest.update(name.encode("utf-8"))
+        digest.update(tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+@app.function
+def read_checkpoint_sidecar(weights_path: Path, tag: str) -> Optional[Dict[str, object]]:
+    sidecar_path = weights_path.with_suffix(".json")
+    if not sidecar_path.exists():
+        return None
+    try:
+        payload = json.loads(sidecar_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("format") == tag:
+        return payload
+    legacy_keys = {"image_size", "in_channels", "patch_size", "hidden_dim", "depth", "num_heads"}
+    if "format" not in payload and legacy_keys.issubset(payload.keys()):
+        return {
+            "format": tag,
+            "generation": "reflow" if "reflow" in weights_path.stem else "gen1",
+            "model_config": payload,
+            "history": None,
+            "train_config": None,
+            "provenance": None,
+            "legacy_sidecar": True,
+        }
+    return None
+
+
+@app.function
+def resume_checkpoint_options(models_dir: Path, tag: str, generation: Optional[str] = None) -> Dict[str, str]:
+    options: Dict[str, str] = {"(none)": ""}
+    if not models_dir.exists():
+        return options
+    for weights_path in sorted(models_dir.glob("*.pt")):
+        sidecar = read_checkpoint_sidecar(weights_path, tag)
+        if sidecar is None or (generation is not None and sidecar.get("generation") != generation):
+            continue
+        legacy = ", legacy sidecar" if sidecar.get("legacy_sidecar") else ""
+        options[f"{weights_path.name} ({sidecar.get('generation', '?')}{legacy})"] = str(weights_path)
+    return options
+
+
+@app.function
+def load_dit_checkpoint(weights_path: Path, device: torch.device, tag: str) -> Dict[str, object]:
+    sidecar = read_checkpoint_sidecar(weights_path, tag)
+    if sidecar is None:
+        raise ValueError(
+            f"No compatible sidecar next to `{weights_path.name}` "
+            f"(expected format `{tag}` or a legacy config-only JSON)."
+        )
+    config, err = make_dit_config(**dict(sidecar["model_config"]))
+    if config is None:
+        raise ValueError(f"Invalid model config in sidecar: {err}")
+    model = build_model_from_config(config, device=device)
+    state = torch.load(str(weights_path), map_location=device, weights_only=True)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    model.requires_grad_(False)
+    return {
+        "model": model,
+        "sidecar": sidecar,
+        "path": weights_path,
+        "sha256": file_sha256(weights_path),
+        "fingerprint": model_fingerprint(model),
+    }
+
+
+@app.function
+def resolve_generation(
+    session_run: Optional[Dict[str, object]],
+    loaded_ckpt: Optional[Dict[str, object]],
+    label: str,
+) -> Dict[str, object]:
+    if loaded_ckpt is not None:
+        sidecar = loaded_ckpt["sidecar"]
+        history = sidecar.get("history") or {}
+        name = Path(loaded_ckpt["path"]).name
+        note = (
+            " A model trained in this session also exists; select *(none)* to use it instead."
+            if session_run is not None
+            else ""
+        )
+        return {
+            "model": loaded_ckpt["model"],
+            "train_losses": [float(v) for v in history.get("train_losses", [])],
+            "val_losses": [float(v) for v in history.get("val_losses", [])],
+            "wall_time": float(history.get("wall_time", 0.0)),
+            "ema_used": bool(history.get("ema_used", False)),
+            "train_config": sidecar.get("train_config"),
+            "provenance": sidecar.get("provenance"),
+            "source": {
+                "kind": "checkpoint",
+                "file": name,
+                "sha256": loaded_ckpt["sha256"],
+                "fingerprint": loaded_ckpt["fingerprint"],
+            },
+            "summary": f"**Active {label} model:** checkpoint `{name}` "
+            f"(fingerprint `{loaded_ckpt['fingerprint']}`).{note}",
+        }
+    if session_run is not None:
+        fingerprint = model_fingerprint(session_run["model"])
+        return {
+            "model": session_run["model"],
+            "train_losses": list(session_run["train_losses"]),
+            "val_losses": list(session_run["val_losses"]),
+            "wall_time": float(session_run["wall_time"]),
+            "ema_used": bool(session_run["ema_used"]),
+            "train_config": session_run.get("train_config"),
+            "provenance": session_run.get("provenance"),
+            "source": {"kind": "session", "file": None, "sha256": None, "fingerprint": fingerprint},
+            "summary": f"**Active {label} model:** trained in this session (fingerprint `{fingerprint}`) "
+            "— save it in Section 11 to resume from it later.",
+        }
+    return {
+        "model": None,
+        "train_losses": [],
+        "val_losses": [],
+        "wall_time": 0.0,
+        "ema_used": False,
+        "train_config": None,
+        "provenance": None,
+        "source": None,
+        "summary": f"_No {label} model yet — train one or load a checkpoint._",
+    }
+
+
+@app.cell
+def _():
+    models_dir = Path(__file__).resolve().parent.parent / "models"
+    return (models_dir,)
+
+
+@app.cell
+def _(mo):
+    gen1_ckpt_refresh_btn = mo.ui.run_button(label="Refresh Checkpoint List")
+    gen1_ckpt_refresh_btn
+    return (gen1_ckpt_refresh_btn,)
+
+
+@app.cell
+def _(gen1_ckpt_refresh_btn, mo, models_dir):
+    gen1_ckpt_refresh_btn.value
+    gen1_ckpt_ui = mo.ui.dropdown(
+        options=resume_checkpoint_options(models_dir, format_tag()),
+        value="(none)",
+        label="1st-gen Checkpoint",
+    )
+    gen1_load_btn = mo.ui.run_button(label="Load 1st-gen Checkpoint")
+    mo.hstack([gen1_ckpt_ui, gen1_load_btn], justify="start")
+    return gen1_ckpt_ui, gen1_load_btn
+
+
+@app.cell
+def _(device, gen1_ckpt_ui, gen1_load_btn, mo):
+    loaded_gen1_ckpt: Optional[Dict[str, object]] = None
+    if not gen1_ckpt_ui.value:
+        _out = mo.md("_No checkpoint selected — Sections 7–11 use the model trained in this session._")
+    elif not gen1_load_btn.value:
+        _out = mo.md("Click **Load 1st-gen Checkpoint** to load the selected file.")
+    else:
+        try:
+            loaded_gen1_ckpt = load_dit_checkpoint(Path(str(gen1_ckpt_ui.value)), device, format_tag())
+            _out = mo.md(
+                f"**Loaded** `{loaded_gen1_ckpt['path'].name}` — generation "
+                f"`{loaded_gen1_ckpt['sidecar'].get('generation', '?')}`, "
+                f"{count_parameters(loaded_gen1_ckpt['model']):,} parameters, "
+                f"sha256 `{loaded_gen1_ckpt['sha256'][:12]}…`"
+            )
+        except (ValueError, RuntimeError, OSError) as _err:
+            _out = mo.md(f"**Load failed** — {_err}")
+    _out
+    return (loaded_gen1_ckpt,)
+
+
+@app.cell
+def _(
+    loaded_gen1_ckpt: Optional[Dict[str, object]],
+    mo,
+    session_gen1_run: Optional[Dict[str, object]],
+):
+    gen1_resolved = resolve_generation(session_gen1_run, loaded_gen1_ckpt, "1st-gen")
+    trained_model: Optional[nn.Module] = gen1_resolved["model"]
+    train_losses: List[float] = gen1_resolved["train_losses"]
+    val_losses: List[float] = gen1_resolved["val_losses"]
+    train_wall_time: float = gen1_resolved["wall_time"]
+    trained_ema_used: bool = gen1_resolved["ema_used"]
+    gen1_train_cfg_used: Optional[Dict[str, object]] = gen1_resolved["train_config"]
+    gen1_source: Optional[Dict[str, object]] = gen1_resolved["source"]
+    mo.md(gen1_resolved["summary"])
     return (
+        gen1_source,
+        gen1_train_cfg_used,
         train_losses,
         train_wall_time,
         trained_ema_used,
@@ -2035,6 +2297,14 @@ def _(mo):
     paper); *from-scratch* re-initializes it with the previous generation's
     config. `init_next_generation_model` and `build_reflow_pairs` accept any
     generation, so the procedure can be repeated for $k$-rectified flows.
+
+    **Checkpoints.** Pair generation inverts all 50,000 images, so the recovered
+    $x_0$ tensors can be saved to `~/data/cifar10_reflow/` (with a JSON sidecar that
+    records the inversion settings, $x_0$ statistics and the fingerprint of the
+    1st-gen model that produced them) and reloaded on a later run instead of being
+    regenerated. A loaded pair file is checked against this notebook's
+    deterministic train/val split before use. The reflow model itself can likewise
+    be loaded from a Section 11 checkpoint at the end of this section.
     """)
     return
 
@@ -2084,6 +2354,7 @@ def dtype_from_string(name: str) -> torch.dtype:
 @app.cell
 def _(
     device,
+    gen1_source: Optional[Dict[str, object]],
     mo,
     reflow_batch_ui,
     reflow_dtype_ui,
@@ -2097,11 +2368,14 @@ def _(
     val_images_uint8,
     val_labels,
 ):
-    reflow_train_x0: Optional[torch.Tensor] = None
-    reflow_val_x0: Optional[torch.Tensor] = None
-    reflow_gen_time = 0.0
+    generated_reflow_pairs: Optional[Dict[str, object]] = None
     if trained_model is None:
-        mo.output.replace(mo.md("_Train the 1st-generation model first (Section 5) before generating reflow pairs._"))
+        mo.output.replace(
+            mo.md(
+                "_Train or load the 1st-generation model first (Section 5) before generating "
+                "reflow pairs — or load saved pairs below._"
+            )
+        )
     elif not reflow_pairs_btn.value:
         mo.output.replace(mo.md("Click **Generate Reflow Pairs** to build $(x_0, x_1, y)$ couples for train + val splits."))
     else:
@@ -2117,7 +2391,7 @@ def _(
             mo.output.replace(mo.md(f"Val pairs: {done}/{total}"))
 
         _t0 = time.perf_counter()
-        reflow_train_x0 = build_reflow_pairs(
+        _train_x0 = build_reflow_pairs(
             model=trained_model,
             images_uint8=train_images_uint8,
             labels=train_labels,
@@ -2130,7 +2404,7 @@ def _(
             progress_cb=_progress_tr,
             data_end_power=float(reflow_grid_power_ui.value),
         )
-        reflow_val_x0 = build_reflow_pairs(
+        _val_x0 = build_reflow_pairs(
             model=trained_model,
             images_uint8=val_images_uint8,
             labels=val_labels,
@@ -2143,40 +2417,297 @@ def _(
             progress_cb=_progress_va,
             data_end_power=float(reflow_grid_power_ui.value),
         )
-        reflow_gen_time = time.perf_counter() - _t0
-        assert reflow_train_x0.shape[0] == train_images_uint8.shape[0], (
-            f"Reflow train pairs {reflow_train_x0.shape[0]} != train split {train_images_uint8.shape[0]}"
+        _gen_time = time.perf_counter() - _t0
+        assert _train_x0.shape[0] == train_images_uint8.shape[0], (
+            f"Reflow train pairs {_train_x0.shape[0]} != train split {train_images_uint8.shape[0]}"
         )
-        assert reflow_val_x0.shape[0] == val_images_uint8.shape[0], (
-            f"Reflow val pairs {reflow_val_x0.shape[0]} != val split {val_images_uint8.shape[0]}"
+        assert _val_x0.shape[0] == val_images_uint8.shape[0], (
+            f"Reflow val pairs {_val_x0.shape[0]} != val split {val_images_uint8.shape[0]}"
         )
+        generated_reflow_pairs = {
+            "train_x0": _train_x0,
+            "val_x0": _val_x0,
+            "meta": {
+                "num_steps": _steps,
+                "grid_power": float(reflow_grid_power_ui.value),
+                "guidance_scale": _guide,
+                "storage_dtype": str(reflow_dtype_ui.value),
+                "generation_seconds": _gen_time,
+                "gen1_source": gen1_source,
+            },
+        }
         mo.output.replace(
             mo.md(
-                f"**Reflow pairs generated** in {reflow_gen_time:.1f}s\n\n"
+                f"**Reflow pairs generated** in {_gen_time:.1f}s — save them below to skip this step next time.\n\n"
                 f"| Split | x0 count | x1 count | Match? |\n|---|---|---|---|\n"
-                f"| train | {reflow_train_x0.shape[0]:,} | {train_images_uint8.shape[0]:,} | "
-                f"{reflow_train_x0.shape[0] == train_images_uint8.shape[0]} |\n"
-                f"| val | {reflow_val_x0.shape[0]:,} | {val_images_uint8.shape[0]:,} | "
-                f"{reflow_val_x0.shape[0] == val_images_uint8.shape[0]} |"
+                f"| train | {_train_x0.shape[0]:,} | {train_images_uint8.shape[0]:,} | "
+                f"{_train_x0.shape[0] == train_images_uint8.shape[0]} |\n"
+                f"| val | {_val_x0.shape[0]:,} | {val_images_uint8.shape[0]:,} | "
+                f"{_val_x0.shape[0] == val_images_uint8.shape[0]} |"
             )
         )
-    return reflow_train_x0, reflow_val_x0
+    return (generated_reflow_pairs,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Save / load reflow pairs
+
+    **Save** writes the generated $x_0$ tensors (train + val, in the storage dtype
+    chosen above) together with the split indices to
+    `~/data/cifar10_reflow/<name>.pt`, and the provenance to `<name>.json`. The
+    $x_1$ images and labels are not duplicated: they are recovered from this
+    notebook's deterministic split, and the stored indices guarantee the coupling
+    is re-joined exactly. **Load** restores a saved file; it then takes precedence
+    over pairs generated in this session (select *(none)* to switch back).
+    """)
+    return
+
+
+@app.cell
+def _():
+    reflow_data_dir = Path.home() / "data" / "cifar10_reflow"
+    return (reflow_data_dir,)
+
+
+@app.function
+def x0_summary_stats(x0: torch.Tensor, max_items: int = 4096) -> Dict[str, float]:
+    sample = x0[:max_items].to(torch.float32)
+    return {"mean": float(sample.mean().item()), "std": float(sample.std().item())}
+
+
+@app.function
+def save_reflow_pairs(
+    train_x0: torch.Tensor,
+    val_x0: torch.Tensor,
+    train_indices: torch.Tensor,
+    val_indices: torch.Tensor,
+    meta: Dict[str, object],
+    data_dir: Path,
+    filename: str,
+    overwrite: bool = False,
+) -> Tuple[Path, Path]:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    name = filename if filename.endswith(".pt") else f"{filename}.pt"
+    tensors_path = data_dir / name
+    sidecar_path = tensors_path.with_suffix(".json")
+    if tensors_path.exists() and not overwrite:
+        raise FileExistsError(f"`{tensors_path}` already exists — tick *Overwrite* or choose another name.")
+    torch.save(
+        {
+            "train_x0": train_x0.contiguous(),
+            "val_x0": val_x0.contiguous(),
+            "train_indices": train_indices.to(torch.int64).contiguous(),
+            "val_indices": val_indices.to(torch.int64).contiguous(),
+        },
+        tensors_path,
+    )
+    payload = {
+        "format": "dit_rcfm_cifar10_reflow_pairs_v1",
+        "num_train": int(train_x0.shape[0]),
+        "num_val": int(val_x0.shape[0]),
+        "x0_shape": list(train_x0.shape[1:]),
+        "x0_train_stats": x0_summary_stats(train_x0),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **meta,
+    }
+    with open(sidecar_path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+    return tensors_path, sidecar_path
+
+
+@app.function
+def reflow_pair_file_options(data_dir: Path) -> Dict[str, str]:
+    options: Dict[str, str] = {"(none)": ""}
+    if not data_dir.exists():
+        return options
+    for tensors_path in sorted(data_dir.glob("*.pt")):
+        sidecar_path = tensors_path.with_suffix(".json")
+        if not sidecar_path.exists():
+            continue
+        try:
+            meta = json.loads(sidecar_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if meta.get("format") != "dit_rcfm_cifar10_reflow_pairs_v1":
+            continue
+        options[
+            f"{tensors_path.name} ({meta.get('num_steps', '?')} steps, ρ={meta.get('grid_power', '?')})"
+        ] = str(tensors_path)
+    return options
+
+
+@app.function
+def load_reflow_pairs(
+    tensors_path: Path,
+    train_indices: torch.Tensor,
+    val_indices: torch.Tensor,
+) -> Dict[str, object]:
+    meta = json.loads(tensors_path.with_suffix(".json").read_text())
+    blob = torch.load(str(tensors_path), map_location="cpu", weights_only=True)
+    if not torch.equal(blob["train_indices"], train_indices.to(torch.int64)) or not torch.equal(
+        blob["val_indices"], val_indices.to(torch.int64)
+    ):
+        raise ValueError(
+            "The saved pairs were built on a different train/val split than this notebook's, "
+            "so their x0 would be coupled to the wrong images."
+        )
+    return {"train_x0": blob["train_x0"], "val_x0": blob["val_x0"], "meta": meta, "path": tensors_path}
+
+
+@app.cell
+def _(mo):
+    pairs_save_name_ui = mo.ui.text(
+        value="cifar10_reflow_pairs_v1.pt",
+        label="Filename (saved into ~/data/cifar10_reflow/)",
+        full_width=True,
+    )
+    pairs_overwrite_ui = mo.ui.checkbox(value=False, label="Overwrite if the file exists")
+    pairs_save_btn = mo.ui.run_button(label="Save Reflow Pairs")
+    mo.vstack([pairs_save_name_ui, mo.hstack([pairs_overwrite_ui, pairs_save_btn], justify="start")])
+    return pairs_overwrite_ui, pairs_save_btn, pairs_save_name_ui
+
+
+@app.cell
+def _(
+    generated_reflow_pairs: Optional[Dict[str, object]],
+    mo,
+    pairs_overwrite_ui,
+    pairs_save_btn,
+    pairs_save_name_ui,
+    reflow_data_dir,
+    train_indices,
+    val_indices,
+):
+    if generated_reflow_pairs is None:
+        _out = mo.md("_Generate reflow pairs above to enable saving._")
+    elif not pairs_save_btn.value:
+        _out = mo.md("Choose a filename and click **Save Reflow Pairs**.")
+    else:
+        try:
+            _tensors_path, _sidecar_path = save_reflow_pairs(
+                train_x0=generated_reflow_pairs["train_x0"],
+                val_x0=generated_reflow_pairs["val_x0"],
+                train_indices=train_indices,
+                val_indices=val_indices,
+                meta=generated_reflow_pairs["meta"],
+                data_dir=reflow_data_dir,
+                filename=str(pairs_save_name_ui.value).strip() or "cifar10_reflow_pairs_v1.pt",
+                overwrite=bool(pairs_overwrite_ui.value),
+            )
+            _out = mo.md(f"**Saved.**\n\n- tensors: `{_tensors_path}`\n- sidecar: `{_sidecar_path}`")
+        except (FileExistsError, OSError) as _err:
+            _out = mo.md(f"**Not saved** — {_err}")
+    _out
+    return
+
+
+@app.cell
+def _(mo):
+    pairs_refresh_btn = mo.ui.run_button(label="Refresh Pair List")
+    pairs_refresh_btn
+    return (pairs_refresh_btn,)
+
+
+@app.cell
+def _(mo, pairs_refresh_btn, reflow_data_dir):
+    pairs_refresh_btn.value
+    pairs_file_ui = mo.ui.dropdown(
+        options=reflow_pair_file_options(reflow_data_dir),
+        value="(none)",
+        label="Saved Reflow Pairs",
+    )
+    pairs_load_btn = mo.ui.run_button(label="Load Reflow Pairs")
+    mo.hstack([pairs_file_ui, pairs_load_btn], justify="start")
+    return pairs_file_ui, pairs_load_btn
+
+
+@app.cell
+def _(mo, pairs_file_ui, pairs_load_btn, train_indices, val_indices):
+    loaded_reflow_pairs: Optional[Dict[str, object]] = None
+    if not pairs_file_ui.value:
+        _out = mo.md("_No saved pairs selected — the reflow model trains on pairs generated in this session._")
+    elif not pairs_load_btn.value:
+        _out = mo.md("Click **Load Reflow Pairs** to load the selected file.")
+    else:
+        try:
+            loaded_reflow_pairs = load_reflow_pairs(Path(str(pairs_file_ui.value)), train_indices, val_indices)
+            _meta = loaded_reflow_pairs["meta"]
+            _out = mo.md(
+                f"**Loaded** `{loaded_reflow_pairs['path'].name}` — {_meta['num_train']:,} train + "
+                f"{_meta['num_val']:,} val pairs, {_meta['num_steps']} Euler steps, ρ = {_meta['grid_power']}, "
+                f"guidance {_meta['guidance_scale']}, saved {_meta['timestamp']}"
+            )
+        except (ValueError, KeyError, RuntimeError, OSError, json.JSONDecodeError) as _err:
+            _out = mo.md(f"**Load failed** — {_err}")
+    _out
+    return (loaded_reflow_pairs,)
+
+
+@app.function
+def resolve_reflow_pairs(
+    generated: Optional[Dict[str, object]],
+    loaded: Optional[Dict[str, object]],
+    gen1_source: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    chosen = loaded if loaded is not None else generated
+    if chosen is None:
+        return {
+            "train_x0": None,
+            "val_x0": None,
+            "meta": None,
+            "summary": "_No reflow pairs yet — generate them or load a saved file._",
+        }
+    meta = dict(chosen["meta"])
+    meta["source_file"] = str(Path(chosen["path"]).name) if loaded is not None else None
+    origin = f"file `{Path(chosen['path']).name}`" if loaded is not None else "generated in this session"
+    producer = (meta.get("gen1_source") or {}).get("fingerprint")
+    active = (gen1_source or {}).get("fingerprint")
+    warning = ""
+    if producer and active and producer != active:
+        warning = (
+            f"\n\n**Note:** these pairs were produced by the 1st-gen model with fingerprint `{producer}`, "
+            f"but the active 1st-gen model is `{active}`. Reflow training still works, but the "
+            "*from-previous* initialization and the round-trip check then use a different model "
+            "than the one that built the pairs."
+        )
+    return {
+        "train_x0": chosen["train_x0"],
+        "val_x0": chosen["val_x0"],
+        "meta": meta,
+        "summary": f"**Active reflow pairs:** {origin} — {int(chosen['train_x0'].shape[0]):,} train + "
+        f"{int(chosen['val_x0'].shape[0]):,} val.{warning}",
+    }
+
+
+@app.cell
+def _(
+    gen1_source: Optional[Dict[str, object]],
+    generated_reflow_pairs: Optional[Dict[str, object]],
+    loaded_reflow_pairs: Optional[Dict[str, object]],
+    mo,
+):
+    reflow_pairs_resolved = resolve_reflow_pairs(generated_reflow_pairs, loaded_reflow_pairs, gen1_source)
+    reflow_train_x0: Optional[torch.Tensor] = reflow_pairs_resolved["train_x0"]
+    reflow_val_x0: Optional[torch.Tensor] = reflow_pairs_resolved["val_x0"]
+    reflow_pairs_meta: Optional[Dict[str, object]] = reflow_pairs_resolved["meta"]
+    mo.md(reflow_pairs_resolved["summary"])
+    return reflow_pairs_meta, reflow_train_x0, reflow_val_x0
 
 
 @app.cell
 def _(
     device,
     mo,
-    reflow_grid_power_ui,
-    reflow_guidance_ui,
-    reflow_steps_ui,
+    reflow_pairs_meta: Optional[Dict[str, object]],
     reflow_train_x0: Optional[torch.Tensor],
     train_images_uint8,
     train_labels,
     trained_model: Optional[nn.Module],
 ):
-    if trained_model is None or reflow_train_x0 is None:
-        _out = mo.md("_Generate reflow pairs first (button above) to see the round-trip sanity check._")
+    if trained_model is None or reflow_train_x0 is None or reflow_pairs_meta is None:
+        _out = mo.md("_Generate or load reflow pairs (and have a 1st-gen model) to see the round-trip sanity check._")
     else:
         _stats = roundtrip_reconstruction(
             model=trained_model,
@@ -2184,9 +2715,9 @@ def _(
             labels=train_labels[:16],
             device=device,
             null_index=trained_model.null_index,
-            num_steps=int(reflow_steps_ui.value),
-            guidance_scale=float(reflow_guidance_ui.value),
-            data_end_power=float(reflow_grid_power_ui.value),
+            num_steps=int(reflow_pairs_meta["num_steps"]),
+            guidance_scale=float(reflow_pairs_meta["guidance_scale"]),
+            data_end_power=float(reflow_pairs_meta["grid_power"]),
         )
         _x0_sub = reflow_train_x0[:2048].to(torch.float32)
         _out = mo.md(
@@ -2304,6 +2835,7 @@ def init_next_generation_model(previous_model: nn.Module, mode: str, device: tor
 def _(
     amp_dtype,
     device,
+    gen1_source: Optional[Dict[str, object]],
     mo,
     reflow_bs_ui,
     reflow_ema_ui,
@@ -2311,6 +2843,7 @@ def _(
     reflow_grad_clip_ui,
     reflow_init_ui,
     reflow_lr_ui,
+    reflow_pairs_meta: Optional[Dict[str, object]],
     reflow_t_scheme_ui,
     reflow_train_btn,
     reflow_train_x0: Optional[torch.Tensor],
@@ -2325,9 +2858,14 @@ def _(
     val_images_uint8,
     val_labels,
 ):
-    reflow_run: Optional[Dict[str, object]] = None
+    session_reflow_run: Optional[Dict[str, object]] = None
     if trained_model is None or reflow_train_x0 is None or reflow_val_x0 is None:
-        mo.output.replace(mo.md("_Generate reflow pairs first (Section 8 button) before training the reflow model._"))
+        mo.output.replace(
+            mo.md(
+                "_A 1st-gen model (Section 5) and reflow pairs (generated or loaded above) are both "
+                "required before training the reflow model._"
+            )
+        )
     elif not reflow_train_btn.value:
         mo.output.replace(mo.md("Click **Train Reflow Model** to fit a 2-rectified flow on the reflow pairs."))
     else:
@@ -2344,7 +2882,7 @@ def _(
             seed=int(seed_ui.value) + 7,
         )
         set_seed(reflow_train_cfg.seed)
-        reflow_run = fit_flow_model(
+        session_reflow_run = fit_flow_model(
             model=init_next_generation_model(trained_model, str(reflow_init_ui.value), device),
             train_cfg=reflow_train_cfg,
             train_images_uint8=train_images_uint8,
@@ -2360,19 +2898,97 @@ def _(
                 mo.md(f"**Reflow epoch {epoch}/{total}** — train {tl:.4f} | val {vl:.4f}")
             ),
         )
+        session_reflow_run["train_config"] = asdict(reflow_train_cfg)
+        session_reflow_run["provenance"] = {
+            "init": str(reflow_init_ui.value),
+            "gen1_source": gen1_source,
+            "reflow_pairs": reflow_pairs_meta,
+        }
         mo.output.replace(
             mo.md(
-                f"**Reflow training complete** in {reflow_run['wall_time']:.1f}s — "
-                f"final train {reflow_run['train_losses'][-1]:.4f} | final val {reflow_run['val_losses'][-1]:.4f}"
-                f" | using EMA weights: {reflow_run['ema_used']}"
+                f"**Reflow training complete** in {session_reflow_run['wall_time']:.1f}s — "
+                f"final train {session_reflow_run['train_losses'][-1]:.4f} | "
+                f"final val {session_reflow_run['val_losses'][-1]:.4f}"
+                f" | using EMA weights: {session_reflow_run['ema_used']}"
             )
         )
-    reflow_train_losses: List[float] = reflow_run["train_losses"] if reflow_run else []
-    reflow_val_losses: List[float] = reflow_run["val_losses"] if reflow_run else []
-    reflow_model: Optional[nn.Module] = reflow_run["model"] if reflow_run else None
-    reflow_wall_time: float = reflow_run["wall_time"] if reflow_run else 0.0
+    return (session_reflow_run,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ### Resume from a checkpoint — skip reflow training
+
+    Load a reflow model saved by Section 11 to run Sections 9–11 without retraining
+    it (load the 1st-gen checkpoint in Section 5 as well to compare both
+    generations). As in Section 5, a loaded checkpoint takes precedence over a
+    reflow model trained in this session; select *(none)* to switch back.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    reflow_ckpt_refresh_btn = mo.ui.run_button(label="Refresh Checkpoint List")
+    reflow_ckpt_refresh_btn
+    return (reflow_ckpt_refresh_btn,)
+
+
+@app.cell
+def _(mo, models_dir, reflow_ckpt_refresh_btn):
+    reflow_ckpt_refresh_btn.value
+    reflow_ckpt_ui = mo.ui.dropdown(
+        options=resume_checkpoint_options(models_dir, format_tag(), generation="reflow"),
+        value="(none)",
+        label="Reflow Checkpoint",
+    )
+    reflow_ckpt_load_btn = mo.ui.run_button(label="Load Reflow Checkpoint")
+    mo.hstack([reflow_ckpt_ui, reflow_ckpt_load_btn], justify="start")
+    return reflow_ckpt_load_btn, reflow_ckpt_ui
+
+
+@app.cell
+def _(device, mo, reflow_ckpt_load_btn, reflow_ckpt_ui):
+    loaded_reflow_ckpt: Optional[Dict[str, object]] = None
+    if not reflow_ckpt_ui.value:
+        _out = mo.md("_No checkpoint selected — Sections 9–11 use the reflow model trained in this session._")
+    elif not reflow_ckpt_load_btn.value:
+        _out = mo.md("Click **Load Reflow Checkpoint** to load the selected file.")
+    else:
+        try:
+            loaded_reflow_ckpt = load_dit_checkpoint(Path(str(reflow_ckpt_ui.value)), device, format_tag())
+            _out = mo.md(
+                f"**Loaded** `{loaded_reflow_ckpt['path'].name}` — "
+                f"{count_parameters(loaded_reflow_ckpt['model']):,} parameters, "
+                f"sha256 `{loaded_reflow_ckpt['sha256'][:12]}…`"
+            )
+        except (ValueError, RuntimeError, OSError) as _err:
+            _out = mo.md(f"**Load failed** — {_err}")
+    _out
+    return (loaded_reflow_ckpt,)
+
+
+@app.cell
+def _(
+    loaded_reflow_ckpt: Optional[Dict[str, object]],
+    mo,
+    session_reflow_run: Optional[Dict[str, object]],
+):
+    reflow_resolved = resolve_generation(session_reflow_run, loaded_reflow_ckpt, "reflow")
+    reflow_model: Optional[nn.Module] = reflow_resolved["model"]
+    reflow_train_losses: List[float] = reflow_resolved["train_losses"]
+    reflow_val_losses: List[float] = reflow_resolved["val_losses"]
+    reflow_wall_time: float = reflow_resolved["wall_time"]
+    reflow_ema_used: bool = reflow_resolved["ema_used"]
+    reflow_train_cfg_used: Optional[Dict[str, object]] = reflow_resolved["train_config"]
+    reflow_provenance: Optional[Dict[str, object]] = reflow_resolved["provenance"]
+    mo.md(reflow_resolved["summary"])
     return (
+        reflow_ema_used,
         reflow_model,
+        reflow_provenance,
+        reflow_train_cfg_used,
         reflow_train_losses,
         reflow_val_losses,
         reflow_wall_time,
@@ -2958,8 +3574,11 @@ def _(mo):
 
     The chosen generation's state dict is written to the repo-root `models/`
     directory (created if missing), together with a `.json` sidecar carrying
-    the exact `DiTConfigV1` used, so `build_model_from_config` can reconstruct
-    the model later.
+    the exact `DiTConfigV1` used (so `build_model_from_config` can reconstruct
+    the model), the loss history, the training config and the provenance (for a
+    reflow model: its initialization, the 1st-gen model and the reflow pairs it
+    was trained on). Sections 5 and 8 load these checkpoints to resume later.
+    Existing files are only replaced when *Overwrite* is ticked.
     """)
     return
 
@@ -2997,51 +3616,104 @@ def _(mo, save_which_ui):
         label="Filename (saved into models/)",
         full_width=True,
     )
+    save_overwrite_ui = mo.ui.checkbox(value=False, label="Overwrite if the file exists")
     save_btn = mo.ui.run_button(label="Save Model")
-    mo.vstack([save_filename_ui, save_btn])
-    return save_btn, save_filename_ui
+    mo.vstack([save_filename_ui, mo.hstack([save_overwrite_ui, save_btn], justify="start")])
+    return save_btn, save_filename_ui, save_overwrite_ui
 
 
 @app.function
-def save_model_and_config(model: nn.Module, models_dir: Path, filename: str) -> Tuple[Path, Path]:
+def save_model_and_config(
+    model: nn.Module,
+    models_dir: Path,
+    filename: str,
+    generation: str = "gen1",
+    history: Optional[Dict[str, object]] = None,
+    train_config: Optional[Dict[str, object]] = None,
+    provenance: Optional[Dict[str, object]] = None,
+    overwrite: bool = False,
+) -> Tuple[Path, Path]:
     models_dir.mkdir(parents=True, exist_ok=True)
-    weights_path = models_dir / filename
+    weights_path = models_dir / (filename if filename.endswith(".pt") else f"{filename}.pt")
     config_path = weights_path.with_suffix(".json")
+    if weights_path.exists() and not overwrite:
+        raise FileExistsError(f"`{weights_path}` already exists — tick *Overwrite* or choose another name.")
     torch.save(model.state_dict(), weights_path)
+    payload = {
+        "format": format_tag(),
+        "generation": generation,
+        "model_config": asdict(model.config),
+        "history": history,
+        "train_config": train_config,
+        "provenance": provenance,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
     with open(config_path, "w") as f:
-        json.dump(asdict(model.config), f, indent=2, sort_keys=True)
+        json.dump(payload, f, indent=2, sort_keys=True)
     return weights_path, config_path
 
 
 @app.cell
 def _(
+    gen1_source: Optional[Dict[str, object]],
+    gen1_train_cfg_used: Optional[Dict[str, object]],
     mo,
+    models_dir,
+    reflow_ema_used: bool,
     reflow_model: Optional[nn.Module],
+    reflow_provenance: Optional[Dict[str, object]],
+    reflow_train_cfg_used: Optional[Dict[str, object]],
+    reflow_train_losses: List[float],
+    reflow_val_losses: List[float],
+    reflow_wall_time: float,
     save_btn,
     save_filename_ui,
+    save_overwrite_ui,
     save_which_ui,
+    train_losses: List[float],
+    train_wall_time: float,
+    trained_ema_used: bool,
     trained_model: Optional[nn.Module],
+    val_losses: List[float],
 ):
     if str(save_which_ui.value) == "none":
         _out = mo.md("_Train the 1st-generation model (Section 5) and/or the reflow model (Section 8) first._")
     elif not save_btn.value:
         _out = mo.md("Choose which model to save and click **Save Model**.")
     else:
-        _target = trained_model if str(save_which_ui.value) == "gen1" else reflow_model
+        _is_gen1 = str(save_which_ui.value) == "gen1"
+        _target = trained_model if _is_gen1 else reflow_model
         if _target is None:
             _out = mo.md("_The chosen model is not trained yet._")
         else:
             _fname = str(save_filename_ui.value).strip() or default_checkpoint_name(str(save_which_ui.value))
-            _models_dir = Path(__file__).resolve().parent.parent / "models"
-            _weights_path, _config_path = save_model_and_config(_target, _models_dir, _fname)
-            _out = mo.md(
-                f"""
+            _history = {
+                "train_losses": train_losses if _is_gen1 else reflow_train_losses,
+                "val_losses": val_losses if _is_gen1 else reflow_val_losses,
+                "wall_time": train_wall_time if _is_gen1 else reflow_wall_time,
+                "ema_used": trained_ema_used if _is_gen1 else reflow_ema_used,
+            }
+            try:
+                _weights_path, _config_path = save_model_and_config(
+                    _target,
+                    models_dir,
+                    _fname,
+                    generation=str(save_which_ui.value),
+                    history=_history,
+                    train_config=gen1_train_cfg_used if _is_gen1 else reflow_train_cfg_used,
+                    provenance={"gen1_source": gen1_source} if _is_gen1 else reflow_provenance,
+                    overwrite=bool(save_overwrite_ui.value),
+                )
+                _out = mo.md(
+                    f"""
     **Saved.**
 
     - weights: `{_weights_path}`
-    - config: `{_config_path}`
-                """
-            )
+    - sidecar: `{_config_path}`
+                    """
+                )
+            except (FileExistsError, OSError) as _err:
+                _out = mo.md(f"**Not saved** — {_err}")
     _out
     return
 
