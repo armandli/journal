@@ -182,11 +182,3 @@ pkill -f "marimo run" 2>/dev/null || true
 ### Step 3 — Report
 
 Report the list of stopped sessions (PID + path), or "No sessions were running." if none.
-
----
-
-## Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "marimo-session"
-```

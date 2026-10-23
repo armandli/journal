@@ -131,9 +131,3 @@ Fix any remaining errors manually and re-run until clean. Report the file path, 
 ```
 
 Wait for the agent to complete and relay its report to the user.
-
-## Step 3 — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "create-research-book"
-```

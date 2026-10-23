@@ -119,11 +119,3 @@ surface as silently wrong accuracy rather than exceptions.
 ## External Docs
 
 - Full docs: https://docs.pytorch.org/vision/main/index.html
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "torchvision-guide-python"
-```

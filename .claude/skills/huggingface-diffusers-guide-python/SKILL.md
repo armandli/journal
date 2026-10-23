@@ -148,11 +148,3 @@ at a full-size model.
 ## External Docs
 
 - Full docs: https://huggingface.co/docs/diffusers/index
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "huggingface-diffusers-guide-python"
-```

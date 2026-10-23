@@ -129,11 +129,3 @@ handing the tokenizer to a training loop.
 ## External Docs
 
 - Full docs: https://huggingface.co/docs/tokenizers/index
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "huggingface-tokenizers-guide-python"
-```

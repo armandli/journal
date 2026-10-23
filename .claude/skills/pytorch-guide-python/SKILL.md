@@ -197,11 +197,3 @@ grads = torch.autograd.grad(outputs=y, inputs=x)
 ## External Docs
 
 - API reference: https://docs.pytorch.org/docs/2.12/pytorch-api.html
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "pytorch-guide-python"
-```

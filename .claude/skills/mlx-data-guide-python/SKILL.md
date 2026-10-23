@@ -153,11 +153,3 @@ first access, not at pipeline-construction time.
 ## External Docs
 
 - Full docs: https://ml-explore.github.io/mlx-data/build/html/index.html
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "mlx-data-guide-python"
-```

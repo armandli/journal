@@ -151,11 +151,3 @@ a large model.
 ## External Docs
 
 - Full docs: https://huggingface.co/docs/transformers/index
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "huggingface-transformers-guide-python"
-```

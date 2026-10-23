@@ -129,11 +129,3 @@ by reading the code.
 ## External Docs
 
 - Full docs: https://huggingface.co/docs/datasets/index
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "huggingface-datasets-guide-python"
-```

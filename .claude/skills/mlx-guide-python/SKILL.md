@@ -215,11 +215,3 @@ sub_keys = mx.random.split(key, num=4)
 
 - API reference: https://ml-explore.github.io/mlx/build/html/index.html
 - Examples repo: https://github.com/ml-explore/mlx-examples
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "mlx-guide-python"
-```

@@ -96,11 +96,3 @@ such models (skip `GradScaler`, or construct it with `enabled=False`).
 
 - API reference: https://docs.pytorch.org/docs/2.13/amp.html
 - Worked examples: https://docs.pytorch.org/docs/2.13/notes/amp_examples.html
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "pytorch-amp-guide-python"
-```

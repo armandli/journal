@@ -121,11 +121,3 @@ silent failure (resample explicitly with `torchaudio.functional.resample` or
 
 - Full docs: https://docs.pytorch.org/audio/stable/index.html
 - Maintenance-phase / TorchCodec migration notice: https://github.com/pytorch/audio/issues/3902
-
----
-
-### Final Step — Record Usage
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "torchaudio-guide-python"
-```

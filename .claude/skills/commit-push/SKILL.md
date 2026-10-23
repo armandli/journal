@@ -21,16 +21,6 @@ If there are no changes (no untracked files, no modifications, no staged changes
 
 ---
 
-## Step 1.5 — Record Usage
-
-Record this skill's usage now (before staging) so the stats file is included in the commit:
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "commit-push"
-```
-
----
-
 ## Step 2 — Stage All Changes
 
 Run `git add -A` to stage everything.

@@ -314,13 +314,3 @@ def _(counter, mo):
 - **Validate in Python**, not JS — raise `traitlets.TraitError` on bad input in `__init__` or `observe` handlers.
 
 See [references/JS-PATTERNS.md](references/JS-PATTERNS.md) for DOM manipulation patterns, animation cleanup, canvas, SVG, and multi-view considerations.
-
----
-
-## Final Step — Record Usage
-
-After the skill's primary task completes, run:
-
-```bash
-python3 ${PWD}/.claude/skills/skill-stat/scripts/record-stat.py "marimo-anywidget"
-```
